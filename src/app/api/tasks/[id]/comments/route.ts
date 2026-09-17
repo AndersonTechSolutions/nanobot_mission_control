@@ -5,6 +5,7 @@ import { validateBody, createCommentSchema } from '@/lib/validation';
 import { mutationLimiter } from '@/lib/rate-limit';
 import { logger } from '@/lib/logger';
 import { resolveMentionRecipients } from '@/lib/mentions';
+import { requireAgentTaskAccess, requireWorkspaceId } from '@/lib/enforcement/workspace-scope';
 
 /**
  * GET /api/tasks/[id]/comments - Get all comments for a task
@@ -20,7 +21,9 @@ export async function GET(
     const db = getDatabase();
     const resolvedParams = await params;
     const taskId = parseInt(resolvedParams.id);
-    const workspaceId = auth.user.workspace_id ?? 1;
+    const wsResult = requireWorkspaceId(auth.user);
+    if (!('workspaceId' in wsResult)) return wsResult.response;
+    const { workspaceId } = wsResult;
 
     if (isNaN(taskId)) {
       return NextResponse.json({ error: 'Invalid task ID' }, { status: 400 });
@@ -28,12 +31,15 @@ export async function GET(
     
     // Verify task exists
     const task = db
-      .prepare('SELECT id FROM tasks WHERE id = ? AND workspace_id = ?')
-      .get(taskId, workspaceId);
+      .prepare('SELECT id, assigned_to FROM tasks WHERE id = ? AND workspace_id = ?')
+      .get(taskId, workspaceId) as { id: number; assigned_to: string | null } | undefined;
     if (!task) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 });
     }
-    
+
+    const taskDeny = requireAgentTaskAccess(auth.user, task.assigned_to);
+    if (taskDeny) return taskDeny;
+
     // Get comments ordered by creation time
     const stmt = db.prepare(`
       SELECT * FROM comments 
@@ -101,7 +107,9 @@ export async function POST(
     const db = getDatabase();
     const resolvedParams = await params;
     const taskId = parseInt(resolvedParams.id);
-    const workspaceId = auth.user.workspace_id ?? 1;
+    const wsResult = requireWorkspaceId(auth.user);
+    if (!('workspaceId' in wsResult)) return wsResult.response;
+    const { workspaceId } = wsResult;
 
     if (isNaN(taskId)) {
       return NextResponse.json({ error: 'Invalid task ID' }, { status: 400 });
@@ -141,7 +149,10 @@ export async function POST(
     if (!task) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 });
     }
-    
+
+    const taskDeny = requireAgentTaskAccess(auth.user, task.assigned_to ?? null);
+    if (taskDeny) return taskDeny;
+
     // Verify parent comment exists if specified
     if (parent_id) {
       const parentComment = db
@@ -201,14 +212,48 @@ export async function POST(
       workspaceId
     );
     
+    // Auto-assign: if task is unassigned and a mentioned target is an agent, assign it
+    let autoAssignedTo: string | null = null;
+    if (!task.assigned_to) {
+      const mentionedAgent = mentionResolution.resolved.find((m) => m.type === 'agent');
+      if (mentionedAgent) {
+        autoAssignedTo = mentionedAgent.recipient;
+        const newStatus = task.status === 'inbox' ? 'assigned' : task.status;
+        db.prepare('UPDATE tasks SET assigned_to = ?, status = ?, updated_at = ? WHERE id = ? AND workspace_id = ?')
+          .run(autoAssignedTo, newStatus, now, taskId, workspaceId);
+
+        db_helpers.ensureTaskSubscription(taskId, autoAssignedTo, workspaceId);
+        db_helpers.createNotification(
+          autoAssignedTo,
+          'assignment',
+          'Task Assigned',
+          `You have been assigned to task: ${task.title} (via @mention by ${author})`,
+          'task',
+          taskId,
+          workspaceId
+        );
+
+        db_helpers.logActivity(
+          'task_assigned',
+          'task',
+          taskId,
+          author,
+          `Auto-assigned task "${task.title}" to ${autoAssignedTo} via @mention`,
+          { assigned_to: autoAssignedTo, trigger: 'mention' },
+          workspaceId
+        );
+      }
+    }
+
     // Ensure subscriptions for author, mentions, and assignee
     db_helpers.ensureTaskSubscription(taskId, author, workspaceId);
     const mentionRecipients = mentionResolution.recipients;
     mentionRecipients.forEach((mentionedRecipient) => {
       db_helpers.ensureTaskSubscription(taskId, mentionedRecipient, workspaceId);
     });
-    if (task.assigned_to) {
-      db_helpers.ensureTaskSubscription(taskId, task.assigned_to, workspaceId);
+    const effectiveAssignee = autoAssignedTo || task.assigned_to;
+    if (effectiveAssignee) {
+      db_helpers.ensureTaskSubscription(taskId, effectiveAssignee, workspaceId);
     }
 
     // Notify subscribers
@@ -236,12 +281,13 @@ export async function POST(
       .prepare('SELECT * FROM comments WHERE id = ? AND workspace_id = ?')
       .get(commentId, workspaceId) as Comment;
     
-    return NextResponse.json({ 
+    return NextResponse.json({
       comment: {
         ...createdComment,
         mentions: createdComment.mentions ? JSON.parse(createdComment.mentions) : [],
         replies: [] // New comments have no replies initially
-      }
+      },
+      ...(autoAssignedTo ? { auto_assigned_to: autoAssignedTo } : {}),
     }, { status: 201 });
   } catch (error) {
     logger.error({ err: error }, 'POST /api/tasks/[id]/comments error');

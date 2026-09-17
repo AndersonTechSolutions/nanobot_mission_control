@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createSession } from '@/lib/auth'
 import { getDatabase, logAuditEvent } from '@/lib/db'
 import { verifyGoogleIdToken } from '@/lib/google-auth'
-import { getMcSessionCookieOptions } from '@/lib/session-cookie'
+import { getMcSessionCookieName, getMcSessionCookieOptions, isRequestSecure } from '@/lib/session-cookie'
 import { loginLimiter } from '@/lib/rate-limit'
 
 function upsertAccessRequest(input: {
@@ -41,12 +41,16 @@ export async function POST(request: NextRequest) {
     const displayName = String(profile.name || email.split('@')[0] || 'Google User').trim()
     const avatar = profile.picture ? String(profile.picture) : null
 
+    // Match by Google provider_user_id first, then by email — but only for
+    // existing Google users. Never match a local/proxy user by email alone,
+    // as that would allow account takeover via a Google account registered
+    // with the same email address.
     const row = db.prepare(`
       SELECT u.id, u.username, u.display_name, u.role, u.provider, u.email, u.avatar_url, u.is_approved,
              u.created_at, u.updated_at, u.last_login_at, u.workspace_id, COALESCE(w.tenant_id, 1) as tenant_id
       FROM users u
       LEFT JOIN workspaces w ON w.id = u.workspace_id
-      WHERE (provider = 'google' AND provider_user_id = ?) OR lower(email) = ?
+      WHERE provider = 'google' AND (provider_user_id = ? OR lower(email) = ?)
       ORDER BY u.id ASC
       LIMIT 1
     `).get(sub, email) as any
@@ -100,10 +104,10 @@ export async function POST(request: NextRequest) {
       },
     })
 
-    const isSecureRequest = request.headers.get('x-forwarded-proto') === 'https'
-      || new URL(request.url).protocol === 'https:'
+    const isSecureRequest = isRequestSecure(request)
+    const cookieName = getMcSessionCookieName(isSecureRequest)
 
-    response.cookies.set('mc-session', token, {
+    response.cookies.set(cookieName, token, {
       ...getMcSessionCookieOptions({ maxAgeSeconds: expiresAt - Math.floor(Date.now() / 1000), isSecureRequest }),
     })
 

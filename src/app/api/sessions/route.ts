@@ -2,38 +2,40 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getAllGatewaySessions } from '@/lib/sessions'
 import { syncClaudeSessions } from '@/lib/claude-sessions'
 import { scanCodexSessions } from '@/lib/codex-sessions'
+import { scanHermesSessions } from '@/lib/hermes-sessions'
+import { scanOpenCodeSessions } from '@/lib/opencode-sessions'
 import { getDatabase, db_helpers } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
-import { runClawdbot } from '@/lib/command'
+import { callOpenClawGateway } from '@/lib/openclaw-gateway'
 import { mutationLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
+import { denyUnscopedResourceForStrictWorkspace } from '@/lib/workspace-isolation'
 
-const LOCAL_SESSION_ACTIVE_WINDOW_MS = 90 * 60 * 1000
+// Upstream default 90 minutes was too lax (every recently-touched jsonl
+// stayed "active"); 2 minutes was too tight. 15 minutes matches the
+// scanner's threshold so derived/scanned active state stay coherent.
+const LOCAL_SESSION_ACTIVE_WINDOW_MS = 15 * 60 * 1000
 
 export async function GET(request: NextRequest) {
   const auth = requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDenied = denyUnscopedResourceForStrictWorkspace(auth.user, 'local_sessions', new URL(request.url).pathname)
+  if (isolationDenied) return isolationDenied
 
   try {
-    const { searchParams } = new URL(request.url)
-    const includeLocal = searchParams.get('include_local') === '1'
     const gatewaySessions = getAllGatewaySessions()
     const mappedGatewaySessions = mapGatewaySessions(gatewaySessions)
 
-    // Preserve existing behavior by default: when gateway sessions are present,
-    // return only gateway-backed sessions unless include_local=1 is requested.
-    if (mappedGatewaySessions.length > 0 && !includeLocal) {
-      return NextResponse.json({ sessions: mappedGatewaySessions })
-    }
-
-    // Local Claude + Codex sessions from disk/SQLite
+    // Always include local sessions alongside gateway sessions
     await syncClaudeSessions()
     const claudeSessions = getLocalClaudeSessions()
     const codexSessions = getLocalCodexSessions()
-    const localMerged = mergeLocalSessions(claudeSessions, codexSessions)
+    const hermesSessions = getLocalHermesSessions()
+    const opencodeSessions = getLocalOpenCodeSessions()
+    const localMerged = mergeLocalSessions(claudeSessions, codexSessions, hermesSessions, opencodeSessions)
 
-    if (mappedGatewaySessions.length === 0) {
-      return NextResponse.json({ sessions: localMerged })
+    if (mappedGatewaySessions.length === 0 && localMerged.length === 0) {
+      return NextResponse.json({ sessions: [] })
     }
 
     const merged = dedupeAndSortSessions([...mappedGatewaySessions, ...localMerged])
@@ -52,6 +54,8 @@ const SESSION_KEY_RE = /^[a-zA-Z0-9:_.-]+$/
 export async function POST(request: NextRequest) {
   const auth = requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDenied = denyUnscopedResourceForStrictWorkspace(auth.user, 'gateway_sessions', new URL(request.url).pathname)
+  if (isolationDenied) return isolationDenied
 
   const rateCheck = mutationLimiter(request)
   if (rateCheck) return rateCheck
@@ -66,7 +70,8 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid session key' }, { status: 400 })
     }
 
-    let rpcFn: string
+    let rpcMethod: string
+    let rpcParams: Record<string, unknown>
     let logDetail: string
 
     switch (action) {
@@ -75,7 +80,8 @@ export async function POST(request: NextRequest) {
         if (!VALID_THINKING_LEVELS.includes(level)) {
           return NextResponse.json({ error: `Invalid thinking level. Must be: ${VALID_THINKING_LEVELS.join(', ')}` }, { status: 400 })
         }
-        rpcFn = `session_setThinking("${sessionKey}", "${level}")`
+        rpcMethod = 'session_setThinking'
+        rpcParams = { sessionKey, level }
         logDetail = `Set thinking=${level} on ${sessionKey}`
         break
       }
@@ -84,7 +90,8 @@ export async function POST(request: NextRequest) {
         if (!VALID_VERBOSE_LEVELS.includes(level)) {
           return NextResponse.json({ error: `Invalid verbose level. Must be: ${VALID_VERBOSE_LEVELS.join(', ')}` }, { status: 400 })
         }
-        rpcFn = `session_setVerbose("${sessionKey}", "${level}")`
+        rpcMethod = 'session_setVerbose'
+        rpcParams = { sessionKey, level }
         logDetail = `Set verbose=${level} on ${sessionKey}`
         break
       }
@@ -93,7 +100,8 @@ export async function POST(request: NextRequest) {
         if (!VALID_REASONING_LEVELS.includes(level)) {
           return NextResponse.json({ error: `Invalid reasoning level. Must be: ${VALID_REASONING_LEVELS.join(', ')}` }, { status: 400 })
         }
-        rpcFn = `session_setReasoning("${sessionKey}", "${level}")`
+        rpcMethod = 'session_setReasoning'
+        rpcParams = { sessionKey, level }
         logDetail = `Set reasoning=${level} on ${sessionKey}`
         break
       }
@@ -102,7 +110,8 @@ export async function POST(request: NextRequest) {
         if (typeof label !== 'string' || label.length > 100) {
           return NextResponse.json({ error: 'Label must be a string up to 100 characters' }, { status: 400 })
         }
-        rpcFn = `session_setLabel("${sessionKey}", ${JSON.stringify(label)})`
+        rpcMethod = 'session_setLabel'
+        rpcParams = { sessionKey, label }
         logDetail = `Set label="${label}" on ${sessionKey}`
         break
       }
@@ -110,7 +119,7 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: 'Invalid action. Must be: set-thinking, set-verbose, set-reasoning, set-label' }, { status: 400 })
     }
 
-    const result = await runClawdbot(['-c', rpcFn], { timeoutMs: 10000 })
+    const result = await callOpenClawGateway(rpcMethod, rpcParams, 10_000)
 
     db_helpers.logActivity(
       'session_control',
@@ -121,7 +130,7 @@ export async function POST(request: NextRequest) {
       { session_key: sessionKey, action }
     )
 
-    return NextResponse.json({ success: true, action, sessionKey, stdout: result.stdout.trim() })
+    return NextResponse.json({ success: true, action, sessionKey, result })
   } catch (error: any) {
     logger.error({ err: error }, 'Session POST error')
     return NextResponse.json({ error: error.message || 'Session action failed' }, { status: 500 })
@@ -131,6 +140,8 @@ export async function POST(request: NextRequest) {
 export async function DELETE(request: NextRequest) {
   const auth = requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDenied = denyUnscopedResourceForStrictWorkspace(auth.user, 'gateway_sessions', new URL(request.url).pathname)
+  if (isolationDenied) return isolationDenied
 
   const rateCheck = mutationLimiter(request)
   if (rateCheck) return rateCheck
@@ -143,10 +154,7 @@ export async function DELETE(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid session key' }, { status: 400 })
     }
 
-    const result = await runClawdbot(
-      ['-c', `session_delete("${sessionKey}")`],
-      { timeoutMs: 10000 }
-    )
+    const result = await callOpenClawGateway('session_delete', { sessionKey }, 10_000)
 
     db_helpers.logActivity(
       'session_control',
@@ -157,7 +165,7 @@ export async function DELETE(request: NextRequest) {
       { session_key: sessionKey, action: 'delete' }
     )
 
-    return NextResponse.json({ success: true, sessionKey, stdout: result.stdout.trim() })
+    return NextResponse.json({ success: true, sessionKey, result })
   } catch (error: any) {
     logger.error({ err: error }, 'Session DELETE error')
     return NextResponse.json({ error: error.message || 'Session deletion failed' }, { status: 500 })
@@ -165,7 +173,7 @@ export async function DELETE(request: NextRequest) {
 }
 
 function mapGatewaySessions(gatewaySessions: ReturnType<typeof getAllGatewaySessions>) {
-  // Deduplicate by sessionId -- nanobot tracks cron runs under the same
+  // Deduplicate by sessionId — OpenClaw tracks cron runs under the same
   // session ID as the parent session, causing duplicate React keys (#80).
   // Keep the most recently updated entry when duplicates exist.
   const sessionMap = new Map<string, (typeof gatewaySessions)[0]>()
@@ -178,9 +186,9 @@ function mapGatewaySessions(gatewaySessions: ReturnType<typeof getAllGatewaySess
   }
 
   return Array.from(sessionMap.values()).map((s) => {
-    const total = s.totalTokens || 0
+    const totalTokens = s.totalTokens || 0
     const context = s.contextTokens || 35000
-    const pct = context > 0 ? Math.round((total / context) * 100) : 0
+    const pct = context > 0 ? Math.round((totalTokens / context) * 100) : 0
     return {
       id: s.sessionId || `${s.agent}:${s.key}`,
       key: s.key,
@@ -188,7 +196,7 @@ function mapGatewaySessions(gatewaySessions: ReturnType<typeof getAllGatewaySess
       kind: s.chatType || 'unknown',
       age: formatAge(s.updatedAt),
       model: s.model,
-      tokens: `${formatTokens(total)}/${formatTokens(context)} (${pct}%)`,
+      tokens: `${formatTokens(totalTokens)}/${formatTokens(context)} (${pct}%)`,
       channel: s.channel,
       flags: [],
       active: s.active,
@@ -208,7 +216,6 @@ function getLocalClaudeSessions() {
     ).all() as Array<Record<string, any>>
 
     return rows.map((s) => {
-      const total = (s.input_tokens || 0) + (s.output_tokens || 0)
       const lastMsg = s.last_message_at ? new Date(s.last_message_at).getTime() : 0
       // Trust scanner state first, but fall back to derived recency so UI doesn't
       // show stale "xh ago" when the active flag lags behind disk updates.
@@ -281,11 +288,86 @@ function getLocalCodexSessions() {
   }
 }
 
+function getLocalHermesSessions() {
+  try {
+    const rows = scanHermesSessions(100)
+
+    return rows.map((s) => {
+      const total = s.inputTokens + s.outputTokens
+      const lastMsg = s.lastMessageAt ? new Date(s.lastMessageAt).getTime() : 0
+      const firstMsg = s.firstMessageAt ? new Date(s.firstMessageAt).getTime() : 0
+      const effectiveLastActivity = s.isActive ? Date.now() : lastMsg
+      return {
+        id: s.sessionId,
+        key: s.title || s.sessionId,
+        agent: 'hermes',
+        kind: 'hermes',
+        age: s.isActive ? 'now' : formatAge(lastMsg),
+        model: s.model || 'hermes',
+        tokens: `${formatTokens(s.inputTokens)}/${formatTokens(s.outputTokens)}`,
+        channel: s.source || 'cli',
+        flags: s.source && s.source !== 'cli' ? [s.source] : [],
+        active: s.isActive,
+        startTime: firstMsg,
+        lastActivity: effectiveLastActivity,
+        source: 'local' as const,
+        userMessages: s.messageCount,
+        assistantMessages: 0,
+        toolUses: s.toolCallCount,
+        estimatedCost: 0,
+        lastUserPrompt: s.title || null,
+        totalTokens: total,
+        workingDir: null,
+      }
+    })
+  } catch (err) {
+    logger.warn({ err }, 'Failed to read local Hermes sessions')
+    return []
+  }
+}
+
+function getLocalOpenCodeSessions() {
+  try {
+    const rows = scanOpenCodeSessions(100)
+
+    return rows.map((s) => {
+      const effectiveLastActivity = s.isActive && s.lastMessageAt ? Date.now() : (s.lastMessageAt ? new Date(s.lastMessageAt).getTime() : 0)
+      return {
+        id: s.sessionId,
+        key: s.projectSlug || s.sessionId,
+        agent: s.projectSlug || 'opencode',
+        kind: 'opencode',
+        age: s.isActive && s.lastMessageAt ? 'now' : formatAge(s.lastMessageAt ? new Date(s.lastMessageAt).getTime() : 0),
+        model: s.model || s.version || 'opencode',
+        tokens: `${formatTokens(s.inputTokens)}/${formatTokens(s.outputTokens)}`,
+        channel: 'local',
+        flags: s.provider ? [s.provider] : [],
+        active: s.isActive,
+        startTime: s.firstMessageAt ? new Date(s.firstMessageAt).getTime() : 0,
+        lastActivity: effectiveLastActivity,
+        source: 'local' as const,
+        userMessages: s.userMessages,
+        assistantMessages: s.assistantMessages,
+        toolUses: 0,
+        estimatedCost: 0,
+        lastUserPrompt: s.title || null,
+        totalTokens: s.totalTokens,
+        workingDir: s.projectPath || null,
+      }
+    })
+  } catch (err) {
+    logger.warn({ err }, 'Failed to read local OpenCode sessions')
+    return []
+  }
+}
+
 function mergeLocalSessions(
   claudeSessions: Array<Record<string, any>>,
   codexSessions: Array<Record<string, any>>,
+  hermesSessions: Array<Record<string, any>> = [],
+  opencodeSessions: Array<Record<string, any>> = [],
 ) {
-  const merged = [...claudeSessions, ...codexSessions]
+  const merged = [...claudeSessions, ...codexSessions, ...hermesSessions, ...opencodeSessions]
   return dedupeAndSortSessions(merged)
 }
 

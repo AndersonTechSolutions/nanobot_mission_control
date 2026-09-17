@@ -1,7 +1,39 @@
+import { existsSync, realpathSync, statSync } from 'node:fs'
+import path from 'node:path'
+import { spawn } from 'node:child_process'
 import { getDatabase, db_helpers } from './db'
-import { runOpenClaw } from './command'
+import {
+  auditClaudeSessionDispatch,
+  ensureClaudeBaseSession,
+  markClaudeBaseSessionMaterialized,
+} from './claude-code-sessions'
+import { callOpenClawGateway } from './openclaw-gateway'
 import { eventBus } from './event-bus'
 import { logger } from './logger'
+import { config } from './config'
+import { getAllGatewaySessions } from './sessions'
+import { parseJsonlTranscript, readSessionJsonl, type TranscriptMessage } from './transcript-parser'
+import { syncTaskOutbound } from './github-sync-engine'
+import { classifyModelProvider, getDispatchModelId, getModelByAlias } from './models'
+import { getMiniMaxApiKey, resolveMiniMaxEndpoint } from './minimax'
+import type Database from 'better-sqlite3'
+
+const AGENT_DISPATCH_ACCEPT_TIMEOUT_MS = 60_000
+
+/** Sync task to GitHub/GNAP and broadcast escalation if task failed */
+function syncAndEscalateIfFailed(task: { id: number; title: string; status: string; priority: string; project_id?: number | null; workspace_id: number; description?: string | null }, newStatus: string, errorMsg?: string, dispatchAttempts?: number): void {
+  syncTaskOutbound({ ...task, status: newStatus }, task.workspace_id)
+  if (newStatus === 'failed') {
+    eventBus.broadcast('task.escalated', {
+      id: task.id,
+      title: task.title,
+      reason: errorMsg?.includes('Aegis rejected') ? 'max_aegis_rejections' : errorMsg?.includes('stuck') ? 'stale_task_max_retries' : 'max_dispatch_retries',
+      dispatch_attempts: dispatchAttempts ?? 0,
+      error_message: (errorMsg ?? '').substring(0, 500),
+      workspace_id: task.workspace_id,
+    })
+  }
+}
 
 interface DispatchableTask {
   id: number
@@ -13,10 +45,224 @@ interface DispatchableTask {
   workspace_id: number
   agent_name: string
   agent_id: number
+  agent_config: string | null
+  /** From agents.runtime_type — 'claude' opts into per-agent CLI session dispatch (#602). */
+  agent_runtime_type?: string | null
   ticket_prefix: string | null
   project_ticket_no: number | null
   project_id: number | null
   tags?: string[]
+  /** Raw tasks.metadata JSON — carries optional per-task sandbox overrides. */
+  metadata?: string | null
+}
+
+interface DispatchTokenUsage {
+  model: string
+  sessionId: string
+  inputTokens: number
+  outputTokens: number
+  workspaceId: number
+}
+
+/** Keep dispatch accounting aligned with the token_usage migration schema. */
+export function insertDispatchTokenUsage(
+  db: Pick<Database.Database, 'prepare'>,
+  usage: DispatchTokenUsage,
+  createdAt = Math.floor(Date.now() / 1000),
+): void {
+  db.prepare(`
+    INSERT INTO token_usage (model, session_id, input_tokens, output_tokens, cost_usd, created_at, workspace_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    usage.model,
+    usage.sessionId,
+    usage.inputTokens,
+    usage.outputTokens,
+    0,
+    createdAt,
+    usage.workspaceId,
+  )
+}
+
+function recordDispatchTokenUsage(usage: DispatchTokenUsage): void {
+  try {
+    insertDispatchTokenUsage(getDatabase(), usage)
+  } catch (err) {
+    logger.warn({ err, model: usage.model, workspaceId: usage.workspaceId }, 'Dispatch token usage insert failed')
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Model routing
+// ---------------------------------------------------------------------------
+
+/**
+ * Return an explicit gateway model override from Mission Control agent config.
+ *
+ * By default, task dispatch should not inject a model override; the OpenClaw
+ * agent should use its own configured default model. A Mission Control agent
+ * may still opt into an override via agent.config.dispatchModel.
+ */
+export function resolveTaskDispatchModelOverride(task: Pick<DispatchableTask, 'agent_config'>): string | null {
+  if (task.agent_config) {
+    try {
+      const cfg = JSON.parse(task.agent_config)
+      if (typeof cfg.dispatchModel === 'string' && cfg.dispatchModel) return cfg.dispatchModel
+      if (typeof cfg.model === 'string' && cfg.model) return null
+      if (cfg.model && typeof cfg.model === 'object' && typeof cfg.model.primary === 'string' && cfg.model.primary) return null
+    } catch { /* ignore */ }
+  }
+  return null
+}
+
+/** Extract the gateway agent identifier from the agent's config JSON.
+ *  Falls back to agent_name (display name) if openclawId is not set. */
+function resolveGatewayAgentId(task: DispatchableTask): string {
+  if (task.agent_config) {
+    try {
+      const cfg = JSON.parse(task.agent_config)
+      if (typeof cfg.openclawId === 'string' && cfg.openclawId) return cfg.openclawId
+    } catch { /* ignore */ }
+  }
+  return task.agent_name
+}
+
+// ---------------------------------------------------------------------------
+// Host-CLI sandbox flags (issue #720)
+// ---------------------------------------------------------------------------
+//
+// Opt-in safety flags for the host CLI dispatch paths (`claude` / `codex`).
+// Source of truth is the agent's config JSON (agents.config), using the same
+// flat naming style as `dispatchModel`:
+//
+//   { "dispatchAllowedTools": ["Read", "Grep"], "dispatchMaxBudgetUsd": 5,
+//     "dispatchCwd": "repos/my-project" }
+//
+// Each field can be overridden per task via tasks.metadata (camelCase or
+// snake_case, mirroring existing metadata keys like dispatch_session_id):
+//
+//   { "dispatch_allowed_tools": [...], "dispatch_max_budget_usd": 2,
+//     "dispatch_cwd": "..." }
+//
+// Absent config means today's behavior, byte-for-byte: no extra CLI flags,
+// no spawn cwd.
+
+/**
+ * Tool names the Claude Code CLI accepts for `--allowedTools`. Conservative
+ * exact-match allowlist — entries not listed here (including `Bash(...)`
+ * specifier syntax) are dropped with a warning. `--dangerously-skip-permissions`
+ * is never passed by task dispatch.
+ */
+export const CLAUDE_CLI_ALLOWED_TOOL_NAMES = [
+  'Task', 'Bash', 'Glob', 'Grep', 'Read', 'Edit', 'MultiEdit', 'Write',
+  'NotebookEdit', 'WebFetch', 'WebSearch', 'TodoWrite',
+] as const
+
+/** Ceiling for `--max-budget-usd` regardless of what the config asks for. */
+export const CLI_MAX_BUDGET_USD_CEILING = 100
+
+export interface CliDispatchSandboxOptions {
+  allowedTools: string[] | null
+  maxBudgetUsd: number | null
+  cwd: string | null
+}
+
+/**
+ * Validate a configured allowed-tools list against CLAUDE_CLI_ALLOWED_TOOL_NAMES.
+ * Unknown entries are dropped with a warning. Returns null when the input is
+ * not a list or nothing survives filtering — in `--print` mode, omitting
+ * `--allowedTools` is the more restrictive default (tools stay gated), so an
+ * all-invalid list fails closed, not open.
+ */
+export function filterCliAllowedTools(input: unknown, taskId?: number): string[] | null {
+  if (!Array.isArray(input)) return null
+  const valid: string[] = []
+  const rejected: string[] = []
+  for (const entry of input) {
+    if (typeof entry === 'string' && (CLAUDE_CLI_ALLOWED_TOOL_NAMES as readonly string[]).includes(entry)) {
+      if (!valid.includes(entry)) valid.push(entry)
+    } else {
+      rejected.push(typeof entry === 'string' ? entry : typeof entry)
+    }
+  }
+  if (rejected.length > 0) {
+    logger.warn({ taskId, rejected: rejected.slice(0, 20) },
+      'Ignoring allowed-tools entries not in the Claude CLI tool allowlist')
+  }
+  return valid.length > 0 ? valid : null
+}
+
+/** Clamp a configured max budget to a finite positive number ≤ the ceiling. */
+export function clampCliMaxBudgetUsd(input: unknown, taskId?: number): number | null {
+  if (typeof input !== 'number' || !Number.isFinite(input) || input <= 0) {
+    if (input !== undefined && input !== null) {
+      logger.warn({ taskId }, 'Ignoring invalid dispatch max budget (must be a finite positive number)')
+    }
+    return null
+  }
+  return Math.min(input, CLI_MAX_BUDGET_USD_CEILING)
+}
+
+/**
+ * Resolve a configured dispatch cwd to a real directory inside the operator's
+ * workspace root (config.workspaceRoot / MC_WORKSPACE_ROOT). Relative paths
+ * resolve against the root. Both sides go through fs.realpathSync before the
+ * prefix check, so `../` traversal and symlink escapes are rejected. Returns
+ * null (feature off) when no workspace root is configured.
+ */
+export function resolveCliDispatchCwd(input: unknown, workspaceRoot: string, taskId?: number): string | null {
+  if (typeof input !== 'string' || !input.trim()) return null
+  if (!workspaceRoot) {
+    logger.warn({ taskId }, 'Ignoring dispatch cwd: MC_WORKSPACE_ROOT is not configured')
+    return null
+  }
+  try {
+    const realRoot = realpathSync(path.resolve(workspaceRoot))
+    const realCwd = realpathSync(path.resolve(realRoot, input.trim()))
+    if (realCwd !== realRoot && !realCwd.startsWith(realRoot + path.sep)) {
+      logger.warn({ taskId }, 'Ignoring dispatch cwd: resolves outside the configured workspace root')
+      return null
+    }
+    if (!statSync(realCwd).isDirectory()) {
+      logger.warn({ taskId }, 'Ignoring dispatch cwd: not a directory')
+      return null
+    }
+    return realCwd
+  } catch {
+    logger.warn({ taskId }, 'Ignoring dispatch cwd: path does not exist or is not accessible')
+    return null
+  }
+}
+
+/**
+ * Resolve the opt-in CLI sandbox options for a task: agent config first,
+ * per-field override from tasks.metadata. All fields validated; anything
+ * invalid degrades to "flag not passed" (today's behavior).
+ */
+export function resolveCliSandboxOptions(
+  task: Pick<DispatchableTask, 'id' | 'agent_config' | 'metadata'>,
+  workspaceRoot: string = config.workspaceRoot,
+): CliDispatchSandboxOptions {
+  let agentCfg: Record<string, any> = {}
+  if (task.agent_config) {
+    try {
+      const parsed = JSON.parse(task.agent_config)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) agentCfg = parsed
+    } catch { /* ignore */ }
+  }
+  const meta = safeParseMetadata(task.metadata)
+
+  const pick = (camel: string, snake: string): unknown => {
+    if (meta[camel] !== undefined) return meta[camel]
+    if (meta[snake] !== undefined) return meta[snake]
+    return agentCfg[camel]
+  }
+
+  return {
+    allowedTools: filterCliAllowedTools(pick('dispatchAllowedTools', 'dispatch_allowed_tools'), task.id),
+    maxBudgetUsd: clampCliMaxBudgetUsd(pick('dispatchMaxBudgetUsd', 'dispatch_max_budget_usd'), task.id),
+    cwd: resolveCliDispatchCwd(pick('dispatchCwd', 'dispatch_cwd'), workspaceRoot, task.id),
+  }
 }
 
 function buildTaskPrompt(task: DispatchableTask, rejectionFeedback?: string | null): string {
@@ -47,23 +293,19 @@ function buildTaskPrompt(task: DispatchableTask, rejectionFeedback?: string | nu
   return lines.join('\n')
 }
 
-/** Extract first valid JSON object from raw stdout (handles surrounding text/warnings). */
-function parseGatewayJson(raw: string): any | null {
-  const trimmed = String(raw || '').trim()
-  if (!trimmed) return null
-  const start = trimmed.indexOf('{')
-  const end = trimmed.lastIndexOf('}')
-  if (start < 0 || end < start) return null
-  try {
-    return JSON.parse(trimmed.slice(start, end + 1))
-  } catch {
-    return null
-  }
-}
-
 interface AgentResponseParsed {
   text: string | null
   sessionId: string | null
+}
+
+interface DeferredCompletionTask {
+  id: number
+  title: string
+  assigned_to: string | null
+  metadata: string | null
+  workspace_id: number
+  ticket_prefix: string | null
+  project_ticket_no: number | null
 }
 
 function parseAgentResponse(stdout: string): AgentResponseParsed {
@@ -88,15 +330,1078 @@ function parseAgentResponse(stdout: string): AgentResponseParsed {
   }
 }
 
+function safeParseMetadata(raw: string | null | undefined): Record<string, any> {
+  if (!raw) return {}
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+export function extractDeferredCompletionText(waitPayload: any): string | null {
+  if (!waitPayload || typeof waitPayload !== 'object') return null
+
+  const directCandidates = [
+    waitPayload.text,
+    waitPayload.message,
+    waitPayload.response,
+    waitPayload.output,
+    waitPayload.result,
+  ]
+  for (const value of directCandidates) {
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+
+  const nestedCandidates = [
+    waitPayload.result?.text,
+    waitPayload.result?.message,
+    waitPayload.result?.response,
+    waitPayload.result?.output,
+    waitPayload.output?.text,
+    waitPayload.output?.message,
+    waitPayload.output?.content,
+  ]
+  for (const value of nestedCandidates) {
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+
+  const arrays = [
+    waitPayload.payloads,
+    waitPayload.result?.payloads,
+    waitPayload.output,
+    waitPayload.result?.output,
+  ]
+  const parts: string[] = []
+  for (const list of arrays) {
+    if (!Array.isArray(list)) continue
+    for (const item of list) {
+      if (!item || typeof item !== 'object') continue
+      if (typeof item.text === 'string' && item.text.trim()) {
+        parts.push(item.text.trim())
+      }
+      if (Array.isArray(item.content)) {
+        for (const block of item.content) {
+          if (!block || typeof block !== 'object') continue
+          const blockType = String(block.type || '')
+          if ((blockType === 'text' || blockType === 'output_text' || blockType === 'input_text') && typeof block.text === 'string' && block.text.trim()) {
+            parts.push(block.text.trim())
+          }
+        }
+      }
+    }
+  }
+
+  return parts.length > 0 ? parts.join('\n').slice(0, 10_000) : null
+}
+
+function isCompletionStatus(status: string): boolean {
+  return ['completed', 'complete', 'success', 'succeeded', 'done', 'ok'].includes(status)
+}
+
+function normalizeGatewayIdentifier(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const normalized = value.trim().toLowerCase()
+  return normalized || null
+}
+
+function buildDeferredCompletionMarkers(task: DeferredCompletionTask): string[] {
+  const markers = new Set<string>([
+    `TASK-${task.id}`,
+    `TASK-${String(task.id).padStart(3, '0')}`,
+  ])
+
+  if (task.ticket_prefix && task.project_ticket_no) {
+    markers.add(`${task.ticket_prefix}-${task.project_ticket_no}`)
+    markers.add(`${task.ticket_prefix}-${String(task.project_ticket_no).padStart(3, '0')}`)
+  }
+
+  return [...markers]
+}
+
+function getTranscriptText(message: TranscriptMessage): string {
+  return message.parts
+    .map((part) => part.type === 'text' ? part.text.trim() : '')
+    .filter(Boolean)
+    .join('\n')
+    .trim()
+}
+
+function findAssistantTextAfterTaskPrompt(rawTranscript: string, task: DeferredCompletionTask): string | null {
+  const messages = parseJsonlTranscript(rawTranscript, 2000)
+  if (messages.length === 0) return null
+
+  const markers = buildDeferredCompletionMarkers(task).map((marker) => marker.toLowerCase())
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]
+    if (message.role !== 'user') continue
+
+    const userText = getTranscriptText(message).toLowerCase()
+    if (!markers.some((marker) => userText.includes(marker))) continue
+
+    for (let j = i + 1; j < messages.length; j++) {
+      const candidate = messages[j]
+      if (candidate.role !== 'assistant') continue
+      const text = getTranscriptText(candidate)
+      if (text) return text.slice(0, 10_000)
+    }
+  }
+
+  return null
+}
+
+function recoverDeferredCompletionTextFromTranscript(
+  task: DeferredCompletionTask,
+  metadata: Record<string, any>,
+): string | null {
+  if (!config.openclawStateDir) return null
+
+  const dispatchSessionId = normalizeGatewayIdentifier(metadata.dispatch_session_id)
+  const assignedAgent = normalizeGatewayIdentifier(task.assigned_to)
+  const agentCandidates = new Set<string>(
+    [dispatchSessionId, assignedAgent].filter((value): value is string => Boolean(value))
+  )
+
+  if (agentCandidates.size === 0) return null
+
+  const sessions = getAllGatewaySessions(24 * 60 * 60 * 1000, true)
+    .filter((session) => {
+      const sessionAgent = normalizeGatewayIdentifier(session.agent)
+      const sessionId = normalizeGatewayIdentifier(session.sessionId)
+      const sessionKey = normalizeGatewayIdentifier(session.key)
+      return Boolean(
+        (sessionAgent && agentCandidates.has(sessionAgent)) ||
+        (dispatchSessionId && sessionId === dispatchSessionId) ||
+        (dispatchSessionId && sessionKey === dispatchSessionId)
+      )
+    })
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+
+  for (const session of sessions) {
+    if (!session.agent || !session.sessionId) continue
+    const rawTranscript = readSessionJsonl(config.openclawStateDir, session.agent, session.sessionId)
+    if (!rawTranscript) continue
+    const text = findAssistantTextAfterTaskPrompt(rawTranscript, task)
+    if (text) return text
+  }
+
+  return null
+}
+
+async function waitForDeferredRun(runId: string): Promise<{ complete: boolean; text: string | null }> {
+  const waitPayload = await callOpenClawGateway<any>(
+    'agent.wait',
+    { runId, timeoutMs: 1000 },
+    3000,
+  )
+  const status = String(waitPayload?.status || waitPayload?.result?.status || '').toLowerCase()
+  if (!isCompletionStatus(status)) {
+    return { complete: false, text: null }
+  }
+  return {
+    complete: true,
+    text: extractDeferredCompletionText(waitPayload),
+  }
+}
+
+export async function reconcileDeferredTaskCompletions(options: {
+  workspaceId?: number
+  taskId?: number
+  limit?: number
+  waitForRun?: (runId: string) => Promise<{ complete: boolean; text: string | null }>
+} = {}): Promise<{ ok: boolean; message: string; checked: number; promoted: number }> {
+  const db = getDatabase()
+  const workspaceId = options.workspaceId ?? 1
+  const limit = Math.max(1, Math.min(options.limit ?? 5, 20))
+  const waitForRun = options.waitForRun ?? waitForDeferredRun
+  const now = Math.floor(Date.now() / 1000)
+
+  const params: unknown[] = [workspaceId]
+  let query = `
+    SELECT t.id, t.title, t.assigned_to, t.metadata, t.workspace_id,
+           p.ticket_prefix, t.project_ticket_no
+    FROM tasks t
+    JOIN workspaces w ON w.id = t.workspace_id
+    LEFT JOIN projects p ON p.id = t.project_id AND p.workspace_id = t.workspace_id
+    WHERE t.workspace_id = ?
+      AND w.isolation = 'shared'
+      AND t.status = 'in_progress'
+      AND t.metadata IS NOT NULL
+      AND t.metadata LIKE '%"async_state"%'
+      AND t.metadata LIKE '%"pending"%'
+  `
+  if (options.taskId !== undefined) {
+    query += ' AND t.id = ?'
+    params.push(options.taskId)
+  }
+  query += ' ORDER BY t.updated_at ASC LIMIT ?'
+  params.push(limit)
+
+  const tasks = db.prepare(query).all(...params) as DeferredCompletionTask[]
+  let promoted = 0
+
+  for (const task of tasks) {
+    const metadata = safeParseMetadata(task.metadata)
+    if (metadata.async_state !== 'pending') continue
+
+    const runId = typeof metadata.dispatch_run_id === 'string' && metadata.dispatch_run_id.trim()
+      ? metadata.dispatch_run_id.trim()
+      : typeof metadata.dispatchRunId === 'string' && metadata.dispatchRunId.trim()
+        ? metadata.dispatchRunId.trim()
+        : typeof metadata.runId === 'string' && metadata.runId.trim()
+          ? metadata.runId.trim()
+          : null
+    if (!runId) continue
+
+    let completion: { complete: boolean; text: string | null }
+    try {
+      completion = await waitForRun(runId)
+    } catch (err) {
+      logger.warn({ err, taskId: task.id, runId }, 'Deferred task completion check failed')
+      continue
+    }
+    if (!completion.complete) continue
+
+    const recoveredText = completion.text?.trim() || recoverDeferredCompletionTextFromTranscript(task, metadata)
+    const resolution = recoveredText || 'Deferred agent run completed without textual output.'
+    const truncated = resolution.length > 10_000
+      ? resolution.substring(0, 10_000) + '\n\n[Response truncated at 10,000 characters]'
+      : resolution
+    const nextMetadata: Record<string, any> = {
+      ...metadata,
+      async_state: 'completed',
+      async_completed_at: now,
+    }
+
+    const update = db.prepare(`
+      UPDATE tasks
+      SET status = 'review',
+          outcome = 'success',
+          resolution = ?,
+          metadata = ?,
+          updated_at = ?
+      WHERE id = ?
+        AND workspace_id = ?
+        AND status = 'in_progress'
+    `).run(truncated, JSON.stringify(nextMetadata), now, task.id, task.workspace_id)
+
+    if (update.changes === 0) continue
+
+    db.prepare(`
+      INSERT INTO comments (task_id, author, content, created_at, workspace_id)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(task.id, task.assigned_to || 'agent', truncated, now, task.workspace_id)
+
+    eventBus.broadcast('task.status_changed', {
+      id: task.id,
+      status: 'review',
+      previous_status: 'in_progress',
+      workspace_id: task.workspace_id,
+    })
+    eventBus.broadcast('task.updated', {
+      id: task.id,
+      status: 'review',
+      outcome: 'success',
+      assigned_to: task.assigned_to,
+      dispatch_session_id: nextMetadata.dispatch_session_id,
+      dispatch_run_id: nextMetadata.dispatch_run_id,
+      workspace_id: task.workspace_id,
+    })
+
+    db_helpers.logActivity(
+      'task_agent_completed',
+      'task',
+      task.id,
+      task.assigned_to || 'agent',
+      `Deferred agent completed task "${task.title}" - awaiting review`,
+      { response_length: truncated.length, dispatch_session_id: nextMetadata.dispatch_session_id, dispatch_run_id: nextMetadata.dispatch_run_id },
+      task.workspace_id
+    )
+
+    promoted++
+  }
+
+  return {
+    ok: true,
+    checked: tasks.length,
+    promoted,
+    message: promoted > 0
+      ? `Promoted ${promoted}/${tasks.length} deferred task(s) to review`
+      : `Checked ${tasks.length} deferred task(s); none completed`,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Direct Claude API dispatch (gateway-free)
+// ---------------------------------------------------------------------------
+
+function getAnthropicApiKey(): string | null {
+  return (process.env.ANTHROPIC_API_KEY || '').trim() || null
+}
+
+function isGatewayAvailable(): boolean {
+  // `config.openclawHome` defaults to `~/.openclaw` even when OpenClaw is not
+  // installed, so a truthy path string alone is not evidence that a gateway
+  // can actually be invoked. Require physical evidence:
+  //   - a real `openclaw.json` on disk (= an installed OpenClaw config), OR
+  //   - a registered gateway row whose status is healthy. We explicitly
+  //     reject `status = 'unknown'` because the onboarding flow seeds a
+  //     `primary` row pointing at `host.docker.internal:18789` regardless
+  //     of whether OpenClaw is actually running. Treating that seed row as
+  //     proof of availability would route every dispatch through
+  //     `runOpenClaw` and fail with `spawn openclaw ENOENT` on hosts that
+  //     don't have the binary. Require the row to have been pinged
+  //     successfully at least once (status in healthy set) before we trust
+  //     the gateway path.
+  if (config.openclawConfigPath && existsSync(config.openclawConfigPath)) return true
+  try {
+    const db = getDatabase()
+    const row = db.prepare(
+      "SELECT COUNT(*) as c FROM gateways WHERE status IN ('online', 'healthy', 'ready')"
+    ).get() as { c: number } | undefined
+    return (row?.c ?? 0) > 0
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Resolve the Anthropic dispatch model ID for a catalog tier alias.
+ *
+ * MODEL_CATALOG is the single source of truth for model IDs — classification
+ * derives the exact API model ID from the catalog entry instead of
+ * hard-coding ID strings here. The literal fallback only applies if the
+ * catalog alias is ever removed (defensive; all three aliases exist today).
+ */
+function anthropicDispatchId(alias: 'opus' | 'sonnet' | 'haiku', fallback: string): string {
+  const entry = getModelByAlias(alias)
+  return entry && entry.provider === 'anthropic' ? getDispatchModelId(entry) : fallback
+}
+
+function classifyDirectModel(task: DispatchableTask): string {
+  // Check per-agent config override first
+  if (task.agent_config) {
+    try {
+      const cfg = JSON.parse(task.agent_config)
+      if (typeof cfg.dispatchModel === 'string' && cfg.dispatchModel) {
+        // Strip gateway prefixes like "9router/cc/" to get bare model ID
+        return cfg.dispatchModel.replace(/^.*\//, '')
+      }
+    } catch { /* ignore */ }
+  }
+
+  const text = `${task.title} ${task.description ?? ''}`.toLowerCase()
+  const priority = task.priority?.toLowerCase() ?? ''
+
+  // Complex → Opus
+  const complexSignals = [
+    'debug', 'diagnos', 'architect', 'design system', 'security audit',
+    'root cause', 'investigate', 'incident', 'refactor', 'migration',
+  ]
+  if (priority === 'critical' || complexSignals.some(s => text.includes(s))) {
+    return anthropicDispatchId('opus', 'claude-opus-4-6')
+  }
+
+  // Size heuristics → Opus for large/complex tasks
+  const descLength = (task.description ?? '').length
+  if (descLength > 2000) return anthropicDispatchId('opus', 'claude-opus-4-6')
+  try {
+    const db = getDatabase()
+    const row = db.prepare('SELECT estimated_hours FROM tasks WHERE id = ? AND workspace_id = ?')
+      .get(task.id, task.workspace_id) as { estimated_hours: number | null } | undefined
+    if (row?.estimated_hours && row.estimated_hours >= 4) return anthropicDispatchId('opus', 'claude-opus-4-6')
+  } catch { /* ignore */ }
+
+  // Routine → Haiku
+  const routineSignals = [
+    'status check', 'health check', 'format', 'rename', 'summarize',
+    'translate', 'quick ', 'simple ', 'routine ', 'minor ',
+  ]
+  if (routineSignals.some(s => text.includes(s)) && priority !== 'high' && priority !== 'critical') {
+    // Catalog carries 'claude-haiku-4-5' (Anthropic's alias for the
+    // claude-haiku-4-5-20251001 snapshot) — both resolve to the same model.
+    return anthropicDispatchId('haiku', 'claude-haiku-4-5')
+  }
+
+  // Default → Sonnet
+  return anthropicDispatchId('sonnet', 'claude-sonnet-4-6')
+}
+
+function getAgentSoulContent(task: DispatchableTask): string | null {
+  try {
+    const db = getDatabase()
+    const row = db.prepare(
+      'SELECT soul_content FROM agents WHERE id = ? AND workspace_id = ?'
+    ).get(task.agent_id, task.workspace_id) as { soul_content: string | null } | undefined
+    return row?.soul_content || null
+  } catch {
+    return null
+  }
+}
+
+async function callClaudeDirectly(
+  task: DispatchableTask,
+  prompt: string,
+): Promise<AgentResponseParsed> {
+  const apiKey = getAnthropicApiKey()
+  if (!apiKey) throw new Error('ANTHROPIC_API_KEY not set — cannot dispatch without gateway')
+
+  const model = classifyDirectModel(task)
+  const soul = getAgentSoulContent(task)
+
+  const messages: Array<{ role: string; content: string }> = [
+    { role: 'user', content: prompt },
+  ]
+
+  const body: Record<string, unknown> = {
+    model,
+    max_tokens: 4096,
+    messages,
+  }
+
+  if (soul) {
+    body.system = soul
+  }
+
+  logger.info({ taskId: task.id, model, agent: task.agent_name }, 'Dispatching task via direct Claude API')
+
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify(body),
+  })
+
+  if (!res.ok) {
+    const errorBody = await res.text().catch(() => '')
+    throw new Error(`Claude API ${res.status}: ${errorBody.substring(0, 500)}`)
+  }
+
+  const data = await res.json() as {
+    content: Array<{ type: string; text?: string }>
+    usage?: { input_tokens?: number; output_tokens?: number }
+  }
+
+  const text = data.content
+    ?.filter((b: { type: string }) => b.type === 'text')
+    .map((b: { text?: string }) => b.text || '')
+    .join('\n') || null
+
+  // Record token usage
+  if (data.usage) {
+    recordDispatchTokenUsage({
+      model,
+      sessionId: `task-${task.id}`,
+      inputTokens: data.usage.input_tokens || 0,
+      outputTokens: data.usage.output_tokens || 0,
+      workspaceId: task.workspace_id,
+    })
+  }
+
+  return { text, sessionId: null }
+}
+
+// ---------------------------------------------------------------------------
+// Direct compatibility API dispatch — also gateway-free.
+//
+// The "local" provider path is intentionally generic: it speaks the OpenAI
+// `/v1/chat/completions` REST shape, which is what LMStudio, Ollama, vLLM and
+// liteLLM proxies all expose. Operators who run multiple local backends
+// behind a single liteLLM endpoint can point LOCAL_LLM_ENDPOINT at it and
+// route every "local model" request through one process.
+//
+// Model routing is done by prefix on the agent's `dispatchModel`:
+//   "openai/gpt-4o-mini", "gpt-4.1-mini", "o1-*", "o3-*"  → OpenAI cloud
+//   "local/<model>", "ollama/<model>", "lmstudio/<model>" → LOCAL_LLM_ENDPOINT
+//   anything else (incl. "claude-*")                      → Anthropic
+// ---------------------------------------------------------------------------
+
+export type DirectProvider = 'anthropic' | 'openai' | 'local' | 'minimax'
+
+function getOpenAIApiKey(): string | null {
+  return (process.env.OPENAI_API_KEY || '').trim() || null
+}
+
+/**
+ * OpenAI-compatible local endpoint. Defaults to LMStudio's stock listener on
+ * the docker host (`host.docker.internal:1234/v1`). Set LOCAL_LLM_ENDPOINT to
+ * point at Ollama (`http://host.docker.internal:11434/v1`), a liteLLM proxy
+ * (`http://litellm:4000`), or any other OpenAI-compatible service.
+ */
+function getLocalEndpoint(): string | null {
+  return (process.env.LOCAL_LLM_ENDPOINT || 'http://host.docker.internal:1234/v1').trim() || null
+}
+
+function getLocalApiKey(): string | null {
+  // Some liteLLM/proxy setups require a master key even for local routing.
+  return (process.env.LOCAL_LLM_API_KEY || '').trim() || null
+}
+
+export function pickProvider(model: string): DirectProvider {
+  // Consult MODEL_CATALOG first (single source of truth). Only providers
+  // with a direct dispatch path map to a DirectProvider; catalog providers
+  // without one fall through to the prefix rules below.
+  const catalogProvider = classifyModelProvider(model)
+  if (catalogProvider === 'anthropic') return 'anthropic'
+  if (catalogProvider === 'openai') return 'openai'
+  if (catalogProvider === 'ollama') return 'local'
+  if (catalogProvider === 'minimax') return 'minimax'
+
+  // Prefix-match fallback for models not in the catalog — behavior for
+  // unknown IDs is unchanged (default remains 'anthropic').
+  const m = model.toLowerCase()
+  if (m.startsWith('openai/') || m.startsWith('gpt-') || m.startsWith('o1-') || m.startsWith('o3-')) return 'openai'
+  if (m.startsWith('local/') || m.startsWith('ollama/') || m.startsWith('lmstudio/') || m.startsWith('litellm/')) return 'local'
+  if (m.startsWith('minimax/')) return 'minimax'
+  return 'anthropic'
+}
+
+function stripProviderPrefix(model: string): string {
+  return model.replace(/^(openai|local|ollama|lmstudio|litellm|anthropic|minimax)\//i, '')
+}
+
+/**
+ * The Claude Code CLI on the container's PATH (mounted from the host's
+ * `~/.local/bin`). When present and authenticated (host's `~/.claude.json`
+ * is bind-mounted in), we prefer it over the raw Anthropic API: it inherits
+ * the operator's existing login, plan, and rate limits without requiring
+ * an `ANTHROPIC_API_KEY` to be exported into the container.
+ */
+let claudeCliBinaryPath: string | false | null = null
+
+/**
+ * Resolve the Claude CLI binary path. Returns the absolute path when found
+ * at a known location, or 'claude' (bare command name) when it's in PATH.
+ * Prefers Docker paths, then Windows native install, then PATH resolution.
+ * Cached — spawnSync costs ~1s and existsSync results are stable per boot.
+ */
+function getClaudeCliBinaryPath(): string | null {
+  if (claudeCliBinaryPath !== null) {
+    return claudeCliBinaryPath || null
+  }
+
+  try {
+    // Docker paths (preferred per #933 — container bind-mounts)
+    const dockerPaths = [
+      '/home/nextjs/.local/bin/claude',
+      '/usr/local/bin/claude',
+      '/usr/bin/claude',
+    ]
+    for (const p of dockerPaths) {
+      if (existsSync(p)) {
+        claudeCliBinaryPath = p
+        return p
+      }
+    }
+
+    // Windows native install (~/.local/bin/claude.exe)
+    const os = require('node:os')
+    const path = require('node:path')
+    const windowsPath = path.join(os.homedir(), '.local', 'bin', 'claude.exe')
+    if (existsSync(windowsPath)) {
+      claudeCliBinaryPath = windowsPath
+      return windowsPath
+    }
+
+    // Try PATH resolution as fallback
+    const { spawnSync } = require('node:child_process')
+    const r = spawnSync('claude', ['--version'], { stdio: 'ignore', timeout: 5000 })
+    if (r.status === 0) {
+      // It's in PATH, use the bare name (let OS resolve)
+      claudeCliBinaryPath = 'claude'
+      return 'claude'
+    }
+
+    claudeCliBinaryPath = false
+    return null
+  } catch {
+    claudeCliBinaryPath = false
+    return null
+  }
+}
+
+function isClaudeCliAvailable(): boolean {
+  return getClaudeCliBinaryPath() !== null
+}
+
+/**
+ * The Codex CLI authenticated via ChatGPT subscription login. When present,
+ * OpenAI-model tasks can dispatch through `codex exec` without an
+ * OPENAI_API_KEY — same idea as the Claude Code CLI path above.
+ */
+let codexCliBinaryPath: string | false | null = null
+
+/**
+ * Resolve the Codex CLI binary path. Returns 'codex' (bare command name) when
+ * it's in PATH. Cached — spawnSync costs ~1s.
+ */
+function getCodexCliBinaryPath(): string | null {
+  if (codexCliBinaryPath !== null) {
+    return codexCliBinaryPath || null
+  }
+
+  try {
+    const { spawnSync } = require('node:child_process')
+    const r = spawnSync('codex', ['--version'], { stdio: 'ignore', timeout: 5000 })
+    if (r.status === 0) {
+      codexCliBinaryPath = 'codex'
+      return 'codex'
+    }
+    codexCliBinaryPath = false
+    return null
+  } catch {
+    codexCliBinaryPath = false
+    return null
+  }
+}
+
+function isCodexCliAvailable(): boolean {
+  return getCodexCliBinaryPath() !== null
+}
+
+function isDirectDispatchAvailable(provider?: DirectProvider): boolean {
+  if (provider === 'anthropic') return !!getAnthropicApiKey() || isClaudeCliAvailable()
+  if (provider === 'openai') return !!getOpenAIApiKey() || isCodexCliAvailable()
+  if (provider === 'local') return !!getLocalEndpoint()
+  if (provider === 'minimax') return !!getMiniMaxApiKey()
+  return !!getAnthropicApiKey() || !!getOpenAIApiKey() || !!getLocalEndpoint()
+    || !!getMiniMaxApiKey() || isClaudeCliAvailable() || isCodexCliAvailable()
+}
+
+/**
+ * Dispatch via the host-mounted Claude Code CLI, using the operator's existing
+ * login (no API key required). Reads the prompt over stdin and asks for a
+ * machine-readable result via `--output-format json`.
+ *
+ * The CLI accepts model aliases ("opus" / "sonnet" / "haiku") and the long
+ * `claude-...` IDs. We try the bare ID first (already produced by
+ * `classifyDirectModel`), and fall back to the alias derived from the family
+ * keyword so a stale `claude-opus-4-5` mapping still routes correctly.
+ */
+/** Session routing for #602: create materializes the agent's base session under
+ * a server-generated UUID; resume forks a fresh per-task session from it. */
+interface ClaudeCliSessionOptions {
+  create?: string
+  resume?: string
+}
+
+// Bounded CLI output (#602 contract): a runaway child cannot grow dispatch
+// memory without limit. Applies to every claude CLI dispatch path.
+const CLAUDE_CLI_MAX_OUTPUT_BYTES = 1_000_000
+
+async function callClaudeViaCli(
+  task: DispatchableTask,
+  prompt: string,
+  model: string,
+  session?: ClaudeCliSessionOptions,
+): Promise<AgentResponseParsed> {
+  const soul = getAgentSoulContent(task)
+  const sandbox = resolveCliSandboxOptions(task)
+  const args = ['--print', '--output-format', 'json', '--model', model]
+  if (session?.create) args.push('--session-id', session.create)
+  else if (session?.resume) args.push('--resume', session.resume, '--fork-session')
+  if (sandbox.allowedTools) args.push('--allowedTools', sandbox.allowedTools.join(','))
+  if (sandbox.maxBudgetUsd !== null) args.push('--max-budget-usd', String(sandbox.maxBudgetUsd))
+  if (soul) args.push('--append-system-prompt', soul)
+
+  const sandboxApplied = sandbox.allowedTools !== null || sandbox.maxBudgetUsd !== null || sandbox.cwd !== null
+  logger.info(
+    {
+      taskId: task.id, model, agent: task.agent_name,
+      ...(session?.create ? { sessionCreate: session.create } : {}),
+      ...(session?.resume ? { sessionResume: session.resume } : {}),
+      ...(sandboxApplied ? { sandbox: { allowedTools: sandbox.allowedTools, maxBudgetUsd: sandbox.maxBudgetUsd, cwd: sandbox.cwd } } : {}),
+    },
+    'Dispatching task via Claude CLI',
+  )
+
+  return await new Promise<AgentResponseParsed>((resolve, reject) => {
+    const claudePath = getClaudeCliBinaryPath()
+    if (!claudePath) {
+      return reject(new Error('Claude CLI not available'))
+    }
+    const proc = spawn(claudePath, args, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, CI: '1' },
+      ...(sandbox.cwd ? { cwd: sandbox.cwd } : {}),
+    })
+    let stdout = ''
+    let stderr = ''
+    let outputBytes = 0
+    const timeoutMs = 180_000
+    const timer = setTimeout(() => {
+      proc.kill('SIGTERM')
+      reject(new Error(`Claude CLI timed out after ${timeoutMs / 1000}s`))
+    }, timeoutMs)
+    const guardOutput = (chunk: Buffer) => {
+      outputBytes += chunk.length
+      if (outputBytes > CLAUDE_CLI_MAX_OUTPUT_BYTES) {
+        clearTimeout(timer)
+        proc.kill('SIGKILL')
+        reject(new Error(`Claude CLI output exceeded ${CLAUDE_CLI_MAX_OUTPUT_BYTES} bytes`))
+        return false
+      }
+      return true
+    }
+
+    proc.stdout.on('data', (d) => { if (guardOutput(d)) stdout += d.toString() })
+    proc.stderr.on('data', (d) => { if (guardOutput(d)) stderr += d.toString() })
+    proc.on('error', (err) => { clearTimeout(timer); reject(err) })
+    proc.on('close', (code) => {
+      clearTimeout(timer)
+      if (code !== 0) {
+        return reject(new Error(`claude CLI exited ${code}: ${stderr.slice(0, 500) || stdout.slice(0, 500)}`))
+      }
+      try {
+        const parsed = JSON.parse(stdout)
+        const text: string | null = (typeof parsed?.result === 'string' && parsed.result)
+          || (typeof parsed?.output === 'string' && parsed.output)
+          || (typeof parsed?.text === 'string' && parsed.text)
+          || stdout.trim()
+          || null
+        const sessionId: string | null = (typeof parsed?.session_id === 'string' && parsed.session_id)
+          || (typeof parsed?.sessionId === 'string' && parsed.sessionId)
+          || null
+
+        // Record token usage if reported.
+        if (parsed?.usage && (parsed.usage.input_tokens || parsed.usage.output_tokens)) {
+          recordDispatchTokenUsage({
+            model,
+            sessionId: sessionId || `task-${task.id}`,
+            inputTokens: parsed.usage.input_tokens || 0,
+            outputTokens: parsed.usage.output_tokens || 0,
+            workspaceId: task.workspace_id,
+          })
+        }
+
+        resolve({ text, sessionId })
+      } catch {
+        resolve({ text: stdout.trim() || null, sessionId: null })
+      }
+    })
+
+    proc.stdin.write(prompt)
+    proc.stdin.end()
+  })
+}
+
+/**
+ * #602: dispatch through the agent's persistent Claude Code base session.
+ * First successful dispatch materializes the base session under a
+ * server-generated UUID (`--session-id`); every later dispatch forks a
+ * per-task session from it (`--resume <base> --fork-session`), and the forked
+ * id flows through the normal completion tail into
+ * `tasks.metadata.dispatch_session_id`.
+ *
+ * No-fallback rule: any failure here (missing CLI, auth, expired or damaged
+ * session) is a dispatch failure. We never reroute to the API-key or gateway
+ * paths — those run with different authority than the operator's CLI login.
+ */
+async function dispatchViaClaudeSession(
+  task: DispatchableTask,
+  prompt: string,
+): Promise<AgentResponseParsed> {
+  if (!isClaudeCliAvailable()) {
+    auditClaudeSessionDispatch({
+      agentId: task.agent_id,
+      baseSessionId: '',
+      taskId: task.id,
+      outcome: 'failed',
+      error: 'claude CLI unavailable for runtime_type=claude agent',
+    })
+    throw new Error(
+      `claude runtime dispatch: CLI unavailable for agent ${task.agent_name}; refusing to fall back to a less restrictive provider`,
+    )
+  }
+
+  const base = ensureClaudeBaseSession(task.agent_id)
+  const model = stripProviderPrefix(classifyDirectModel(task))
+  const session = base.materialized ? { resume: base.sessionId } : { create: base.sessionId }
+
+  try {
+    const response = await callClaudeViaCli(task, prompt, model, session)
+    if (!base.materialized) {
+      markClaudeBaseSessionMaterialized(task.agent_id, base.sessionId)
+    }
+    auditClaudeSessionDispatch({
+      agentId: task.agent_id,
+      baseSessionId: base.sessionId,
+      taskId: task.id,
+      outcome: 'resumed',
+      forkedSessionId: base.materialized ? response.sessionId : null,
+    })
+    return response
+  } catch (err) {
+    // If this was a first-dispatch create attempt that failed, mark the session
+    // as materialized anyway. This allows retry to resume instead of attempting
+    // create again with the same id, which would collision-loop forever (#934).
+    // The original error is preserved in the audit and thrown upward unchanged.
+    if (!base.materialized) {
+      markClaudeBaseSessionMaterialized(task.agent_id, base.sessionId)
+    }
+    auditClaudeSessionDispatch({
+      agentId: task.agent_id,
+      baseSessionId: base.sessionId,
+      taskId: task.id,
+      outcome: 'failed',
+      error: err instanceof Error ? err.message : String(err),
+    })
+    throw err
+  }
+}
+
+async function callOpenAICompatible(
+  task: DispatchableTask,
+  prompt: string,
+  endpoint: string,
+  apiKey: string | null,
+  model: string,
+  providerLabel: DirectProvider,
+): Promise<AgentResponseParsed> {
+  const soul = getAgentSoulContent(task)
+  const messages: Array<{ role: string; content: string }> = []
+  if (soul) messages.push({ role: 'system', content: soul })
+  messages.push({ role: 'user', content: prompt })
+
+  const body = { model, messages, max_tokens: 4096 }
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`
+
+  logger.info({ taskId: task.id, model, agent: task.agent_name, provider: providerLabel },
+    `Dispatching task via direct ${providerLabel} API`)
+
+  const res = await fetch(`${endpoint.replace(/\/$/, '')}/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  })
+
+  if (!res.ok) {
+    const errorBody = await res.text().catch(() => '')
+    throw new Error(`${providerLabel} API ${res.status}: ${errorBody.substring(0, 500)}`)
+  }
+
+  const data = await res.json() as {
+    choices?: Array<{ message?: { content?: string } }>
+    usage?: { prompt_tokens?: number; completion_tokens?: number }
+  }
+  const text = data.choices?.[0]?.message?.content?.trim() || null
+
+  if (data.usage) {
+    recordDispatchTokenUsage({
+      model,
+      sessionId: `task-${task.id}`,
+      inputTokens: data.usage.prompt_tokens || 0,
+      outputTokens: data.usage.completion_tokens || 0,
+      workspaceId: task.workspace_id,
+    })
+  }
+
+  return { text, sessionId: null }
+}
+
+async function callMiniMaxAnthropicCompatible(
+  task: DispatchableTask,
+  prompt: string,
+  endpoint: string,
+  apiKey: string,
+  model: string,
+): Promise<AgentResponseParsed> {
+  const soul = getAgentSoulContent(task)
+  const messages: Array<{ role: string; content: string }> = [
+    { role: 'user', content: prompt },
+  ]
+  const body: Record<string, unknown> = { model, max_tokens: 4096, messages }
+  if (soul) body.system = soul
+
+  logger.info(
+    { taskId: task.id, model, agent: task.agent_name, provider: 'minimax' },
+    'Dispatching task via direct MiniMax API',
+  )
+
+  const res = await fetch(endpoint.replace(/\/$/, '') + '/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer ' + apiKey,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify(body),
+  })
+
+  if (!res.ok) {
+    const errorBody = await res.text().catch(() => '')
+    throw new Error('MiniMax API ' + res.status + ': ' + errorBody.substring(0, 500))
+  }
+
+  const data = await res.json() as {
+    content?: Array<{ type: string; text?: string }>
+    usage?: { input_tokens?: number; output_tokens?: number }
+  }
+  const text = data.content
+    ?.filter(block => block.type === 'text')
+    .map(block => block.text || '')
+    .join('\n') || null
+
+  if (data.usage) {
+    recordDispatchTokenUsage({
+      model,
+      sessionId: 'task-' + task.id,
+      inputTokens: data.usage.input_tokens || 0,
+      outputTokens: data.usage.output_tokens || 0,
+      workspaceId: task.workspace_id,
+    })
+  }
+
+  return { text, sessionId: null }
+}
+
+async function callMiniMaxDirectly(
+  task: DispatchableTask,
+  prompt: string,
+  model: string,
+): Promise<AgentResponseParsed> {
+  const apiKey = getMiniMaxApiKey()
+  if (!apiKey) throw new Error('MINIMAX_API_KEY not set — cannot dispatch to MiniMax without gateway')
+
+  const { baseUrl, protocol } = resolveMiniMaxEndpoint()
+  const modelId = stripProviderPrefix(model)
+  if (protocol === 'anthropic') {
+    return callMiniMaxAnthropicCompatible(task, prompt, baseUrl, apiKey, modelId)
+  }
+  return callOpenAICompatible(task, prompt, baseUrl, apiKey, modelId, 'minimax')
+}
+
+async function callOpenAIDirectly(task: DispatchableTask, prompt: string, model: string): Promise<AgentResponseParsed> {
+  const apiKey = getOpenAIApiKey()
+  if (!apiKey) {
+    // No API key — fall back to the host Codex CLI (ChatGPT subscription
+    // login), mirroring the Claude CLI path used for Anthropic models.
+    if (isCodexCliAvailable()) return callCodexViaCli(task, prompt, stripProviderPrefix(model))
+    throw new Error('OPENAI_API_KEY not set and Codex CLI not found — cannot dispatch to OpenAI without gateway')
+  }
+  return callOpenAICompatible(task, prompt, 'https://api.openai.com/v1', apiKey, stripProviderPrefix(model), 'openai')
+}
+
+/**
+ * Dispatch via the host Codex CLI using the operator's ChatGPT login (no API
+ * key required). One-shot `codex exec` run: prompt over stdin (`-` arg, avoids
+ * Windows argv length limits and quoting), clean result text retrieved via
+ * --output-last-message. The agent soul has no system-prompt flag on codex,
+ * so it is prepended to the prompt body.
+ */
+async function callCodexViaCli(
+  task: DispatchableTask,
+  prompt: string,
+  model: string,
+): Promise<AgentResponseParsed> {
+  const os = require('node:os')
+  const path = require('node:path')
+  const { readFileSync, rmSync } = require('node:fs')
+  const outPath = path.join(os.tmpdir(), `mc-codex-task-${task.id}-${process.pid}-${Date.now()}.txt`)
+
+  const soul = getAgentSoulContent(task)
+  const fullPrompt = soul ? `${soul}\n\n---\n\n${prompt}` : prompt
+
+  const args = ['exec', '--sandbox', 'workspace-write', '--skip-git-repo-check', '--output-last-message', outPath]
+  // ChatGPT-subscription auth only supports the account's model lineup (e.g.
+  // gpt-5.5); claude-* or unsupported gpt ids would 400. Pass --model only for
+  // explicit gpt overrides, otherwise let the CLI use its configured default.
+  if (model && /^gpt-/i.test(model)) args.push('--model', model)
+  args.push('-')
+
+  // Workspace-scoped cwd only (issue #720) — codex's own --sandbox flag
+  // handling above stays untouched.
+  const dispatchCwd = resolveCliSandboxOptions(task).cwd
+  logger.info(
+    { taskId: task.id, model, agent: task.agent_name, ...(dispatchCwd ? { sandbox: { cwd: dispatchCwd } } : {}) },
+    'Dispatching task via Codex CLI',
+  )
+
+  return await new Promise<AgentResponseParsed>((resolve, reject) => {
+    const codexPath = getCodexCliBinaryPath()
+    if (!codexPath) {
+      return reject(new Error('Codex CLI not available'))
+    }
+    const proc = spawn(codexPath, args, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env },
+      ...(dispatchCwd ? { cwd: dispatchCwd } : {}),
+    })
+    let stdout = ''
+    let stderr = ''
+    const timeoutMs = 300_000
+    const timer = setTimeout(() => {
+      proc.kill('SIGTERM')
+      reject(new Error(`Codex CLI timed out after ${timeoutMs / 1000}s`))
+    }, timeoutMs)
+
+    proc.stdout.on('data', (d) => { stdout += d.toString() })
+    proc.stderr.on('data', (d) => { stderr += d.toString() })
+    proc.on('error', (err) => { clearTimeout(timer); reject(err) })
+    proc.on('close', (code) => {
+      clearTimeout(timer)
+      let text: string | null = null
+      try { text = (readFileSync(outPath, 'utf8') as string).trim() || null } catch { /* no output file written */ }
+      try { rmSync(outPath, { force: true }) } catch { /* ignore */ }
+      if (code !== 0 && !text) {
+        return reject(new Error(`codex CLI exited ${code}: ${(stderr || stdout).slice(0, 500)}`))
+      }
+      resolve({ text: text || stdout.trim() || null, sessionId: null })
+    })
+
+    proc.stdin.write(fullPrompt)
+    proc.stdin.end()
+  })
+}
+
+async function callLocalDirectly(task: DispatchableTask, prompt: string, model: string): Promise<AgentResponseParsed> {
+  const endpoint = getLocalEndpoint()
+  if (!endpoint) throw new Error('LOCAL_LLM_ENDPOINT not set — cannot dispatch to local model')
+  return callOpenAICompatible(task, prompt, endpoint, getLocalApiKey(), stripProviderPrefix(model), 'local')
+}
+
+async function callDirectly(task: DispatchableTask, prompt: string): Promise<AgentResponseParsed> {
+  const model = classifyDirectModel(task)
+  const provider = pickProvider(model)
+  if (provider === 'minimax') return callMiniMaxDirectly(task, prompt, model)
+  if (provider === 'openai') return callOpenAIDirectly(task, prompt, model)
+  if (provider === 'local') return callLocalDirectly(task, prompt, model)
+  // Anthropic: prefer the host Claude Code CLI when available — it uses the
+  // operator's existing login, no API key needed. Fall back to the API key
+  // path only if the CLI isn't installed.
+  if (isClaudeCliAvailable()) return callClaudeViaCli(task, prompt, stripProviderPrefix(model))
+  return callClaudeDirectly(task, prompt)
+}
+
 interface ReviewableTask {
   id: number
   title: string
   description: string | null
+  status: string
+  priority: string
   resolution: string | null
   assigned_to: string | null
+  agent_config: string | null
   workspace_id: number
+  project_id: number | null
   ticket_prefix: string | null
   project_ticket_no: number | null
+}
+
+function resolveGatewayAgentIdForReview(task: ReviewableTask): string {
+  if (task.agent_config) {
+    try {
+      const cfg = JSON.parse(task.agent_config)
+      if (typeof cfg.openclawId === 'string' && cfg.openclawId) return cfg.openclawId
+    } catch { /* ignore */ }
+  }
+  return task.assigned_to || 'jarv'
 }
 
 function buildReviewPrompt(task: ReviewableTask): string {
@@ -153,11 +1458,14 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
   const db = getDatabase()
 
   const tasks = db.prepare(`
-    SELECT t.id, t.title, t.description, t.resolution, t.assigned_to, t.workspace_id,
-           p.ticket_prefix, t.project_ticket_no
+    SELECT t.id, t.title, t.description, t.status, t.priority, t.resolution, t.assigned_to, t.workspace_id,
+           t.project_id, p.ticket_prefix, t.project_ticket_no, a.config as agent_config
     FROM tasks t
+    JOIN workspaces w ON w.id = t.workspace_id
     LEFT JOIN projects p ON p.id = t.project_id AND p.workspace_id = t.workspace_id
+    LEFT JOIN agents a ON a.name = t.assigned_to AND a.workspace_id = t.workspace_id
     WHERE t.status = 'review'
+      AND w.isolation = 'shared'
     ORDER BY t.updated_at ASC
     LIMIT 3
   `).all() as ReviewableTask[]
@@ -170,43 +1478,53 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
 
   for (const task of tasks) {
     // Move to quality_review to prevent re-processing
-    db.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?')
-      .run('quality_review', Math.floor(Date.now() / 1000), task.id)
+    db.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND workspace_id = ?')
+      .run('quality_review', Math.floor(Date.now() / 1000), task.id, task.workspace_id)
 
     eventBus.broadcast('task.status_changed', {
       id: task.id,
       status: 'quality_review',
       previous_status: 'review',
+      workspace_id: task.workspace_id,
     })
 
     try {
       const prompt = buildReviewPrompt(task)
-      // Use the assigned agent or fall back to a default reviewer agent
-      const reviewAgent = task.assigned_to || 'jarv'
+      let agentResponse: AgentResponseParsed
 
-      const invokeParams = {
-        message: prompt,
-        agentId: reviewAgent,
-        idempotencyKey: `aegis-review-${task.id}-${Date.now()}`,
-        deliver: false,
+      if (!isGatewayAvailable() && isDirectDispatchAvailable()) {
+        // Direct API review through the configured provider, with no gateway required.
+        // Pass through agent_config so Aegis honors per-agent dispatchModel
+        // overrides and routes to the matching provider.
+        const reviewTask: DispatchableTask = {
+          id: task.id, title: task.title, description: task.description,
+          status: 'quality_review', priority: 'high', assigned_to: 'aegis',
+          workspace_id: task.workspace_id, agent_name: 'aegis', agent_id: 0,
+          agent_config: task.agent_config, ticket_prefix: task.ticket_prefix,
+          project_ticket_no: task.project_ticket_no, project_id: null,
+        }
+        agentResponse = await callDirectly(reviewTask, prompt)
+      } else {
+        // Resolve the gateway agent ID from config, falling back to assigned_to or default
+        const reviewAgent = resolveGatewayAgentIdForReview(task)
+
+        const invokeParams = {
+          message: prompt,
+          agentId: reviewAgent,
+          idempotencyKey: `aegis-review-${task.id}-${Date.now()}`,
+          deliver: false,
+        }
+        const finalPayload = await callOpenClawGateway<any>(
+          'agent',
+          invokeParams,
+          125_000,
+          { expectFinal: true },
+        )
+        agentResponse = parseAgentResponse(
+          finalPayload?.result ? JSON.stringify(finalPayload.result) : JSON.stringify(finalPayload)
+        )
       }
-      const invokeResult = await runOpenClaw(
-        ['gateway', 'call', 'agent', '--timeout', '10000', '--params', JSON.stringify(invokeParams), '--json'],
-        { timeoutMs: 12_000 }
-      )
-      const acceptedPayload = parseGatewayJson(invokeResult.stdout)
-        ?? parseGatewayJson(String((invokeResult as any)?.stderr || ''))
-      const runId = acceptedPayload?.runId
-      if (!runId) throw new Error('Gateway did not return a runId for Aegis review')
 
-      const waitResult = await runOpenClaw(
-        ['gateway', 'call', 'agent.wait', '--timeout', '120000', '--params', JSON.stringify({ runId, timeoutMs: 115_000 }), '--json'],
-        { timeoutMs: 125_000 }
-      )
-      const waitPayload = parseGatewayJson(waitResult.stdout)
-      const agentResponse = parseAgentResponse(
-        waitPayload?.result ? JSON.stringify(waitPayload.result) : waitResult.stdout
-      )
       if (!agentResponse.text) {
         throw new Error('Aegis review returned empty response')
       }
@@ -220,30 +1538,58 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
       `).run(task.id, verdict.status, verdict.notes, task.workspace_id)
 
       if (verdict.status === 'approved') {
-        db.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?')
-          .run('done', Math.floor(Date.now() / 1000), task.id)
+        db.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND workspace_id = ?')
+          .run('done', Math.floor(Date.now() / 1000), task.id, task.workspace_id)
 
         eventBus.broadcast('task.status_changed', {
           id: task.id,
           status: 'done',
           previous_status: 'quality_review',
+          workspace_id: task.workspace_id,
         })
+        syncAndEscalateIfFailed(task, 'done')
       } else {
-        // Rejected: push back to in_progress with feedback
-        db.prepare('UPDATE tasks SET status = ?, error_message = ?, updated_at = ? WHERE id = ?')
-          .run('in_progress', `Aegis rejected: ${verdict.notes}`, Math.floor(Date.now() / 1000), task.id)
+        // Rejected: check dispatch_attempts to decide next status
+        const now = Math.floor(Date.now() / 1000)
+        const currentAttempts = (db.prepare('SELECT dispatch_attempts FROM tasks WHERE id = ? AND workspace_id = ?').get(task.id, task.workspace_id) as { dispatch_attempts: number } | undefined)?.dispatch_attempts ?? 0
+        const newAttempts = currentAttempts + 1
+        const maxAegisRetries = 3
 
-        eventBus.broadcast('task.status_changed', {
-          id: task.id,
-          status: 'in_progress',
-          previous_status: 'quality_review',
-        })
+        if (newAttempts >= maxAegisRetries) {
+          // Too many rejections — move to failed
+          db.prepare('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, updated_at = ? WHERE id = ? AND workspace_id = ?')
+            .run('failed', `Aegis rejected ${newAttempts} times. Last: ${verdict.notes}`, newAttempts, now, task.id, task.workspace_id)
+
+          eventBus.broadcast('task.status_changed', {
+            id: task.id,
+            status: 'failed',
+            previous_status: 'quality_review',
+            error_message: `Aegis rejected ${newAttempts} times`,
+            reason: 'max_aegis_retries_exceeded',
+            workspace_id: task.workspace_id,
+          })
+          syncAndEscalateIfFailed(task, 'failed', `Aegis rejected ${newAttempts} times`, newAttempts)
+        } else {
+          // Requeue to assigned for re-dispatch with feedback
+          db.prepare('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, updated_at = ? WHERE id = ? AND workspace_id = ?')
+            .run('assigned', `Aegis rejected: ${verdict.notes}`, newAttempts, now, task.id, task.workspace_id)
+
+          eventBus.broadcast('task.status_changed', {
+            id: task.id,
+            status: 'assigned',
+            previous_status: 'quality_review',
+            error_message: `Aegis rejected: ${verdict.notes}`,
+            reason: 'aegis_rejection',
+            workspace_id: task.workspace_id,
+          })
+          syncAndEscalateIfFailed(task, 'assigned')
+        }
 
         // Add rejection as a comment so the agent sees it on next dispatch
         db.prepare(`
           INSERT INTO comments (task_id, author, content, created_at, workspace_id)
           VALUES (?, 'aegis', ?, ?, ?)
-        `).run(task.id, `Quality Review Rejected:\n${verdict.notes}`, Math.floor(Date.now() / 1000), task.workspace_id)
+        `).run(task.id, `Quality Review Rejected (attempt ${newAttempts}/${maxAegisRetries}):\n${verdict.notes}`, now, task.workspace_id)
       }
 
       db_helpers.logActivity(
@@ -263,13 +1609,14 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
       logger.error({ taskId: task.id, err }, 'Aegis review failed')
 
       // Revert to review so it can be retried
-      db.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?')
-        .run('review', Math.floor(Date.now() / 1000), task.id)
+      db.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND workspace_id = ?')
+        .run('review', Math.floor(Date.now() / 1000), task.id, task.workspace_id)
 
       eventBus.broadcast('task.status_changed', {
         id: task.id,
         status: 'review',
         previous_status: 'quality_review',
+        workspace_id: task.workspace_id,
       })
 
       results.push({ id: task.id, verdict: 'error', error: errorMsg.substring(0, 100) })
@@ -286,16 +1633,111 @@ export async function runAegisReviews(): Promise<{ ok: boolean; message: string 
   }
 }
 
+/**
+ * Requeue stale tasks stuck in 'in_progress' whose assigned agent is offline.
+ * Prevents tasks from being permanently stuck when agents crash or disconnect.
+ */
+export async function requeueStaleTasks(): Promise<{ ok: boolean; message: string }> {
+  const db = getDatabase()
+  const now = Math.floor(Date.now() / 1000)
+  const staleThreshold = now - 10 * 60 // 10 minutes
+  const maxDispatchRetries = 5
+
+  const staleTasks = db.prepare(`
+    SELECT t.id, t.title, t.assigned_to, t.dispatch_attempts, t.workspace_id,
+           a.status as agent_status, a.last_seen as agent_last_seen
+    FROM tasks t
+    LEFT JOIN agents a ON a.name = t.assigned_to AND a.workspace_id = t.workspace_id
+    WHERE t.status = 'in_progress'
+      AND t.updated_at < ?
+  `).all(staleThreshold) as Array<{
+    id: number; title: string; assigned_to: string | null; dispatch_attempts: number
+    workspace_id: number; agent_status: string | null; agent_last_seen: number | null
+  }>
+
+  if (staleTasks.length === 0) {
+    return { ok: true, message: 'No stale tasks found' }
+  }
+
+  let requeued = 0
+  let failed = 0
+
+  // When MC runs in direct-API mode (no gateway), the agent has no heartbeat
+  // and stays "offline" by design — but tasks still get dispatched via the
+  // configured direct provider. Skip the offline-stale check
+  // entirely in that mode, otherwise every task is failed after 5 cycles
+  // before any direct-API dispatch can run.
+  const directApiSkipsStaleCheck = !isGatewayAvailable() && isDirectDispatchAvailable()
+
+  for (const task of staleTasks) {
+    if (directApiSkipsStaleCheck) continue
+    // Only requeue if the agent is offline or unknown
+    const agentOffline = !task.agent_status || task.agent_status === 'offline'
+    if (!agentOffline) continue
+
+    const newAttempts = (task.dispatch_attempts ?? 0) + 1
+
+    if (newAttempts >= maxDispatchRetries) {
+      db.prepare('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, updated_at = ? WHERE id = ? AND workspace_id = ?')
+        .run('failed', `Task stuck in_progress ${newAttempts} times — agent "${task.assigned_to}" offline. Moved to failed.`, newAttempts, now, task.id, task.workspace_id)
+
+      eventBus.broadcast('task.status_changed', {
+        id: task.id,
+        status: 'failed',
+        previous_status: 'in_progress',
+        error_message: `Stale task — agent offline after ${newAttempts} attempts`,
+        reason: 'stale_task_max_retries',
+        workspace_id: task.workspace_id,
+      })
+
+      syncAndEscalateIfFailed(task as any, 'failed', `Task stuck in_progress ${newAttempts} times`, newAttempts)
+      failed++
+    } else {
+      db.prepare('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, updated_at = ? WHERE id = ? AND workspace_id = ?')
+        .run('assigned', `Requeued: agent "${task.assigned_to}" went offline while task was in_progress`, newAttempts, now, task.id, task.workspace_id)
+
+      // Add a comment explaining the requeue
+      db.prepare(`
+        INSERT INTO comments (task_id, author, content, created_at, workspace_id)
+        VALUES (?, 'scheduler', ?, ?, ?)
+      `).run(task.id, `Task requeued (attempt ${newAttempts}/${maxDispatchRetries}): agent "${task.assigned_to}" went offline while task was in_progress.`, now, task.workspace_id)
+
+      eventBus.broadcast('task.status_changed', {
+        id: task.id,
+        status: 'assigned',
+        previous_status: 'in_progress',
+        error_message: `Agent "${task.assigned_to}" went offline`,
+        reason: 'stale_task_requeue',
+        workspace_id: task.workspace_id,
+      })
+      syncAndEscalateIfFailed(task as any, 'assigned')
+
+      requeued++
+    }
+  }
+
+  const total = requeued + failed
+  return {
+    ok: true,
+    message: total === 0
+      ? `Found ${staleTasks.length} stale task(s) but agents still online`
+      : `Requeued ${requeued}, failed ${failed} of ${staleTasks.length} stale task(s)`,
+  }
+}
+
 export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: string }> {
   const db = getDatabase()
 
   const tasks = db.prepare(`
-    SELECT t.*, a.name as agent_name, a.id as agent_id,
+    SELECT t.*, a.name as agent_name, a.id as agent_id, a.config as agent_config,
+           a.runtime_type as agent_runtime_type,
            p.ticket_prefix, t.project_ticket_no
     FROM tasks t
     JOIN agents a ON a.name = t.assigned_to AND a.workspace_id = t.workspace_id
+    JOIN workspaces w ON w.id = t.workspace_id
     LEFT JOIN projects p ON p.id = t.project_id AND p.workspace_id = t.workspace_id
     WHERE t.status = 'assigned'
+      AND w.isolation = 'shared'
       AND t.assigned_to IS NOT NULL
     ORDER BY
       CASE t.priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END ASC,
@@ -318,14 +1760,25 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
   const now = Math.floor(Date.now() / 1000)
 
   for (const task of tasks) {
-    // Mark as in_progress immediately to prevent re-dispatch
-    db.prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?')
-      .run('in_progress', now, task.id)
+    // Atomically claim the task: only flip to in_progress if it is still
+    // 'assigned'. If two dispatchers race (e.g. concurrent scheduler ticks or
+    // multiple workers polling), exactly one UPDATE reports changes=1 and the
+    // loser skips this task — preventing double-dispatch (issue/PR #698).
+    const claim = db
+      .prepare("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'assigned' AND workspace_id = ?")
+      .run('in_progress', now, task.id, task.workspace_id)
+
+    if (claim.changes === 0) {
+      // Another dispatcher won the race (or the task was cancelled between
+      // SELECT and UPDATE). Skip silently — no event, no activity, no work.
+      continue
+    }
 
     eventBus.broadcast('task.status_changed', {
       id: task.id,
       status: 'in_progress',
       previous_status: 'assigned',
+      workspace_id: task.workspace_id,
     })
 
     db_helpers.logActivity(
@@ -342,43 +1795,170 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
       // Check for previous Aegis rejection feedback
       const rejectionRow = db.prepare(`
         SELECT content FROM comments
-        WHERE task_id = ? AND author = 'aegis' AND content LIKE 'Quality Review Rejected:%'
+        WHERE task_id = ? AND author = 'aegis' AND content LIKE 'Quality Review Rejected:%' AND workspace_id = ?
         ORDER BY created_at DESC LIMIT 1
-      `).get(task.id) as { content: string } | undefined
+      `).get(task.id, task.workspace_id) as { content: string } | undefined
       const rejectionFeedback = rejectionRow?.content?.replace(/^Quality Review Rejected:\n?/, '') || null
 
       const prompt = buildTaskPrompt(task, rejectionFeedback)
 
-      // Step 1: Invoke via gateway
-      const invokeParams = {
-        message: prompt,
-        agentId: task.agent_name,
-        idempotencyKey: `task-dispatch-${task.id}-${Date.now()}`,
-        deliver: false,
-      }
-      const invokeResult = await runOpenClaw(
-        ['gateway', 'call', 'agent', '--timeout', '10000', '--params', JSON.stringify(invokeParams), '--json'],
-        { timeoutMs: 12_000 }
-      )
-      const acceptedPayload = parseGatewayJson(invokeResult.stdout)
-        ?? parseGatewayJson(String((invokeResult as any)?.stderr || ''))
-      const runId = acceptedPayload?.runId
-      if (!runId) throw new Error('Gateway did not return a runId for task dispatch')
+      // Check if task has a target session specified in metadata
+      const taskMeta = (() => {
+        try {
+          const row = db.prepare('SELECT metadata FROM tasks WHERE id = ? AND workspace_id = ?')
+            .get(task.id, task.workspace_id) as { metadata: string } | undefined
+          return row?.metadata ? JSON.parse(row.metadata) : {}
+        } catch { return {} }
+      })()
+      const targetSession: string | null = typeof taskMeta?.target_session === 'string' && taskMeta.target_session
+        ? taskMeta.target_session
+        : null
 
-      // Step 2: Wait for completion
-      const waitResult = await runOpenClaw(
-        ['gateway', 'call', 'agent.wait', '--timeout', '120000', '--params', JSON.stringify({ runId, timeoutMs: 115_000 }), '--json'],
-        { timeoutMs: 125_000 }
-      )
-      const waitPayload = parseGatewayJson(waitResult.stdout)
+      let agentResponse: AgentResponseParsed
+      const useDirectApi = !isGatewayAvailable() && isDirectDispatchAvailable()
 
-      const agentResponse = parseAgentResponse(
-        waitPayload?.result ? JSON.stringify(waitPayload.result) : waitResult.stdout
-      )
-      // Capture sessionId from the wait payload if not in the parsed response
-      if (!agentResponse.sessionId && waitPayload?.sessionId) {
-        agentResponse.sessionId = waitPayload.sessionId
-      }
+      if (String(task.agent_runtime_type || '').toLowerCase() === 'claude') {
+        // #602: explicit opt-in per-agent Claude Code session dispatch. This
+        // branch deliberately outranks gateway availability, target_session,
+        // and callDirectly — a claude-runtime agent never falls back to a
+        // less restrictive provider; failures surface as dispatch failures.
+        agentResponse = await dispatchViaClaudeSession(task, prompt)
+      } else if (useDirectApi && !targetSession) {
+        // Direct API dispatch — provider chosen by `dispatchModel`. No gateway needed.
+        agentResponse = await callDirectly(task, prompt)
+      } else if (targetSession) {
+        // Dispatch to a specific existing session via chat.send
+        logger.info({ taskId: task.id, targetSession, agent: task.agent_name }, 'Dispatching task to targeted session')
+        const sendResult = await callOpenClawGateway<any>(
+          'chat.send',
+          {
+            sessionKey: targetSession,
+            message: prompt,
+            idempotencyKey: `task-dispatch-${task.id}-${Date.now()}`,
+            deliver: false,
+          },
+          125_000,
+        )
+        const status = String(sendResult?.status || '').toLowerCase()
+        if (status !== 'started' && status !== 'ok' && status !== 'in_flight' && status !== 'accepted') {
+          throw new Error(`chat.send to session ${targetSession} returned status: ${status}`)
+        }
+        // chat.send is fire-and-forget. Only runs with a runId can be safely
+        // reconciled by agent.wait; accepted sends without one need explicit
+        // manual/later recovery instead of looking pending forever.
+        const dispatchRunId = typeof sendResult?.runId === 'string' && sendResult.runId.trim()
+          ? sendResult.runId.trim()
+          : null
+        const asyncState = dispatchRunId ? 'pending' : 'accepted_without_run_id'
+        const pendingMeta: Record<string, any> = {
+          ...taskMeta,
+          target_session: targetSession,
+          dispatch_session_id: targetSession,
+          ...(dispatchRunId ? { dispatch_run_id: dispatchRunId } : {
+            async_reconciliation: 'manual_required',
+            async_warning: 'chat.send accepted without a runId; automatic completion reconciliation cannot safely wait on this session.',
+          }),
+          async_state: asyncState,
+          async_dispatched_at: Math.floor(Date.now() / 1000),
+        }
+        db.prepare('UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ? AND workspace_id = ?')
+          .run(JSON.stringify(pendingMeta), Math.floor(Date.now() / 1000), task.id, task.workspace_id)
+
+        eventBus.broadcast('task.updated', {
+          id: task.id,
+          status: 'in_progress',
+          assigned_to: task.assigned_to,
+          dispatch_session_id: targetSession,
+          dispatch_run_id: pendingMeta.dispatch_run_id,
+          async_state: asyncState,
+          workspace_id: task.workspace_id,
+        })
+
+        db_helpers.logActivity(
+          dispatchRunId ? 'task_deferred_dispatch' : 'task_deferred_dispatch_unreconcilable',
+          'task',
+          task.id,
+          'scheduler',
+          dispatchRunId
+            ? `Deferred task "${task.title}" to existing session ${targetSession}`
+            : `Accepted task "${task.title}" in existing session ${targetSession} without a runId; manual reconciliation required`,
+          { dispatch_session_id: targetSession, dispatch_run_id: pendingMeta.dispatch_run_id, async_state: asyncState },
+          task.workspace_id
+        )
+
+        results.push({ id: task.id, success: true })
+        continue
+      } else {
+        // Step 1: Invoke via gateway (new session)
+        const gatewayAgentId = resolveGatewayAgentId(task)
+        const dispatchModel = resolveTaskDispatchModelOverride(task)
+        const invokeParams: Record<string, unknown> = {
+          message: prompt,
+          agentId: gatewayAgentId,
+          idempotencyKey: `task-dispatch-${task.id}-${Date.now()}`,
+          deliver: false,
+        }
+        // Route to appropriate model tier based on task complexity.
+        // null = no override, agent uses its own configured default model.
+        if (dispatchModel) invokeParams.model = dispatchModel
+
+        const acceptedPayload = await callOpenClawGateway<any>(
+          'agent',
+          invokeParams,
+          AGENT_DISPATCH_ACCEPT_TIMEOUT_MS,
+        )
+        const status = String(acceptedPayload?.status || '').toLowerCase()
+        if (status && !['started', 'ok', 'in_flight', 'accepted'].includes(status)) {
+          throw new Error(`agent dispatch returned status: ${status}`)
+        }
+
+        const dispatchRunId = typeof acceptedPayload?.runId === 'string' && acceptedPayload.runId.trim()
+          ? acceptedPayload.runId.trim()
+          : null
+        const dispatchSessionId = typeof acceptedPayload?.sessionId === 'string' && acceptedPayload.sessionId.trim()
+          ? acceptedPayload.sessionId.trim()
+          : typeof acceptedPayload?.session_id === 'string' && acceptedPayload.session_id.trim()
+            ? acceptedPayload.session_id.trim()
+            : gatewayAgentId
+        const asyncState = dispatchRunId ? 'pending' : 'accepted_without_run_id'
+        const pendingMeta: Record<string, any> = {
+          ...taskMeta,
+          dispatch_session_id: dispatchSessionId,
+          ...(dispatchRunId ? { dispatch_run_id: dispatchRunId } : {
+            async_reconciliation: 'manual_required',
+            async_warning: 'agent dispatch accepted without a runId; automatic completion reconciliation cannot safely wait on this run.',
+          }),
+          async_state: asyncState,
+          async_dispatched_at: Math.floor(Date.now() / 1000),
+        }
+        db.prepare('UPDATE tasks SET metadata = ?, updated_at = ? WHERE id = ? AND workspace_id = ?')
+          .run(JSON.stringify(pendingMeta), Math.floor(Date.now() / 1000), task.id, task.workspace_id)
+
+        eventBus.broadcast('task.updated', {
+          id: task.id,
+          status: 'in_progress',
+          assigned_to: task.assigned_to,
+          dispatch_session_id: dispatchSessionId,
+          dispatch_run_id: pendingMeta.dispatch_run_id,
+          async_state: asyncState,
+          workspace_id: task.workspace_id,
+        })
+
+        db_helpers.logActivity(
+          dispatchRunId ? 'task_deferred_dispatch' : 'task_deferred_dispatch_unreconcilable',
+          'task',
+          task.id,
+          'scheduler',
+          dispatchRunId
+            ? `Deferred task "${task.title}" to agent ${task.agent_name}`
+            : `Accepted task "${task.title}" for agent ${task.agent_name} without a runId; manual reconciliation required`,
+          { dispatch_session_id: dispatchSessionId, dispatch_run_id: pendingMeta.dispatch_run_id, async_state: asyncState },
+          task.workspace_id
+        )
+
+        results.push({ id: task.id, success: true })
+        continue
+      } // end else (new session dispatch)
 
       if (!agentResponse.text) {
         throw new Error('Agent returned empty response')
@@ -391,7 +1971,8 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
       // Merge dispatch_session_id into existing metadata
       const existingMeta = (() => {
         try {
-          const row = db.prepare('SELECT metadata FROM tasks WHERE id = ?').get(task.id) as { metadata: string } | undefined
+          const row = db.prepare('SELECT metadata FROM tasks WHERE id = ? AND workspace_id = ?')
+            .get(task.id, task.workspace_id) as { metadata: string } | undefined
           return row?.metadata ? JSON.parse(row.metadata) : {}
         } catch { return {} }
       })()
@@ -401,8 +1982,8 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
 
       // Update task: status → review, set outcome
       db.prepare(`
-        UPDATE tasks SET status = ?, outcome = ?, resolution = ?, metadata = ?, updated_at = ? WHERE id = ?
-      `).run('review', 'success', truncated, JSON.stringify(existingMeta), Math.floor(Date.now() / 1000), task.id)
+        UPDATE tasks SET status = ?, outcome = ?, resolution = ?, metadata = ?, updated_at = ? WHERE id = ? AND workspace_id = ?
+      `).run('review', 'success', truncated, JSON.stringify(existingMeta), Math.floor(Date.now() / 1000), task.id, task.workspace_id)
 
       // Add a comment from the agent with the full response
       db.prepare(`
@@ -420,6 +2001,7 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
         id: task.id,
         status: 'review',
         previous_status: 'in_progress',
+        workspace_id: task.workspace_id,
       })
 
       eventBus.broadcast('task.updated', {
@@ -428,7 +2010,9 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
         outcome: 'success',
         assigned_to: task.assigned_to,
         dispatch_session_id: agentResponse.sessionId,
+        workspace_id: task.workspace_id,
       })
+      syncAndEscalateIfFailed(task, 'review')
 
       db_helpers.logActivity(
         'task_agent_completed',
@@ -446,15 +2030,42 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
       const errorMsg = err.message || 'Unknown error'
       logger.error({ taskId: task.id, agent: task.agent_name, err }, 'Task dispatch failed')
 
-      // Revert to assigned so it can be retried on the next tick
-      db.prepare('UPDATE tasks SET status = ?, error_message = ?, updated_at = ? WHERE id = ?')
-        .run('assigned', errorMsg.substring(0, 5000), Math.floor(Date.now() / 1000), task.id)
+      // Increment dispatch_attempts and decide next status
+      const currentAttempts = (db.prepare('SELECT dispatch_attempts FROM tasks WHERE id = ? AND workspace_id = ?')
+        .get(task.id, task.workspace_id) as { dispatch_attempts: number } | undefined)?.dispatch_attempts ?? 0
+      const newAttempts = currentAttempts + 1
+      const maxDispatchRetries = 5
 
-      eventBus.broadcast('task.status_changed', {
-        id: task.id,
-        status: 'assigned',
-        previous_status: 'in_progress',
-      })
+      if (newAttempts >= maxDispatchRetries) {
+        const failureMessage = `Dispatch failed ${newAttempts} times. Last: ${errorMsg.substring(0, 5000)}`
+        // Too many failures — move to failed
+        db.prepare('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, updated_at = ? WHERE id = ? AND workspace_id = ?')
+          .run('failed', failureMessage, newAttempts, Math.floor(Date.now() / 1000), task.id, task.workspace_id)
+
+        eventBus.broadcast('task.status_changed', {
+          id: task.id,
+          status: 'failed',
+          previous_status: 'in_progress',
+          error_message: failureMessage,
+          reason: 'max_dispatch_retries_exceeded',
+          workspace_id: task.workspace_id,
+        })
+        syncAndEscalateIfFailed(task, 'failed', `Dispatch failed ${newAttempts} times`, newAttempts)
+      } else {
+        // Revert to assigned so it can be retried on the next tick
+        db.prepare('UPDATE tasks SET status = ?, error_message = ?, dispatch_attempts = ?, updated_at = ? WHERE id = ? AND workspace_id = ?')
+          .run('assigned', errorMsg.substring(0, 5000), newAttempts, Math.floor(Date.now() / 1000), task.id, task.workspace_id)
+
+        eventBus.broadcast('task.status_changed', {
+          id: task.id,
+          status: 'assigned',
+          previous_status: 'in_progress',
+          error_message: errorMsg.substring(0, 500),
+          reason: 'dispatch_failed',
+          workspace_id: task.workspace_id,
+        })
+        syncAndEscalateIfFailed(task, 'assigned')
+      }
 
       db_helpers.logActivity(
         'task_dispatch_failed',
@@ -479,5 +2090,158 @@ export async function dispatchAssignedTasks(): Promise<{ ok: boolean; message: s
   return {
     ok: failed.length === 0,
     message: `Dispatched ${succeeded}/${tasks.length} tasks${failSummary}`,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-routing: assign inbox tasks to available agents
+// ---------------------------------------------------------------------------
+
+/** Role affinity mapping — which task keywords match which agent roles. */
+const ROLE_AFFINITY: Record<string, string[]> = {
+  coder: ['code', 'implement', 'build', 'fix', 'bug', 'test', 'unit test', 'refactor', 'feature', 'api', 'endpoint', 'function', 'class', 'module', 'component', 'deploy', 'ci', 'pipeline'],
+  researcher: ['research', 'investigate', 'analyze', 'compare', 'find', 'discover', 'audit', 'review', 'survey', 'benchmark', 'evaluate', 'assess', 'competitor', 'market', 'trend'],
+  reviewer: ['review', 'audit', 'check', 'verify', 'validate', 'quality', 'security', 'compliance', 'approve'],
+  tester: ['test', 'qa', 'e2e', 'integration test', 'regression', 'coverage', 'verify', 'validate'],
+  devops: ['deploy', 'infrastructure', 'ci', 'cd', 'docker', 'kubernetes', 'monitoring', 'pipeline', 'server', 'nginx', 'ssl'],
+  assistant: ['write', 'draft', 'summarize', 'translate', 'format', 'document', 'docs', 'readme', 'email', 'message', 'report'],
+  agent: [], // generic fallback
+}
+
+function scoreAgentForTask(
+  agent: { name: string; role: string; status: string; config: string | null },
+  taskText: string,
+): number {
+  // Offline agents can't take work — unless we're in direct-API mode where
+  // the agent has no heartbeat by design and the dispatcher invokes the
+  // provider HTTP API directly (no live agent process required).
+  const directApiOk = !isGatewayAvailable() && isDirectDispatchAvailable()
+  if (!directApiOk && (agent.status === 'offline' || agent.status === 'error' || agent.status === 'sleeping')) return -1
+
+  const text = taskText.toLowerCase()
+  const keywords = ROLE_AFFINITY[agent.role] || []
+
+  let score = 0
+  // Role keyword match
+  for (const kw of keywords) {
+    if (text.includes(kw)) score += 10
+  }
+
+  // Idle agents get a bonus (prefer agents not currently busy)
+  if (agent.status === 'idle') score += 5
+
+  // Check agent capabilities from config
+  if (agent.config) {
+    try {
+      const cfg = JSON.parse(agent.config)
+      const caps = Array.isArray(cfg.capabilities) ? cfg.capabilities : []
+      for (const cap of caps) {
+        if (typeof cap === 'string' && text.includes(cap.toLowerCase())) score += 15
+      }
+    } catch { /* ignore */ }
+  }
+
+  // Any non-offline agent gets at least 1 (can be a fallback)
+  return Math.max(score, 1)
+}
+
+/**
+ * Auto-route inbox tasks to the best available agent.
+ * Runs before dispatch — moves tasks from inbox → assigned.
+ */
+export async function autoRouteInboxTasks(): Promise<{ ok: boolean; message: string }> {
+  const db = getDatabase()
+
+  const inboxTasks = db.prepare(`
+    SELECT id, title, description, priority, tags, workspace_id
+    FROM tasks
+    WHERE status = 'inbox' AND assigned_to IS NULL
+    ORDER BY
+      CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END ASC,
+      created_at ASC
+    LIMIT 5
+  `).all() as Array<{ id: number; title: string; description: string | null; priority: string; tags: string | null; workspace_id: number }>
+
+  if (inboxTasks.length === 0) {
+    return { ok: true, message: 'No inbox tasks to route' }
+  }
+
+  let routed = 0
+  const now = Math.floor(Date.now() / 1000)
+
+  for (const task of inboxTasks) {
+    const agents = db.prepare(`
+      SELECT id, name, role, status, config
+      FROM agents
+      WHERE workspace_id = ?
+        AND hidden = 0
+        AND status NOT IN ('offline', 'error')
+      LIMIT 50
+    `).all(task.workspace_id) as Array<{ id: number; name: string; role: string; status: string; config: string | null }>
+    if (agents.length === 0) continue
+
+    const taskText = `${task.title} ${task.description || ''}`
+    let parsedTags: string[] = []
+    if (task.tags) {
+      try { parsedTags = JSON.parse(task.tags) } catch { /* ignore */ }
+    }
+    const fullText = `${taskText} ${parsedTags.join(' ')}`
+
+    // Score each agent
+    const scored = agents
+      .map(a => ({ agent: a, score: scoreAgentForTask(a, fullText) }))
+      .filter(s => s.score > 0)
+      .sort((a, b) => b.score - a.score)
+
+    if (scored.length === 0) continue
+
+    const best = scored[0].agent
+
+    // Check capacity — skip agents with 3+ in-progress tasks
+    const inProgressCount = (db.prepare(
+      'SELECT COUNT(*) as c FROM tasks WHERE assigned_to = ? AND status = \'in_progress\' AND workspace_id = ?'
+    ).get(best.name, task.workspace_id) as { c: number }).c
+
+    if (inProgressCount >= 3) {
+      // Try next best agent
+      const alt = scored.find(s => {
+        const c = (db.prepare(
+          'SELECT COUNT(*) as c FROM tasks WHERE assigned_to = ? AND status = \'in_progress\' AND workspace_id = ?'
+        ).get(s.agent.name, task.workspace_id) as { c: number }).c
+        return c < 3
+      })
+      if (!alt) continue // all agents at capacity
+      db.prepare('UPDATE tasks SET status = ?, assigned_to = ?, updated_at = ? WHERE id = ? AND workspace_id = ?')
+        .run('assigned', alt.agent.name, now, task.id, task.workspace_id)
+
+      db_helpers.logActivity('task_auto_routed', 'task', task.id, 'scheduler',
+        `Auto-assigned "${task.title}" to ${alt.agent.name} (${alt.agent.role}, score: ${alt.score})`,
+        { agent: alt.agent.name, role: alt.agent.role, score: alt.score },
+        task.workspace_id)
+
+      eventBus.broadcast('task.status_changed', { id: task.id, status: 'assigned', previous_status: 'inbox', assigned_to: alt.agent.name, workspace_id: task.workspace_id })
+      syncAndEscalateIfFailed(task as any, 'assigned')
+      routed++
+      continue
+    }
+
+    db.prepare('UPDATE tasks SET status = ?, assigned_to = ?, updated_at = ? WHERE id = ? AND workspace_id = ?')
+      .run('assigned', best.name, now, task.id, task.workspace_id)
+
+    db_helpers.logActivity('task_auto_routed', 'task', task.id, 'scheduler',
+      `Auto-assigned "${task.title}" to ${best.name} (${best.role}, score: ${scored[0].score})`,
+      { agent: best.name, role: best.role, score: scored[0].score },
+      task.workspace_id)
+
+    eventBus.broadcast('task.status_changed', { id: task.id, status: 'assigned', previous_status: 'inbox', assigned_to: best.name, workspace_id: task.workspace_id })
+    syncAndEscalateIfFailed(task as any, 'assigned')
+    routed++
+  }
+
+  return {
+    ok: true,
+    message: routed > 0
+      ? `Auto-routed ${routed}/${inboxTasks.length} inbox task(s)`
+      : `${inboxTasks.length} inbox task(s), no suitable agents found`,
   }
 }

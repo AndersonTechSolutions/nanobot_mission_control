@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth'
+import { denyUnscopedResourceForStrictWorkspace } from '@/lib/workspace-isolation'
 import { config } from '@/lib/config'
 import { getAllGatewaySessions } from '@/lib/sessions'
 import { parseJsonlTranscript, readSessionJsonl, type TranscriptMessage, type MessageContentPart } from '@/lib/transcript-parser'
@@ -24,6 +25,8 @@ export interface AggregateEvent {
 export async function GET(request: NextRequest) {
   const auth = requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDenied = denyUnscopedResourceForStrictWorkspace(auth.user, 'session_transcripts', new URL(request.url).pathname)
+  if (isolationDenied) return isolationDenied
 
   const { searchParams } = new URL(request.url)
   const limit = Math.min(Math.max(parseInt(searchParams.get('limit') || '100', 10), 1), 500)

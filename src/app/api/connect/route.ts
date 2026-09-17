@@ -33,18 +33,18 @@ export async function POST(request: NextRequest) {
     agent = { id: result.lastInsertRowid, name: agent_name }
     db_helpers.logActivity('agent_created', 'agent', agent.id as number, 'system',
       `Auto-created agent "${agent_name}" via direct CLI connection`, undefined, workspaceId)
-    eventBus.broadcast('agent.created', { id: agent.id, name: agent_name })
+    eventBus.broadcast('agent.created', { id: agent.id, name: agent_name, workspace_id: workspaceId })
   } else {
     // Set agent online
     db.prepare('UPDATE agents SET status = ?, updated_at = ? WHERE id = ? AND workspace_id = ?')
       .run('online', now, agent.id, workspaceId)
-    eventBus.broadcast('agent.status_changed', { id: agent.id, name: agent.name, status: 'online' })
+    eventBus.broadcast('agent.status_changed', { id: agent.id, name: agent.name, status: 'online', workspace_id: workspaceId })
   }
 
   // Deactivate previous connections for this agent
   db.prepare(
-    `UPDATE direct_connections SET status = 'disconnected', updated_at = ? WHERE agent_id = ? AND status = 'connected'`
-  ).run(now, agent.id)
+    `UPDATE direct_connections SET status = 'disconnected', updated_at = ? WHERE agent_id = ? AND status = 'connected' AND workspace_id = ?`
+  ).run(now, agent.id, workspaceId)
 
   // Create new connection
   const connectionId = randomUUID()
@@ -57,6 +57,7 @@ export async function POST(request: NextRequest) {
     `CLI connection established via ${tool_name}${tool_version ? ` v${tool_version}` : ''}`, undefined, workspaceId)
 
   eventBus.broadcast('connection.created', {
+    workspace_id: workspaceId,
     connection_id: connectionId,
     agent_id: agent.id,
     agent_name,
@@ -127,13 +128,13 @@ export async function DELETE(request: NextRequest) {
     return NextResponse.json({ error: 'Connection not found' }, { status: 404 })
   }
 
-  db.prepare('UPDATE direct_connections SET status = ?, updated_at = ? WHERE connection_id = ?')
-    .run('disconnected', now, connection_id)
+  db.prepare('UPDATE direct_connections SET status = ?, updated_at = ? WHERE connection_id = ? AND workspace_id = ?')
+    .run('disconnected', now, connection_id, workspaceId)
 
   // Check if agent has other active connections; if not, set offline
   const otherActive = db.prepare(
-    'SELECT COUNT(*) as count FROM direct_connections WHERE agent_id = ? AND status = ? AND connection_id != ?'
-  ).get(conn.agent_id, 'connected', connection_id) as any
+    'SELECT COUNT(*) as count FROM direct_connections WHERE agent_id = ? AND status = ? AND connection_id != ? AND workspace_id = ?'
+  ).get(conn.agent_id, 'connected', connection_id, workspaceId) as any
   if (!otherActive?.count) {
     db.prepare('UPDATE agents SET status = ?, updated_at = ? WHERE id = ? AND workspace_id = ?')
       .run('offline', now, conn.agent_id, workspaceId)
@@ -144,6 +145,7 @@ export async function DELETE(request: NextRequest) {
     `CLI connection disconnected (${conn.tool_name})`, undefined, workspaceId)
 
   eventBus.broadcast('connection.disconnected', {
+    workspace_id: workspaceId,
     connection_id,
     agent_id: conn.agent_id,
     agent_name: agent?.name,

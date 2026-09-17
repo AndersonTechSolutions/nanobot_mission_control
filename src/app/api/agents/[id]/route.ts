@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { NextRequest, NextResponse } from 'next/server'
 import { getDatabase, db_helpers, logAuditEvent } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
@@ -5,6 +6,7 @@ import { writeAgentToConfig, enrichAgentConfigFromWorkspace, removeAgentFromConf
 import { eventBus } from '@/lib/event-bus'
 import { logger } from '@/lib/logger'
 import { runOpenClaw } from '@/lib/command'
+import { config as appConfig } from '@/lib/config'
 
 /**
  * GET /api/agents/[id] - Get a single agent by ID or name
@@ -34,7 +36,7 @@ export async function GET(
 
     const parsed = {
       ...(agent as any),
-      config: (agent as any).config ? JSON.parse((agent as any).config) : {},
+      config: enrichAgentConfigFromWorkspace((agent as any).config ? JSON.parse((agent as any).config) : {}),
     }
 
     return NextResponse.json({ agent: parsed })
@@ -49,7 +51,7 @@ export async function GET(
  *
  * Body: {
  *   role?: string
- *   gateway_config?: object   - nanobot agent config fields to update
+ *   gateway_config?: object   - OpenClaw agent config fields to update
  *   write_to_gateway?: boolean - Defaults to true when gateway_config exists
  * }
  */
@@ -65,7 +67,7 @@ export async function PUT(
     const { id } = await params
     const workspaceId = auth.user.workspace_id ?? 1;
     const body = await request.json()
-    const { role, gateway_config } = body
+    const { role, gateway_config, write_to_gateway } = body
 
     let agent
     if (isNaN(Number(id))) {
@@ -87,14 +89,27 @@ export async function PUT(
       newConfig = { ...existingConfig, ...gateway_config }
     }
 
-    const { write_to_gateway } = body
+    // Skip gateway-config write-back when no openclaw.json exists on disk —
+    // this happens on Linux operator setups that drive agents via direct API
+    // dispatch (no OpenClaw install). Without this guard the route DB-saves
+    // the new config, then immediately reverts it because the file open fails
+    // with ENOENT, leaving the user with a misleading "Save failed".
+    const openclawConfigPath = appConfig.openclawConfigPath
+    const openclawConfigPresent = !!openclawConfigPath && existsSync(openclawConfigPath)
     const shouldWriteToGateway = Boolean(
       gateway_config &&
+      openclawConfigPresent &&
       (write_to_gateway === undefined || write_to_gateway === null || write_to_gateway === true)
     )
-    const nanobotId = existingConfig.nanobotId || existingConfig.openclawId || agent.name.toLowerCase().replace(/\s+/g, '-')
+    if (gateway_config && !openclawConfigPresent && (write_to_gateway === true)) {
+      logger.warn(
+        { agent: agent.name, openclawConfigPath },
+        'write_to_gateway requested but openclaw.json is absent — DB save only, gateway write skipped',
+      )
+    }
+    const openclawId = existingConfig.openclawId || agent.name.toLowerCase().replace(/\s+/g, '-')
     const getWriteBackPayload = (source: Record<string, any>) => {
-      const writeBack: any = { id: nanobotId }
+      const writeBack: any = { id: openclawId }
       if (source.model) writeBack.model = source.model
       if (source.identity) writeBack.identity = source.identity
       if (source.sandbox) writeBack.sandbox = source.sandbox
@@ -158,7 +173,7 @@ export async function PUT(
         actor_id: auth.user.id,
         target_type: 'agent',
         target_id: agent.id,
-        detail: { agent_name: agent.name, nanobot_id: nanobotId, fields: Object.keys(gateway_config || {}) },
+        detail: { agent_name: agent.name, openclaw_id: openclawId, fields: Object.keys(gateway_config || {}) },
         ip_address: ipAddress,
       })
     }
@@ -169,22 +184,25 @@ export async function PUT(
       'agent',
       agent.id,
       auth.user.username,
-      `Config updated for agent ${agent.name}`,
-      { fields: Object.keys(gateway_config || {}) },
+      `Config updated for agent ${agent.name}${shouldWriteToGateway ? ' (+ gateway)' : ''}`,
+      { fields: Object.keys(gateway_config || {}), write_to_gateway: shouldWriteToGateway },
       workspaceId
     )
 
     // Broadcast update
     eventBus.broadcast('agent.updated', {
+      workspace_id: workspaceId,
       id: agent.id,
       name: agent.name,
       config: newConfig,
       updated_at: now,
     })
 
+    const enrichedConfig = enrichAgentConfigFromWorkspace(newConfig)
+
     return NextResponse.json({
       success: true,
-      agent: { ...agent, config: newConfig, role: role || agent.role, updated_at: now },
+      agent: { ...agent, config: enrichedConfig, role: role || agent.role, updated_at: now },
     })
   } catch (error: any) {
     logger.error({ err: error }, 'PUT /api/agents/[id] error')
@@ -269,7 +287,7 @@ export async function DELETE(
       workspaceId
     )
 
-    eventBus.broadcast('agent.deleted', { id: agent.id, name: agent.name })
+    eventBus.broadcast('agent.deleted', { id: agent.id, name: agent.name, workspace_id: workspaceId })
 
     return NextResponse.json({
       success: true,

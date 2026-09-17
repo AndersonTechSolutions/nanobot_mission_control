@@ -1,7 +1,9 @@
 'use client'
 
 import { useEffect, useMemo, useState } from 'react'
+import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
+import { apiFetch } from '@/lib/api-client'
 
 interface AgentsDocResponse {
   found: boolean
@@ -11,6 +13,7 @@ interface AgentsDocResponse {
 }
 
 export function LocalAgentsDocPanel() {
+  const t = useTranslations('localAgentsDoc')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [data, setData] = useState<AgentsDocResponse | null>(null)
@@ -23,12 +26,14 @@ export function LocalAgentsDocPanel() {
       setLoading(true)
       setError(null)
       try {
-        const res = await fetch('/api/local/agents-doc', { cache: 'no-store' })
-        const body = await res.json()
-        if (!res.ok) throw new Error(body?.error || 'Failed to load AGENTS.md')
-        if (!cancelled) setData(body as AgentsDocResponse)
-      } catch (err: any) {
-        if (!cancelled) setError(err?.message || 'Failed to load AGENTS.md')
+        const body = await apiFetch<AgentsDocResponse>('/api/local/agents-doc', {
+          cache: 'no-store',
+        })
+        if (!cancelled) setData(body)
+      } catch (err: unknown) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : 'Failed to load AGENTS.md')
+        }
       } finally {
         if (!cancelled) setLoading(false)
       }
@@ -66,9 +71,9 @@ export function LocalAgentsDocPanel() {
     <div className="mt-4 mx-4 rounded-lg border border-border bg-card overflow-hidden">
       <div className="px-4 py-3 border-b border-border flex items-center justify-between gap-3">
         <div className="min-w-0">
-          <h3 className="text-sm font-semibold text-foreground">Local AGENTS.md</h3>
+          <h3 className="text-sm font-semibold text-foreground">{t('title')}</h3>
           <p className="text-2xs text-muted-foreground truncate">
-            {data?.path || 'No local AGENTS.md found yet'}
+            {data?.path || t('noPathFound')}
           </p>
         </div>
         <div className="flex items-center gap-1.5">
@@ -78,7 +83,7 @@ export function LocalAgentsDocPanel() {
             onClick={openInEditor}
             disabled={!data?.path}
           >
-            Open in VS Code
+            {t('openInVsCode')}
           </Button>
           <Button
             variant="outline"
@@ -86,7 +91,7 @@ export function LocalAgentsDocPanel() {
             onClick={copyPath}
             disabled={!data?.path}
           >
-            {copied ? 'Copied' : 'Copy Path'}
+            {copied ? t('copied') : t('copyPath')}
           </Button>
           <Button
             variant="outline"
@@ -94,13 +99,13 @@ export function LocalAgentsDocPanel() {
             onClick={() => setExpanded((v) => !v)}
             disabled={!data?.content}
           >
-            {expanded ? 'Collapse' : 'Expand'}
+            {expanded ? t('collapse') : t('expand')}
           </Button>
         </div>
       </div>
 
       {loading ? (
-        <div className="px-4 py-4 text-xs text-muted-foreground">Loading local AGENTS.md...</div>
+        <div className="px-4 py-4 text-xs text-muted-foreground">{t('loading')}</div>
       ) : error ? (
         <div className="px-4 py-4 text-xs text-destructive">{error}</div>
       ) : data?.found && data.content ? (
@@ -109,10 +114,10 @@ export function LocalAgentsDocPanel() {
         </pre>
       ) : (
         <div className="px-4 py-4 text-xs text-muted-foreground space-y-1">
-          <p>No local AGENTS.md detected.</p>
+          <p>{t('notDetected')}</p>
           {data?.candidates && data.candidates.length > 0 && (
             <p className="text-2xs">
-              Checked: {data.candidates.join(', ')}
+              {t('checked', { paths: data.candidates.join(', ') })}
             </p>
           )}
         </div>

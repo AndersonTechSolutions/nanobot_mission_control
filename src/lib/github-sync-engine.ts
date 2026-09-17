@@ -46,7 +46,7 @@ export async function pushTaskToGitHub(
     priority: string
     github_issue_number?: number | null
     github_repo?: string | null
-    workspace_id?: number
+    workspace_id: number
   },
   project: {
     id: number
@@ -90,8 +90,8 @@ export async function pushTaskToGitHub(
 
     // Mark synced to prevent ping-pong
     db.prepare(`
-      UPDATE tasks SET github_synced_at = ? WHERE id = ?
-    `).run(now, task.id)
+      UPDATE tasks SET github_synced_at = ? WHERE id = ? AND workspace_id = ?
+    `).run(now, task.id, task.workspace_id)
 
     logger.info({ repo, issue: task.github_issue_number }, 'Pushed task update to GitHub')
   } else if (project.github_sync_enabled) {
@@ -108,8 +108,8 @@ export async function pushTaskToGitHub(
     db.prepare(`
       UPDATE tasks
       SET github_issue_number = ?, github_repo = ?, github_synced_at = ?
-      WHERE id = ?
-    `).run(created.number, repo, now, task.id)
+      WHERE id = ? AND workspace_id = ?
+    `).run(created.number, repo, now, task.id, task.workspace_id)
 
     logger.info({ repo, issue: created.number, taskId: task.id }, 'Created GitHub issue for task')
   }
@@ -262,4 +262,41 @@ export async function pullFromGitHub(
   logger.info({ repo, pulled, pushed, projectId: project.id }, 'GitHub sync completed')
 
   return { pulled, pushed }
+}
+
+/**
+ * Fire-and-forget outbound sync for a task to GitHub + GNAP.
+ * Called after any status change — drag-drop, dispatch, Aegis, requeue.
+ */
+export function syncTaskOutbound(
+  task: { id: number; title: string; status: string; priority: string; description?: string | null; github_issue_number?: number | null; github_repo?: string | null; project_id?: number | null; workspace_id?: number },
+  workspaceId: number
+): void {
+  const db = getDatabase()
+  try {
+    // GitHub sync
+    if (task.project_id) {
+      const project = db.prepare(
+        'SELECT id, github_repo, github_sync_enabled FROM projects WHERE id = ? AND workspace_id = ?'
+      ).get(task.project_id, workspaceId) as { id: number; github_repo?: string | null; github_sync_enabled?: number | null } | undefined
+      if (project?.github_sync_enabled) {
+        pushTaskToGitHub({ ...task, workspace_id: workspaceId }, project).catch(err =>
+          logger.warn({ err, taskId: task.id }, 'Outbound GitHub sync failed')
+        )
+      }
+    }
+  } catch (err) {
+    logger.warn({ err, taskId: task.id }, 'GitHub sync lookup failed')
+  }
+
+  try {
+    // GNAP sync
+    const { config } = require('@/lib/config')
+    if (config.gnap?.enabled && config.gnap?.repoPath) {
+      const { pushTaskToGnap } = require('@/lib/gnap-sync')
+      pushTaskToGnap(task, config.gnap.repoPath)
+    }
+  } catch (err) {
+    logger.warn({ err, taskId: task.id }, 'GNAP sync failed')
+  }
 }

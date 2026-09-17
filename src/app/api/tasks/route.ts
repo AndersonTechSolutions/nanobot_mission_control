@@ -6,8 +6,12 @@ import { mutationLimiter } from '@/lib/rate-limit';
 import { logger } from '@/lib/logger';
 import { validateBody, createTaskSchema, bulkUpdateTaskStatusSchema } from '@/lib/validation';
 import { resolveMentionRecipients } from '@/lib/mentions';
-import { normalizeTaskCreateStatus } from '@/lib/task-status';
-import { pushTaskToGitHub } from '@/lib/github-sync-engine';
+import { normalizeTaskCreateStatus, resolveTaskAssignee } from '@/lib/task-status';
+import { reconcileDeferredTaskCompletions } from '@/lib/task-dispatch';
+import { pushTaskToGitHub, syncTaskOutbound } from '@/lib/github-sync-engine';
+import { pushTaskToGnap } from '@/lib/gnap-sync';
+import { config } from '@/lib/config';
+import { requireWorkspaceId } from '@/lib/enforcement/workspace-scope';
 
 function formatTicketRef(prefix?: string | null, num?: number | null): string | undefined {
   if (!prefix || typeof num !== 'number' || !Number.isFinite(num) || num <= 0) return undefined
@@ -66,7 +70,9 @@ export async function GET(request: NextRequest) {
 
   try {
     const db = getDatabase();
-    const workspaceId = auth.user.workspace_id;
+    const wsResult = requireWorkspaceId(auth.user);
+    if (!('workspaceId' in wsResult)) return wsResult.response;
+    const { workspaceId } = wsResult;
     const { searchParams } = new URL(request.url);
 
     // Parse query parameters
@@ -76,10 +82,17 @@ export async function GET(request: NextRequest) {
     const projectIdParam = Number.parseInt(searchParams.get('project_id') || '', 10);
     const limit = Math.min(parseInt(searchParams.get('limit') || '50'), 200);
     const offset = parseInt(searchParams.get('offset') || '0');
+
+    try {
+      await reconcileDeferredTaskCompletions({ workspaceId, limit: 5 })
+    } catch (err) {
+      logger.warn({ err }, 'Deferred task reconciliation failed during task list read')
+    }
     
     // Build dynamic query
     let query = `
-      SELECT t.*, p.name as project_name, p.ticket_prefix as project_prefix
+      SELECT t.*, p.name as project_name, p.ticket_prefix as project_prefix,
+        (SELECT COUNT(*) FROM comments c WHERE c.task_id = t.id AND c.workspace_id = t.workspace_id) as comment_count
       FROM tasks t
       LEFT JOIN projects p
         ON p.id = t.project_id AND p.workspace_id = t.workspace_id
@@ -92,11 +105,19 @@ export async function GET(request: NextRequest) {
       params.push(status);
     }
     
-    if (assigned_to) {
+    // Agent keys (non-admin) may only list their own tasks
+    const agentScope = auth.user.agent_name && auth.user.role !== 'admin'
+      ? auth.user.agent_name
+      : null;
+
+    if (agentScope) {
+      query += ' AND t.assigned_to = ?';
+      params.push(agentScope);
+    } else if (assigned_to) {
       query += ' AND t.assigned_to = ?';
       params.push(assigned_to);
     }
-    
+
     if (priority) {
       query += ' AND t.priority = ?';
       params.push(priority);
@@ -123,7 +144,10 @@ export async function GET(request: NextRequest) {
       countQuery += ' AND status = ?';
       countParams.push(status);
     }
-    if (assigned_to) {
+    if (agentScope) {
+      countQuery += ' AND assigned_to = ?';
+      countParams.push(agentScope);
+    } else if (assigned_to) {
       countQuery += ' AND assigned_to = ?';
       countParams.push(assigned_to);
     }
@@ -156,7 +180,9 @@ export async function POST(request: NextRequest) {
 
   try {
     const db = getDatabase();
-    const workspaceId = auth.user.workspace_id;
+    const wsResult = requireWorkspaceId(auth.user);
+    if (!('workspaceId' in wsResult)) return wsResult.response;
+    const { workspaceId } = wsResult;
     const validated = await validateBody(request, createTaskSchema);
     if ('error' in validated) return validated.error;
     const body = validated.data;
@@ -183,13 +209,16 @@ export async function POST(request: NextRequest) {
       tags = [],
       metadata = {}
     } = body;
-    const normalizedStatus = normalizeTaskCreateStatus(status, assigned_to)
-    
-    // Check for duplicate title
-    const existingTask = db.prepare('SELECT id FROM tasks WHERE title = ? AND workspace_id = ?').get(title, workspaceId);
-    if (existingTask) {
-      return NextResponse.json({ error: 'Task with this title already exists' }, { status: 409 });
-    }
+
+    // Auto-route unassigned tasks to the configured coordinator agent, if any
+    // (issue #663). Opt-in via MC_COORDINATOR_AGENT; when unset, tasks created
+    // without an assignee stay unassigned (config.coordinatorAgent === '').
+    const finalAssignedTo = resolveTaskAssignee(assigned_to, config.coordinatorAgent)
+
+    const normalizedStatus = normalizeTaskCreateStatus(status, finalAssignedTo)
+
+    // Resolve project_id for the task
+    const resolvedProjectId = resolveProjectId(db, workspaceId, project_id)
     
     const now = Math.floor(Date.now() / 1000);
     const mentionResolution = resolveMentionRecipients(description || '', db, workspaceId);
@@ -203,7 +232,6 @@ export async function POST(request: NextRequest) {
     const resolvedCompletedAt = completed_at ?? (normalizedStatus === 'done' ? now : null)
 
     const createTaskTx = db.transaction(() => {
-      const resolvedProjectId = resolveProjectId(db, workspaceId, project_id)
       db.prepare(`
         UPDATE projects
         SET ticket_counter = ticket_counter + 1, updated_at = unixepoch()
@@ -231,7 +259,7 @@ export async function POST(request: NextRequest) {
         priority,
         resolvedProjectId,
         row.ticket_counter,
-        assigned_to,
+        finalAssignedTo,
         actor,
         now,
         now,
@@ -259,7 +287,7 @@ export async function POST(request: NextRequest) {
       title,
       status: normalizedStatus,
       priority,
-      assigned_to,
+      assigned_to: finalAssignedTo,
       ...(outcome ? { outcome } : {})
     }, workspaceId);
 
@@ -281,11 +309,11 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Create notification if assigned
-    if (assigned_to) {
-      db_helpers.ensureTaskSubscription(taskId, assigned_to, workspaceId)
+    // Create notification if assigned (including coordinator auto-routing)
+    if (finalAssignedTo) {
+      db_helpers.ensureTaskSubscription(taskId, finalAssignedTo, workspaceId)
       db_helpers.createNotification(
-        assigned_to,
+        finalAssignedTo,
         'assignment',
         'Task Assigned',
         `You have been assigned to task: ${title}`,
@@ -312,14 +340,20 @@ export async function POST(request: NextRequest) {
         WHERE id = ? AND workspace_id = ?
       `).get(parsedTask.project_id, workspaceId) as any
       if (project?.github_sync_enabled && project?.github_repo) {
-        pushTaskToGitHub(parsedTask as any, project).catch(err =>
+        pushTaskToGitHub(parsedTask, project).catch(err =>
           logger.error({ err, taskId }, 'Outbound GitHub sync failed for new task')
         )
       }
     }
 
+    // Fire-and-forget GNAP sync for new tasks
+    if (config.gnap.enabled && config.gnap.autoSync) {
+      try { pushTaskToGnap(parsedTask as any, config.gnap.repoPath) }
+      catch (err) { logger.warn({ err, taskId }, 'GNAP sync failed for new task') }
+    }
+
     // Broadcast to SSE clients
-    eventBus.broadcast('task.created', parsedTask);
+    eventBus.broadcast('task.created', { ...parsedTask, workspace_id: workspaceId });
 
     return NextResponse.json({ task: parsedTask }, { status: 201 });
   } catch (error) {
@@ -340,7 +374,9 @@ export async function PUT(request: NextRequest) {
 
   try {
     const db = getDatabase();
-    const workspaceId = auth.user.workspace_id;
+    const wsResult = requireWorkspaceId(auth.user);
+    if (!('workspaceId' in wsResult)) return wsResult.response;
+    const { workspaceId } = wsResult;
     const validated = await validateBody(request, bulkUpdateTaskStatusSchema);
     if ('error' in validated) return validated.error;
     const { tasks } = validated.data;
@@ -392,13 +428,20 @@ export async function PUT(request: NextRequest) {
     
     transaction(tasks);
 
-    // Broadcast status changes to SSE clients
+    // Broadcast status changes to SSE clients + outbound sync
     for (const task of tasks) {
       eventBus.broadcast('task.status_changed', {
+        workspace_id: workspaceId,
         id: task.id,
         status: task.status,
         updated_at: Math.floor(Date.now() / 1000),
       });
+
+      // Fire-and-forget outbound sync (GitHub + GNAP)
+      const fullTask = db.prepare('SELECT * FROM tasks WHERE id = ? AND workspace_id = ?').get(task.id, workspaceId) as Task | undefined;
+      if (fullTask) {
+        syncTaskOutbound(fullTask as any, workspaceId);
+      }
     }
 
     return NextResponse.json({ success: true, updated: tasks.length });

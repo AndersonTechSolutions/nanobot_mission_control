@@ -2,9 +2,8 @@
 
 import { create } from 'zustand'
 import { subscribeWithSelector } from 'zustand/middleware'
+import { apiFetch } from '@/lib/api-client'
 import { MODEL_CATALOG } from '@/lib/models'
-
-// Nanobot fork: agent health types from our custom types module
 import type { AgentHealthSnapshot, LifecycleOperation } from '@/types/agent-health'
 
 export type JsonPrimitive = string | number | boolean | null
@@ -15,6 +14,8 @@ type DashboardLayoutUpdater = string[] | null | ((current: string[] | null) => s
 export interface Session {
   id: string
   key: string
+  agent?: string
+  channel?: string
   kind: string
   age: string
   model: string
@@ -93,7 +94,11 @@ export interface ModelConfig {
   name: string
   provider: string
   description: string
-  costPer1k: number
+  /** USD per MILLION tokens (input/output) — mirrors ModelConfig in '@/lib/models' */
+  costPerMTok: { input: number; output: number; cacheRead?: number; cacheWrite?: number | null }
+  contextWindow?: number
+  inputModalities?: Array<'text' | 'image' | 'video'>
+  thinking?: Array<'adaptive' | 'disabled' | 'always_on'>
 }
 
 // Mission Control Phase 2 Types
@@ -101,7 +106,7 @@ export interface Task {
   id: number
   title: string
   description?: string
-  status: 'inbox' | 'assigned' | 'in_progress' | 'review' | 'quality_review' | 'done'
+  status: 'backlog' | 'inbox' | 'assigned' | 'awaiting_owner' | 'in_progress' | 'review' | 'quality_review' | 'done' | 'failed'
   priority: 'low' | 'medium' | 'high' | 'critical' | 'urgent'
   project_id?: number
   project_ticket_no?: number
@@ -144,6 +149,7 @@ export interface Agent {
   last_activity?: string
   created_at: number
   updated_at: number
+  hidden?: number
   config?: JsonValue
   taskStats?: {
     total: number
@@ -238,7 +244,7 @@ export interface Conversation {
     prefKey?: string
     sessionId: string
     sessionKey?: string
-    sessionKind: 'claude-code' | 'codex-cli' | 'gateway'
+    sessionKind: 'claude-code' | 'codex-cli' | 'hermes' | 'opencode' | 'gateway'
     agent?: string
     displayName?: string
     colorTag?: string
@@ -372,6 +378,7 @@ interface MissionControlStore {
   // Dashboard Mode (local vs full gateway)
   dashboardMode: 'full' | 'local'
   gatewayAvailable: boolean
+  localSessionsAvailable: boolean
   bannerDismissed: boolean
   capabilitiesChecked: boolean
   bootComplete: boolean
@@ -379,6 +386,7 @@ interface MissionControlStore {
   defaultOrgName: string
   setDashboardMode: (mode: 'full' | 'local') => void
   setGatewayAvailable: (available: boolean) => void
+  setLocalSessionsAvailable: (available: boolean) => void
   dismissBanner: () => void
   setCapabilitiesChecked: (checked: boolean) => void
   setBootComplete: () => void
@@ -396,6 +404,10 @@ interface MissionControlStore {
   openclawUpdateDismissedVersion: string | null
   setOpenclawUpdate: (info: { installed: string; latest: string; releaseUrl: string; releaseNotes: string; updateCommand: string } | null) => void
   dismissOpenclawUpdate: (version: string) => void
+
+  // OpenClaw Doctor banner dismiss (persisted with 24h expiry)
+  doctorDismissedAt: number | null
+  dismissDoctor: () => void
 
   // WebSocket & Connection
   connection: ConnectionStatus
@@ -438,8 +450,8 @@ interface MissionControlStore {
   dismissAgentErrors: (agentId: string) => void
 
   // Lifecycle Operations (Phase 3)
-  lifecycleOperations: Map<string, LifecycleOperation>  // agentId -> current in-progress operation
-  lifecycleHistory: LifecycleOperation[]  // newest first, capped at 100 entries
+  lifecycleOperations: Map<string, LifecycleOperation>
+  lifecycleHistory: LifecycleOperation[]
   setLifecycleOperation: (agentId: string, op: LifecycleOperation | null) => void
   addLifecycleHistory: (op: LifecycleOperation) => void
   getAgentLifecycleHistory: (agentId: string) => LifecycleOperation[]
@@ -544,11 +556,20 @@ interface MissionControlStore {
   setChatPanelOpen: (open: boolean) => void
   markConversationRead: (conversationId: string) => void
 
+  // Terminal split panes + attention
+  splitPanes: Array<{ id: string; sessionId: string; sessionKind: string; sessionName?: string }>
+  setSplitPanes: (panes: Array<{ id: string; sessionId: string; sessionKind: string; sessionName?: string }>) => void
+  addSplitPane: (sessionId: string, sessionKind: string, sessionName?: string) => void
+  removeSplitPane: (paneId: string) => void
+  clearSplitPanes: () => void
+  sessionAttention: Record<string, 'waiting' | 'error'>
+  setSessionAttention: (sessionId: string, level: 'waiting' | 'error' | null) => void
+
   // Auth
   currentUser: CurrentUser | null
   setCurrentUser: (user: CurrentUser | null) => void
 
-  // Session Viewer (Phase 4 - nanobot fork)
+  // Session Viewer (nanobot fork)
   sessionViewerAgent: string | null
   sessionViewerSession: string | null
   sessionViewerAgentSidebarOpen: boolean
@@ -640,6 +661,7 @@ export const useMissionControl = create<MissionControlStore>()(
     // Dashboard Mode
     dashboardMode: 'local' as const,
     gatewayAvailable: false,
+    localSessionsAvailable: false,
     bannerDismissed: false,
     capabilitiesChecked: false,
     bootComplete: false,
@@ -647,6 +669,7 @@ export const useMissionControl = create<MissionControlStore>()(
     defaultOrgName: 'Default',
     setDashboardMode: (mode) => set({ dashboardMode: mode }),
     setGatewayAvailable: (available) => set({ gatewayAvailable: available }),
+    setLocalSessionsAvailable: (available) => set({ localSessionsAvailable: available }),
     dismissBanner: () => set({ bannerDismissed: true }),
     setCapabilitiesChecked: (checked) => set({ capabilitiesChecked: checked }),
     setBootComplete: () => set({ bootComplete: true }),
@@ -679,6 +702,20 @@ export const useMissionControl = create<MissionControlStore>()(
     dismissOpenclawUpdate: (version) => {
       try { localStorage.setItem('mc-openclaw-update-dismissed', version) } catch {}
       set({ openclawUpdateDismissedVersion: version })
+    },
+
+    // OpenClaw Doctor banner dismiss
+    doctorDismissedAt: (() => {
+      if (typeof window === 'undefined') return null
+      try {
+        const raw = localStorage.getItem('mc-doctor-dismissed-at')
+        return raw ? Number(raw) : null
+      } catch { return null }
+    })(),
+    dismissDoctor: () => {
+      const now = Date.now()
+      try { localStorage.setItem('mc-doctor-dismissed-at', String(now)) } catch {}
+      set({ doctorDismissedAt: now })
     },
 
     // Connection state
@@ -828,8 +865,6 @@ export const useMissionControl = create<MissionControlStore>()(
     // Auth
     currentUser: null,
     setCurrentUser: (user) => set({ currentUser: user }),
-
-    // Session Viewer (Phase 4 - nanobot fork)
     sessionViewerAgent: null,
     sessionViewerSession: null,
     sessionViewerAgentSidebarOpen: true,
@@ -862,18 +897,18 @@ export const useMissionControl = create<MissionControlStore>()(
     setTenants: (tenants) => set({ tenants }),
     fetchTenants: async () => {
       try {
-        const res = await fetch('/api/super/tenants', { cache: 'no-store' })
-        if (!res.ok) return
-        const data = await res.json()
+        const data = await apiFetch<{ tenants?: Tenant[] }>('/api/super/tenants', {
+          cache: 'no-store',
+        })
         const tenantList = Array.isArray(data?.tenants) ? data.tenants : []
         set({ tenants: tenantList })
       } catch {}
     },
     fetchOsUsers: async () => {
       try {
-        const res = await fetch('/api/super/os-users', { cache: 'no-store' })
-        if (!res.ok) return
-        const data = await res.json()
+        const data = await apiFetch<{ users?: OsUser[] }>('/api/super/os-users', {
+          cache: 'no-store',
+        })
         set({ osUsers: Array.isArray(data?.users) ? data.users : [] })
       } catch {}
     },
@@ -900,9 +935,9 @@ export const useMissionControl = create<MissionControlStore>()(
     setProjects: (projects) => set({ projects }),
     fetchProjects: async () => {
       try {
-        const res = await fetch('/api/projects', { cache: 'no-store' })
-        if (!res.ok) return
-        const data = await res.json()
+        const data = await apiFetch<{ projects?: Project[] }>('/api/projects', {
+          cache: 'no-store',
+        })
         const projectList = Array.isArray(data?.projects) ? data.projects : []
         set({ projects: projectList })
       } catch {}
@@ -925,7 +960,6 @@ export const useMissionControl = create<MissionControlStore>()(
         execApprovals: state.execApprovals.map(a => a.id === id ? { ...a, ...updates } : a),
       })),
 
-    // Office Panel
     officeSessionAgents: [],
     officeLocalAgents: [],
     officeNanobotStatus: {},
@@ -1080,14 +1114,12 @@ export const useMissionControl = create<MissionControlStore>()(
         selectedAgent: state.selectedAgent?.id === agentId ? null : state.selectedAgent
       })),
 
-    // Discovered Agents (filesystem-based, Phase 2)
     discoveredAgents: [],
     selectedDiscoveredAgentId: null,
     discoveredAgentsLoading: true,
     discoveredAgentsLastChecked: null,
     healthCheckInterval: 30000,
     setDiscoveredAgents: (agents) => {
-      // Sort by health status: red first, then yellow, then green
       const order: Record<string, number> = { red: 0, yellow: 1, green: 2 }
       const sorted = [...agents].sort(
         (a, b) => (order[a.health.overall] ?? 2) - (order[b.health.overall] ?? 2)
@@ -1130,8 +1162,6 @@ export const useMissionControl = create<MissionControlStore>()(
           a.id === agentId ? { ...a, errors: [], errorsDismissed: true } : a
         ),
       })),
-
-    // Lifecycle Operations (Phase 3)
     lifecycleOperations: new Map<string, LifecycleOperation>(),
     lifecycleHistory: [],
     setLifecycleOperation: (agentId, op) =>
@@ -1147,7 +1177,6 @@ export const useMissionControl = create<MissionControlStore>()(
     addLifecycleHistory: (op) =>
       set((state) => {
         const next = new Map(state.lifecycleOperations)
-        // Clear the active operation when status is terminal
         if (op.status === 'success' || op.status === 'error') {
           next.delete(op.agentId)
         }
@@ -1273,6 +1302,36 @@ export const useMissionControl = create<MissionControlStore>()(
             : msg
         )
       })),
+
+    // Terminal split panes + attention
+    splitPanes: [],
+    setSplitPanes: (panes) => set({ splitPanes: panes }),
+    addSplitPane: (sessionId, sessionKind, sessionName) =>
+      set((state) => {
+        if (state.splitPanes.length >= 4) return state
+        if (state.splitPanes.some((p) => p.sessionId === sessionId)) return state
+        return {
+          splitPanes: [
+            ...state.splitPanes,
+            { id: `pane-${Date.now()}`, sessionId, sessionKind, sessionName },
+          ],
+        }
+      }),
+    removeSplitPane: (paneId) =>
+      set((state) => ({
+        splitPanes: state.splitPanes.filter((p) => p.id !== paneId),
+      })),
+    clearSplitPanes: () => set({ splitPanes: [] }),
+    sessionAttention: {},
+    setSessionAttention: (sessionId, level) =>
+      set((state) => {
+        if (!level) {
+          const next = { ...state.sessionAttention }
+          delete next[sessionId]
+          return { sessionAttention: next }
+        }
+        return { sessionAttention: { ...state.sessionAttention, [sessionId]: level } }
+      }),
 
     // Mission Control Phase 2 - Standup
     standupReports: [],

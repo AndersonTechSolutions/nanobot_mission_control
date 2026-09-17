@@ -3,6 +3,7 @@ import { getDatabase } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
 import { syncClaudeSessions } from '@/lib/claude-sessions'
 import { logger } from '@/lib/logger'
+import { denyUnscopedResourceForStrictWorkspace } from '@/lib/workspace-isolation'
 
 /**
  * GET /api/claude/sessions — List discovered local Claude Code sessions
@@ -16,6 +17,8 @@ import { logger } from '@/lib/logger'
 export async function GET(request: NextRequest) {
   const auth = requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDenied = denyUnscopedResourceForStrictWorkspace(auth.user, 'local_sessions', new URL(request.url).pathname)
+  if (isolationDenied) return isolationDenied
 
   try {
     const db = getDatabase()
@@ -91,6 +94,8 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   const auth = requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDenied = denyUnscopedResourceForStrictWorkspace(auth.user, 'local_sessions', new URL(request.url).pathname)
+  if (isolationDenied) return isolationDenied
 
   try {
     const result = await syncClaudeSessions()

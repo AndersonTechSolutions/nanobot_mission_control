@@ -44,7 +44,7 @@ MC supports two auth methods:
 | Method | Header | Use Case |
 |--------|--------|----------|
 | API Key | `x-api-key: <key>` or `Authorization: Bearer <key>` | Agents, scripts, CI/CD |
-| Session cookie | `Cookie: mc-session=<token>` | Browser UI |
+| Session cookie | `Cookie: __Host-mc-session=<token>` (HTTPS) or `mc-session=<token>` (HTTP) | Browser UI |
 
 **Roles (hierarchical):** `viewer` < `operator` < `admin`
 
@@ -263,7 +263,6 @@ All adapters implement the same `FrameworkAdapter` interface — choose the one 
 | `API_KEY` | — | API key for agent/script authentication |
 | `OPENCLAW_GATEWAY_HOST` | `127.0.0.1` | Gateway host address |
 | `OPENCLAW_GATEWAY_PORT` | `18789` | Gateway port |
-| `MISSION_CONTROL_DB_PATH` | `.data/mission-control.db` | SQLite database path |
 | `OPENCLAW_STATE_DIR` | `~/.openclaw` | OpenClaw state directory |
 | `OPENCLAW_CONFIG_PATH` | `<state-dir>/openclaw.json` | Gateway config file path |
 | `MC_CLAUDE_HOME` | `~/.claude` | Claude home directory |

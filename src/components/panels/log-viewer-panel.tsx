@@ -1,11 +1,13 @@
 'use client'
 
 import { useState, useEffect, useRef, useCallback } from 'react'
+import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
 import { Loader } from '@/components/ui/loader'
-import { useMissionControl } from '@/store'
+import { useMissionControl, type LogEntry } from '@/store'
 import { useSmartPoll } from '@/lib/use-smart-poll'
 import { createClientLogger } from '@/lib/client-logger'
+import { apiFetch } from '@/lib/api-client'
 
 const log = createClientLogger('LogViewer')
 
@@ -29,6 +31,7 @@ function downloadFile(content: string, filename: string, mime: string) {
 }
 
 export function LogViewerPanel() {
+  const t = useTranslations('logViewer')
   const { logs, logFilters, setLogFilters, clearLogs, addLog } = useMissionControl()
   const [isAutoScroll, setIsAutoScroll] = useState(true)
   const [availableSources, setAvailableSources] = useState<string[]>([])
@@ -74,8 +77,7 @@ export function LogViewerPanel() {
       })
 
       log.debug(`Fetching /api/logs?${params}`)
-      const response = await fetch(`/api/logs?${params}`)
-      const data = await response.json()
+      const data = await apiFetch<{ logs?: LogEntry[] }>(`/api/logs?${params}`)
 
       log.debug(`Received ${data.logs?.length || 0} logs from API`)
 
@@ -111,8 +113,7 @@ export function LogViewerPanel() {
 
   const loadSources = useCallback(async () => {
     try {
-      const response = await fetch('/api/logs?action=sources')
-      const data = await response.json()
+      const data = await apiFetch<{ sources?: string[] }>('/api/logs?action=sources')
       setAvailableSources(data.sources || [])
     } catch (error) {
       log.error('Failed to load log sources:', error)
@@ -122,8 +123,10 @@ export function LogViewerPanel() {
   // Try to fetch log file path from gateway status
   const loadLogFilePath = useCallback(async () => {
     try {
-      const response = await fetch('/api/status')
-      const data = await response.json()
+      const data = await apiFetch<{
+        config?: { logFile?: string }
+        logFile?: string
+      }>('/api/status')
       const path = data?.config?.logFile || data?.logFile || null
       setLogFilePath(path)
     } catch {
@@ -215,9 +218,9 @@ export function LogViewerPanel() {
   return (
     <div className="flex flex-col h-full p-6 space-y-4">
       <div className="border-b border-border pb-4">
-        <h1 className="text-3xl font-bold text-foreground">Log Viewer</h1>
+        <h1 className="text-3xl font-bold text-foreground">{t('title')}</h1>
         <p className="text-muted-foreground mt-2">
-          Real-time streaming logs from ClawdBot gateway and system
+          {t('description')}
           {logFilePath && (
             <span className="ml-3 font-mono text-xs text-muted-foreground/70">{logFilePath}</span>
           )}
@@ -230,32 +233,32 @@ export function LogViewerPanel() {
           {/* Level Filter */}
           <div>
             <label className="block text-sm font-medium text-foreground mb-2">
-              Level
+              {t('filterLevel')}
             </label>
             <select
               value={logFilters.level || ''}
               onChange={(e) => handleFilterChange({ level: e.target.value || undefined })}
-              className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+              className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
             >
-              <option value="">All levels</option>
-              <option value="error">Error</option>
-              <option value="warn">Warning</option>
-              <option value="info">Info</option>
-              <option value="debug">Debug</option>
+              <option value="">{t('allLevels')}</option>
+              <option value="error">{t('levelError')}</option>
+              <option value="warn">{t('levelWarning')}</option>
+              <option value="info">{t('levelInfo')}</option>
+              <option value="debug">{t('levelDebug')}</option>
             </select>
           </div>
 
           {/* Source Filter */}
           <div>
             <label className="block text-sm font-medium text-foreground mb-2">
-              Source
+              {t('filterSource')}
             </label>
             <select
               value={logFilters.source || ''}
               onChange={(e) => handleFilterChange({ source: e.target.value || undefined })}
-              className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+              className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
             >
-              <option value="">All sources</option>
+              <option value="">{t('allSources')}</option>
               {availableSources.map((source) => (
                 <option key={source} value={source}>{source}</option>
               ))}
@@ -265,28 +268,28 @@ export function LogViewerPanel() {
           {/* Session Filter */}
           <div>
             <label className="block text-sm font-medium text-foreground mb-2">
-              Session
+              {t('filterSession')}
             </label>
             <input
               type="text"
               value={logFilters.session || ''}
               onChange={(e) => handleFilterChange({ session: e.target.value || undefined })}
-              placeholder="Session ID"
-              className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground placeholder-muted-foreground text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+              placeholder={t('sessionPlaceholder')}
+              className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground placeholder-muted-foreground text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
             />
           </div>
 
           {/* Search Filter */}
           <div>
             <label className="block text-sm font-medium text-foreground mb-2">
-              Search
+              {t('filterSearch')}
             </label>
             <input
               type="text"
               value={logFilters.search || ''}
               onChange={(e) => handleFilterChange({ search: e.target.value || undefined })}
-              placeholder="Search messages..."
-              className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground placeholder-muted-foreground text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+              placeholder={t('searchPlaceholder')}
+              className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground placeholder-muted-foreground text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
             />
           </div>
 
@@ -296,13 +299,13 @@ export function LogViewerPanel() {
               onClick={() => setIsAutoScroll(!isAutoScroll)}
               variant={isAutoScroll ? 'success' : 'outline'}
             >
-              {isAutoScroll ? 'Auto' : 'Manual'}
+              {isAutoScroll ? t('auto') : t('manual')}
             </Button>
             <Button
               onClick={handleScrollToBottom}
               className="bg-blue-500/20 text-blue-400 border border-blue-500/30 hover:bg-blue-500/30"
             >
-              Bottom
+              {t('bottom')}
             </Button>
           </div>
 
@@ -313,20 +316,20 @@ export function LogViewerPanel() {
               disabled={filteredLogs.length === 0}
               className="bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/30 disabled:opacity-40"
             >
-              Export .log
+              {t('exportLog')}
             </Button>
             <Button
               onClick={handleExportJson}
               disabled={filteredLogs.length === 0}
               className="bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/30 disabled:opacity-40"
             >
-              Export JSON
+              {t('exportJson')}
             </Button>
             <Button
               onClick={clearLogs}
               variant="destructive"
             >
-              Clear
+              {t('clear')}
             </Button>
           </div>
         </div>
@@ -335,16 +338,16 @@ export function LogViewerPanel() {
       {/* Log Stats */}
       <div className="flex items-center justify-between text-sm text-muted-foreground">
         <div className="flex items-center gap-3">
-          <span>Showing {filteredLogs.length} of {logs.length} logs</span>
+          <span>{t('showing', { filtered: filteredLogs.length, total: logs.length })}</span>
           {isBufferFull && (
             <span className="px-2 py-0.5 rounded text-xs bg-yellow-500/15 text-yellow-400 border border-yellow-500/25">
-              Showing last {MAX_LOG_BUFFER} entries (buffer full)
+              {t('bufferFull', { max: MAX_LOG_BUFFER })}
             </span>
           )}
         </div>
         <div>
-          Auto-scroll: {isAutoScroll ? 'ON' : 'OFF'} •
-          Last updated: {logs.length > 0 ? new Date(logs[0]?.timestamp).toLocaleTimeString() : 'Never'}
+          {t('autoScroll')}: {isAutoScroll ? t('on') : t('off')} •
+          {t('lastUpdated')}: {logs.length > 0 ? new Date(logs[0]?.timestamp).toLocaleTimeString() : t('never')}
         </div>
       </div>
 
@@ -358,7 +361,7 @@ export function LogViewerPanel() {
             <Loader variant="panel" label="Loading logs" />
           ) : filteredLogs.length === 0 ? (
             <div className="flex items-center justify-center h-32 text-muted-foreground">
-              No logs match the current filters
+              {t('noLogs')}
             </div>
           ) : (
             filteredLogs.map((log) => (
@@ -384,13 +387,13 @@ export function LogViewerPanel() {
                         </span>
                       )}
                     </div>
-                    <div className="mt-1 text-foreground break-words">
+                    <div className="mt-1 text-foreground wrap-break-word">
                       {log.message}
                     </div>
                     {log.data && (
                       <details className="mt-2">
                         <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground">
-                          Additional data
+                          {t('additionalData')}
                         </summary>
                         <pre className="mt-1 text-xs text-muted-foreground overflow-auto">
                           {JSON.stringify(log.data, null, 2)}

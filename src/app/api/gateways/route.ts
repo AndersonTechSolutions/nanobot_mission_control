@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth'
 import { getDatabase } from '@/lib/db'
 import { getDetectedGatewayPort, getDetectedGatewayToken } from '@/lib/gateway-runtime'
+import { denyUnscopedResourceForStrictWorkspace } from '@/lib/workspace-isolation'
 
 interface GatewayEntry {
   id: number
@@ -45,6 +46,8 @@ function ensureTable(db: ReturnType<typeof getDatabase>) {
 export async function GET(request: NextRequest) {
   const auth = requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDeny = denyUnscopedResourceForStrictWorkspace(auth.user, 'runtime_configuration', new URL(request.url).pathname)
+  if (isolationDeny) return isolationDeny
 
   const db = getDatabase()
   ensureTable(db)
@@ -63,10 +66,10 @@ export async function GET(request: NextRequest) {
     `).run(name, host, mainPort, mainToken)
 
     const seeded = db.prepare('SELECT * FROM gateways ORDER BY is_primary DESC, name ASC').all() as GatewayEntry[]
-    return NextResponse.json({ gateways: redactTokens(seeded) })
+    return NextResponse.json({ gateways: redactTokens(enrichGatewaysWithAgentCounts(db, seeded, auth.user.workspace_id)) })
   }
 
-  return NextResponse.json({ gateways: redactTokens(gateways) })
+  return NextResponse.json({ gateways: redactTokens(enrichGatewaysWithAgentCounts(db, gateways, auth.user.workspace_id)) })
 }
 
 /**
@@ -75,12 +78,14 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   const auth = requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDeny = denyUnscopedResourceForStrictWorkspace(auth.user, 'runtime_configuration', new URL(request.url).pathname)
+  if (isolationDeny) return isolationDeny
 
   const db = getDatabase()
   ensureTable(db)
   const body = await request.json()
 
-  const { name, host, port, token, is_primary } = body
+  const { name, host, port, token, is_primary, agents } = body
 
   if (!name || !host || !port) {
     return NextResponse.json({ error: 'name, host, and port are required' }, { status: 400 })
@@ -96,14 +101,37 @@ export async function POST(request: NextRequest) {
       INSERT INTO gateways (name, host, port, token, is_primary) VALUES (?, ?, ?, ?, ?)
     `).run(name, host, port, token || '', is_primary ? 1 : 0)
 
+    // Auto-register agents reported by the gateway (k8s sidecar support)
+    let agentsRegistered = 0
+    if (Array.isArray(agents) && agents.length > 0) {
+      const workspaceId = auth.user?.workspace_id ?? 1
+      const now = Math.floor(Date.now() / 1000)
+      const upsertAgent = db.prepare(`
+        INSERT INTO agents (name, role, status, last_seen, source, workspace_id, updated_at)
+        VALUES (?, ?, 'idle', ?, 'gateway', ?, ?)
+        ON CONFLICT(name, workspace_id) DO UPDATE SET
+          status = 'idle',
+          last_seen = excluded.last_seen,
+          source = 'gateway',
+          updated_at = excluded.updated_at
+      `)
+      for (const agent of agents.slice(0, 50)) {
+        if (typeof agent?.name !== 'string' || !agent.name.trim()) continue
+        const agentName = agent.name.trim().substring(0, 100)
+        const agentRole = typeof agent?.role === 'string' ? agent.role.trim().substring(0, 100) : 'agent'
+        upsertAgent.run(agentName, agentRole, now, workspaceId, now)
+        agentsRegistered++
+      }
+    }
+
     try {
-      db.prepare('INSERT INTO audit_log (action, actor, detail) VALUES (?, ?, ?)').run(
-        'gateway_added', auth.user?.username || 'system', `Added gateway: ${name} (${host}:${port})`
+      db.prepare('INSERT INTO audit_log (action, actor, detail, workspace_id) VALUES (?, ?, ?, ?)').run(
+        'gateway_added', auth.user?.username || 'system', `Added gateway: ${name} (${host}:${port})${agentsRegistered ? `, registered ${agentsRegistered} agent(s)` : ''}`, auth.user.workspace_id ?? 1
       )
     } catch { /* audit might not exist */ }
 
     const gw = db.prepare('SELECT * FROM gateways WHERE id = ?').get(result.lastInsertRowid) as GatewayEntry
-    return NextResponse.json({ gateway: redactToken(gw) }, { status: 201 })
+    return NextResponse.json({ gateway: redactToken(gw), agents_registered: agentsRegistered }, { status: 201 })
   } catch (err: any) {
     if (err.message?.includes('UNIQUE')) {
       return NextResponse.json({ error: 'A gateway with that name already exists' }, { status: 409 })
@@ -118,6 +146,8 @@ export async function POST(request: NextRequest) {
 export async function PUT(request: NextRequest) {
   const auth = requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDeny = denyUnscopedResourceForStrictWorkspace(auth.user, 'runtime_configuration', new URL(request.url).pathname)
+  if (isolationDeny) return isolationDeny
 
   const db = getDatabase()
   ensureTable(db)
@@ -145,15 +175,39 @@ export async function PUT(request: NextRequest) {
     }
   }
 
-  if (sets.length === 0) return NextResponse.json({ error: 'No valid fields to update' }, { status: 400 })
+  if (sets.length === 0 && !Array.isArray(updates.agents)) return NextResponse.json({ error: 'No valid fields to update' }, { status: 400 })
 
-  sets.push('updated_at = (unixepoch())')
-  values.push(id)
+  if (sets.length > 0) {
+    sets.push('updated_at = (unixepoch())')
+    values.push(id)
+    db.prepare(`UPDATE gateways SET ${sets.join(', ')} WHERE id = ?`).run(...values)
+  }
 
-  db.prepare(`UPDATE gateways SET ${sets.join(', ')} WHERE id = ?`).run(...values)
+  // Auto-register agents reported by the gateway (k8s sidecar support)
+  let agentsRegistered = 0
+  if (Array.isArray(updates.agents) && updates.agents.length > 0) {
+    const workspaceId = auth.user?.workspace_id ?? 1
+    const now = Math.floor(Date.now() / 1000)
+    const upsertAgent = db.prepare(`
+      INSERT INTO agents (name, role, status, last_seen, source, workspace_id, updated_at)
+      VALUES (?, ?, 'idle', ?, 'gateway', ?, ?)
+      ON CONFLICT(name, workspace_id) DO UPDATE SET
+        status = 'idle',
+        last_seen = excluded.last_seen,
+        source = 'gateway',
+        updated_at = excluded.updated_at
+    `)
+    for (const agent of updates.agents.slice(0, 50)) {
+      if (typeof agent?.name !== 'string' || !agent.name.trim()) continue
+      const agentName = agent.name.trim().substring(0, 100)
+      const agentRole = typeof agent?.role === 'string' ? agent.role.trim().substring(0, 100) : 'agent'
+      upsertAgent.run(agentName, agentRole, now, workspaceId, now)
+      agentsRegistered++
+    }
+  }
 
   const updated = db.prepare('SELECT * FROM gateways WHERE id = ?').get(id) as GatewayEntry
-  return NextResponse.json({ gateway: redactToken(updated) })
+  return NextResponse.json({ gateway: redactToken(updated), agents_registered: agentsRegistered })
 }
 
 /**
@@ -162,6 +216,8 @@ export async function PUT(request: NextRequest) {
 export async function DELETE(request: NextRequest) {
   const auth = requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDeny = denyUnscopedResourceForStrictWorkspace(auth.user, 'runtime_configuration', new URL(request.url).pathname)
+  if (isolationDeny) return isolationDeny
 
   const db = getDatabase()
   ensureTable(db)
@@ -178,8 +234,8 @@ export async function DELETE(request: NextRequest) {
   const result = db.prepare('DELETE FROM gateways WHERE id = ?').run(id)
 
   try {
-    db.prepare('INSERT INTO audit_log (action, actor, detail) VALUES (?, ?, ?)').run(
-      'gateway_removed', auth.user?.username || 'system', `Removed gateway: ${gw?.name}`
+    db.prepare('INSERT INTO audit_log (action, actor, detail, workspace_id) VALUES (?, ?, ?, ?)').run(
+      'gateway_removed', auth.user?.username || 'system', `Removed gateway: ${gw?.name}`, auth.user.workspace_id ?? 1
     )
   } catch { /* audit might not exist */ }
 
@@ -192,4 +248,26 @@ function redactToken(gw: GatewayEntry): GatewayEntry & { token_set: boolean } {
 
 function redactTokens(gws: GatewayEntry[]) {
   return gws.map(redactToken)
+}
+
+/**
+ * Enrich gateways with live agents_count derived from agents table.
+ * Since there is no agents.gateway_id FK, all gateways share the same count:
+ * the total number of agents with source='gateway' in the workspace.
+ */
+function enrichGatewaysWithAgentCounts(
+  db: ReturnType<typeof getDatabase>,
+  gateways: GatewayEntry[],
+  workspaceId: number
+): GatewayEntry[] {
+  const result = db.prepare(`
+    SELECT COUNT(*) as count FROM agents WHERE source = 'gateway' AND workspace_id = ?
+  `).get(workspaceId) as { count: number } | undefined
+  
+  const gatewayAgentsCount = result?.count ?? 0
+
+  return gateways.map(gw => ({
+    ...gw,
+    agents_count: gatewayAgentsCount
+  }))
 }

@@ -1,12 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { createHash } from 'node:crypto'
-import { access, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
+import { access, lstat, mkdir, open, readFile, realpath, readdir, rename, rm } from 'node:fs/promises'
 import { constants } from 'node:fs'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 import { homedir } from 'node:os'
 import { requireRole } from '@/lib/auth'
 import { resolveWithin } from '@/lib/paths'
 import { checkSkillSecurity } from '@/lib/skill-registry'
+import { logAuditEvent } from '@/lib/db'
+import { skillMutationLimiter } from '@/lib/rate-limit'
+import { skillDeleteSchema, skillMutationSchema, validateBody } from '@/lib/validation'
+import { logger } from '@/lib/logger'
 
 interface SkillSummary {
   id: string
@@ -19,6 +23,28 @@ interface SkillSummary {
 }
 
 type SkillRoot = { source: string; path: string }
+
+class SkillPathError extends Error {}
+
+function auditSkillMutation(
+  action: string,
+  user: { username: string; id: number },
+  source: string,
+  name: string,
+  detail: Record<string, unknown> = {},
+): void {
+  try {
+    logAuditEvent({
+      action,
+      actor: user.username,
+      actor_id: user.id,
+      target_type: 'skill',
+      detail: { source, name, ...detail },
+    })
+  } catch {
+    // The filesystem mutation is authoritative; audit storage is best-effort.
+  }
+}
 
 function resolveSkillRoot(
   envName: string,
@@ -81,13 +107,37 @@ function getSkillRoots(): SkillRoot[] {
   const roots: SkillRoot[] = [
     { source: 'user-agents', path: resolveSkillRoot('MC_SKILLS_USER_AGENTS_DIR', join(home, '.agents', 'skills')) },
     { source: 'user-codex', path: resolveSkillRoot('MC_SKILLS_USER_CODEX_DIR', join(home, '.codex', 'skills')) },
-    { source: 'project-agents', path: resolveSkillRoot('MC_SKILLS_PROJECT_AGENTS_DIR', join(cwd, '.agents', 'skills')) },
-    { source: 'project-codex', path: resolveSkillRoot('MC_SKILLS_PROJECT_CODEX_DIR', join(cwd, '.codex', 'skills')) },
+    // Runtime workspace paths are intentionally not statically traced into the
+    // standalone artifact. They are operator-managed content, not build input.
+    { source: 'project-agents', path: resolveSkillRoot('MC_SKILLS_PROJECT_AGENTS_DIR', `${cwd}/.agents/skills`) },
+    { source: 'project-codex', path: resolveSkillRoot('MC_SKILLS_PROJECT_CODEX_DIR', `${cwd}/.codex/skills`) },
   ]
-  // Add nanobot workspace skills
-  const nanobotWorkspace = process.env.NANOBOT_WORKSPACE_DIR || join(home, '.nanobot', 'workspace')
-  const nanobotSkills = resolveSkillRoot('MC_SKILLS_NANOBOT_DIR', join(nanobotWorkspace, 'skills'))
-  roots.push({ source: 'nanobot', path: nanobotSkills })
+  // Add OpenClaw gateway skill roots when configured
+  const openclawState = process.env.OPENCLAW_STATE_DIR || process.env.OPENCLAW_HOME || process.env.NANOBOT_STATE_DIR || process.env.NANOBOT_HOME || join(home, '.nanobot')
+  const openclawSkills = resolveSkillRoot('MC_SKILLS_OPENCLAW_DIR', join(openclawState, 'skills'))
+  roots.push({ source: 'openclaw', path: openclawSkills })
+
+  // Add OpenClaw workspace-local skills (takes precedence when names conflict)
+  const workspaceDir = process.env.OPENCLAW_WORKSPACE_DIR || process.env.MISSION_CONTROL_WORKSPACE_DIR || join(openclawState, 'workspace')
+  const workspaceSkills = resolveSkillRoot('MC_SKILLS_WORKSPACE_DIR', join(workspaceDir, 'skills'))
+  roots.push({ source: 'workspace', path: workspaceSkills })
+
+  // Dynamic: scan for workspace-<agent> directories
+  try {
+    const { readdirSync, existsSync } = require('node:fs') as typeof import('node:fs')
+    const entries = readdirSync(openclawState) as string[]
+    for (const entry of entries) {
+      if (!entry.startsWith('workspace-')) continue
+      const skillsDir = join(openclawState, entry, 'skills')
+      if (existsSync(skillsDir)) {
+        const agentName = entry.replace('workspace-', '')
+        roots.push({ source: `workspace-${agentName}`, path: skillsDir })
+      }
+    }
+  } catch {
+    // openclawBase may not exist
+  }
+
   return roots
 }
 
@@ -104,11 +154,65 @@ function getRootBySource(roots: SkillRoot[], sourceRaw: string | null): SkillRoo
   return roots.find((r) => r.source === source) || null
 }
 
+function assertRealPathWithin(rootPath: string, candidatePath: string): void {
+  resolveWithin(rootPath, relative(rootPath, candidatePath))
+}
+
+async function resolveSafeSkillPaths(root: SkillRoot, name: string, create = false) {
+  if (create) await mkdir(root.path, { recursive: true })
+  const realRoot = await realpath(root.path).catch(() => null)
+  if (!realRoot) throw new SkillPathError('Skill root is unavailable')
+
+  const skillPath = resolveWithin(realRoot, name)
+  let skillStat = await lstat(skillPath).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return null
+    throw error
+  })
+  if (skillStat?.isSymbolicLink()) throw new SkillPathError('Symlinked skill directories are not allowed')
+  if (skillStat && !skillStat.isDirectory()) throw new SkillPathError('Skill path is not a directory')
+  if (!skillStat) {
+    if (!create) throw new SkillPathError('Skill not found')
+    await mkdir(skillPath, { recursive: false }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== 'EEXIST') throw error
+    })
+    skillStat = await lstat(skillPath)
+    if (skillStat.isSymbolicLink()) throw new SkillPathError('Symlinked skill directories are not allowed')
+    if (!skillStat.isDirectory()) throw new SkillPathError('Skill path is not a directory')
+  }
+
+  const realSkillPath = await realpath(skillPath)
+  assertRealPathWithin(realRoot, realSkillPath)
+  const skillDocPath = resolveWithin(realSkillPath, 'SKILL.md')
+  const docStat = await lstat(skillDocPath).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return null
+    throw error
+  })
+  if (docStat?.isSymbolicLink()) throw new SkillPathError('Symlinked skill documents are not allowed')
+  if (docStat && !docStat.isFile()) throw new SkillPathError('SKILL.md is not a regular file')
+
+  return { skillPath: realSkillPath, skillDocPath }
+}
+
+async function writeSkillDocument(skillPath: string, skillDocPath: string, content: string): Promise<void> {
+  const tempPath = resolveWithin(skillPath, `.SKILL.md.${randomUUID()}.tmp`)
+  let handle: Awaited<ReturnType<typeof open>> | null = null
+  try {
+    handle = await open(tempPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600)
+    await handle.writeFile(content, 'utf8')
+    await handle.sync()
+    await handle.close()
+    handle = null
+    await rename(tempPath, skillDocPath)
+  } catch (error) {
+    await handle?.close().catch(() => undefined)
+    await rm(tempPath, { force: true }).catch(() => undefined)
+    throw error
+  }
+}
+
 async function upsertSkill(root: SkillRoot, name: string, content: string) {
-  const skillPath = resolveWithin(root.path, name)
-  const skillDocPath = resolveWithin(skillPath, 'SKILL.md')
-  await mkdir(skillPath, { recursive: true })
-  await writeFile(skillDocPath, content, 'utf8')
+  const { skillPath, skillDocPath } = await resolveSafeSkillPaths(root, name, true)
+  await writeSkillDocument(skillPath, skillDocPath, content)
 
   // Update DB hash so next sync cycle detects our write
   try {
@@ -141,7 +245,7 @@ async function upsertSkill(root: SkillRoot, name: string, content: string) {
 }
 
 async function deleteSkill(root: SkillRoot, name: string) {
-  const skillPath = resolveWithin(root.path, name)
+  const { skillPath } = await resolveSafeSkillPaths(root, name)
   await rm(skillPath, { recursive: true, force: true })
 
   // Remove from DB
@@ -196,11 +300,14 @@ export async function GET(request: NextRequest) {
     }
     const root = roots.find((r) => r.source === source)
     if (!root) return NextResponse.json({ error: 'Invalid source' }, { status: 400 })
-    const skillPath = join(root.path, name)
-    const skillDocPath = join(skillPath, 'SKILL.md')
-    if (!(await pathReadable(skillDocPath))) {
-      return NextResponse.json({ error: 'SKILL.md not found' }, { status: 404 })
+    let skillPath: string
+    let skillDocPath: string
+    try {
+      ({ skillPath, skillDocPath } = await resolveSafeSkillPaths(root, name))
+    } catch (error) {
+      return NextResponse.json({ error: error instanceof SkillPathError ? error.message : 'Skill path is unavailable' }, { status: 404 })
     }
+    if (!(await pathReadable(skillDocPath))) return NextResponse.json({ error: 'SKILL.md not found' }, { status: 404 })
     const content = await readFile(skillDocPath, 'utf8')
 
     // Run security check inline
@@ -225,11 +332,13 @@ export async function GET(request: NextRequest) {
     }
     const root = roots.find((r) => r.source === source)
     if (!root) return NextResponse.json({ error: 'Invalid source' }, { status: 400 })
-    const skillPath = join(root.path, name)
-    const skillDocPath = join(skillPath, 'SKILL.md')
-    if (!(await pathReadable(skillDocPath))) {
-      return NextResponse.json({ error: 'SKILL.md not found' }, { status: 404 })
+    let skillDocPath: string
+    try {
+      ({ skillDocPath } = await resolveSafeSkillPaths(root, name))
+    } catch (error) {
+      return NextResponse.json({ error: error instanceof SkillPathError ? error.message : 'Skill path is unavailable' }, { status: 404 })
     }
+    if (!(await pathReadable(skillDocPath))) return NextResponse.json({ error: 'SKILL.md not found' }, { status: 404 })
     const content = await readFile(skillDocPath, 'utf8')
     const security = checkSkillSecurity(content)
 
@@ -253,6 +362,10 @@ export async function GET(request: NextRequest) {
       groupMap.set(root.source, { source: root.source, path: root.path, skills: [] })
     }
     for (const skill of dbSkills) {
+      // Dynamically add workspace-* groups not already in roots
+      if (!groupMap.has(skill.source) && skill.source.startsWith('workspace-')) {
+        groupMap.set(skill.source, { source: skill.source, path: '', skills: [] })
+      }
       const group = groupMap.get(skill.source)
       if (group) group.skills.push(skill)
     }
@@ -295,55 +408,102 @@ export async function POST(request: NextRequest) {
   const auth = requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
+  const limitKey = `${auth.user.tenant_id ?? 1}:${auth.user.workspace_id ?? 1}:${auth.user.id}`
+  const limited = skillMutationLimiter(limitKey)
+  if (limited) return limited
+
+  const validated = await validateBody(request, skillMutationSchema)
+  if ('error' in validated) return validated.error
+
   const roots = getSkillRoots()
-  const body = await request.json().catch(() => ({}))
-  const root = getRootBySource(roots, body?.source)
-  const name = normalizeSkillName(String(body?.name || ''))
-  const contentRaw = typeof body?.content === 'string' ? body.content : ''
+  const root = getRootBySource(roots, validated.data.source)
+  const name = normalizeSkillName(validated.data.name)
+  const contentRaw = validated.data.content
   const content = contentRaw.trim() || `# ${name || 'skill'}\n\nDescribe this skill.\n`
 
   if (!root || !name) {
     return NextResponse.json({ error: 'Valid source and name are required' }, { status: 400 })
   }
 
-  await mkdir(root.path, { recursive: true })
-  const { skillPath, skillDocPath } = await upsertSkill(root, name, content)
-  return NextResponse.json({ ok: true, source: root.source, name, skillPath, skillDocPath })
+  const security = checkSkillSecurity(content)
+  if (security.status === 'rejected') {
+    return NextResponse.json({ error: 'Skill content failed security checks', security }, { status: 422 })
+  }
+
+  try {
+    const { skillPath, skillDocPath } = await upsertSkill(root, name, content)
+    auditSkillMutation('skill.upsert', auth.user, root.source, name, { security_status: security.status })
+    return NextResponse.json({ ok: true, source: root.source, name, skillPath, skillDocPath, security })
+  } catch (error) {
+    logger.error({ actor: auth.user.username, source: root.source, name, err: error }, 'Skill creation failed')
+    const message = error instanceof SkillPathError ? error.message : 'Failed to create skill'
+    return NextResponse.json({ error: message }, { status: error instanceof SkillPathError ? 400 : 500 })
+  }
 }
 
 export async function PUT(request: NextRequest) {
   const auth = requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
-  const roots = getSkillRoots()
-  const body = await request.json().catch(() => ({}))
-  const root = getRootBySource(roots, body?.source)
-  const name = normalizeSkillName(String(body?.name || ''))
-  const content = typeof body?.content === 'string' ? body.content : null
+  const limitKey = `${auth.user.tenant_id ?? 1}:${auth.user.workspace_id ?? 1}:${auth.user.id}`
+  const limited = skillMutationLimiter(limitKey)
+  if (limited) return limited
 
-  if (!root || !name || content == null) {
+  const validated = await validateBody(request, skillMutationSchema)
+  if ('error' in validated) return validated.error
+
+  const roots = getSkillRoots()
+  const root = getRootBySource(roots, validated.data.source)
+  const name = normalizeSkillName(validated.data.name)
+  const content = validated.data.content
+
+  if (!root || !name) {
     return NextResponse.json({ error: 'Valid source, name, and content are required' }, { status: 400 })
   }
 
-  await mkdir(root.path, { recursive: true })
-  const { skillPath, skillDocPath } = await upsertSkill(root, name, content)
-  return NextResponse.json({ ok: true, source: root.source, name, skillPath, skillDocPath })
+  const security = checkSkillSecurity(content)
+  if (security.status === 'rejected') {
+    return NextResponse.json({ error: 'Skill content failed security checks', security }, { status: 422 })
+  }
+
+  try {
+    const { skillPath, skillDocPath } = await upsertSkill(root, name, content)
+    auditSkillMutation('skill.update', auth.user, root.source, name, { security_status: security.status })
+    return NextResponse.json({ ok: true, source: root.source, name, skillPath, skillDocPath, security })
+  } catch (error) {
+    logger.error({ actor: auth.user.username, source: root.source, name, err: error }, 'Skill update failed')
+    const message = error instanceof SkillPathError ? error.message : 'Failed to update skill'
+    return NextResponse.json({ error: message }, { status: error instanceof SkillPathError ? 400 : 500 })
+  }
 }
 
 export async function DELETE(request: NextRequest) {
   const auth = requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
-  const { searchParams } = new URL(request.url)
+  const limitKey = `${auth.user.tenant_id ?? 1}:${auth.user.workspace_id ?? 1}:${auth.user.id}`
+  const limited = skillMutationLimiter(limitKey)
+  if (limited) return limited
+
+  const validated = await validateBody(request, skillDeleteSchema)
+  if ('error' in validated) return validated.error
+
   const roots = getSkillRoots()
-  const root = getRootBySource(roots, searchParams.get('source'))
-  const name = normalizeSkillName(String(searchParams.get('name') || ''))
+  const root = getRootBySource(roots, validated.data.source)
+  const name = normalizeSkillName(validated.data.name)
   if (!root || !name) {
     return NextResponse.json({ error: 'Valid source and name are required' }, { status: 400 })
   }
 
-  const { skillPath } = await deleteSkill(root, name)
-  return NextResponse.json({ ok: true, source: root.source, name, skillPath })
+  try {
+    const { skillPath } = await deleteSkill(root, name)
+    auditSkillMutation('skill.delete', auth.user, root.source, name)
+    return NextResponse.json({ ok: true, source: root.source, name, skillPath })
+  } catch (error) {
+    logger.error({ actor: auth.user.username, source: root.source, name, err: error }, 'Skill deletion failed')
+    const message = error instanceof SkillPathError ? error.message : 'Failed to delete skill'
+    return NextResponse.json({ error: message }, { status: error instanceof SkillPathError ? 400 : 500 })
+  }
 }
 
 export const dynamic = 'force-dynamic'

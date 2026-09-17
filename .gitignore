@@ -12,7 +12,13 @@ dist/
 # Misc
 .DS_Store
 *.pem
-.env*.local
+
+# Environment variables - ignore all .env* variants by default
+.env*
+
+# Re-allow intentionally committed sample/test files
+!.env.example
+!.env.test
 
 # npm (project uses pnpm)
 package-lock.json
@@ -28,7 +34,6 @@ yarn-error.log*
 # TypeScript
 *.tsbuildinfo
 next-env.d.ts
-.env
 .data/
 aegis/
 
@@ -41,8 +46,12 @@ playwright-report/
 # Local QA screenshots
 /e2e-debug-*.png
 /e2e-channels-*.png
+docs/_*.png
 
-# Claude Code context files
-CLAUDE.md
+# Claude Code context files (root CLAUDE.md is committed for AI agent discovery)
 **/CLAUDE.md
+!/CLAUDE.md
 .worktrees/
+
+# IDE state
+.vs/

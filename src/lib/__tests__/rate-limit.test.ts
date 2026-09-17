@@ -1,13 +1,41 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { createRateLimiter } from '@/lib/rate-limit'
+import { createKeyedRateLimiter, createRateLimiter } from '@/lib/rate-limit'
 
 describe('createRateLimiter', () => {
+  const originalDisableRateLimit = process.env.MC_DISABLE_RATE_LIMIT
+  const originalTestMode = process.env.MISSION_CONTROL_TEST_MODE
+
   beforeEach(() => {
     vi.useFakeTimers()
   })
 
   afterEach(() => {
     vi.useRealTimers()
+    if (originalDisableRateLimit === undefined) delete process.env.MC_DISABLE_RATE_LIMIT
+    else process.env.MC_DISABLE_RATE_LIMIT = originalDisableRateLimit
+    if (originalTestMode === undefined) delete process.env.MISSION_CONTROL_TEST_MODE
+    else process.env.MISSION_CONTROL_TEST_MODE = originalTestMode
+  })
+
+  it('tracks authenticated identities independently with a keyed limiter', () => {
+    const limiter = createKeyedRateLimiter({ windowMs: 60_000, maxRequests: 1 })
+
+    expect(limiter('workspace-1:user-1')).toBeNull()
+    expect(limiter('workspace-1:user-2')).toBeNull()
+    expect(limiter('workspace-1:user-1')?.status).toBe(429)
+  })
+
+  it('does not bypass a critical keyed limiter in test mode', () => {
+    process.env.MC_DISABLE_RATE_LIMIT = '1'
+    process.env.MISSION_CONTROL_TEST_MODE = '1'
+    const limiter = createKeyedRateLimiter({
+      windowMs: 60_000,
+      maxRequests: 1,
+      critical: true,
+    })
+
+    expect(limiter('workspace-1:user-1')).toBeNull()
+    expect(limiter('workspace-1:user-1')?.status).toBe(429)
   })
 
   function makeRequest(ip: string = '127.0.0.1'): Request {
@@ -71,5 +99,30 @@ describe('createRateLimiter', () => {
     expect(limiter(makeRequest('10.0.0.1'))).not.toBeNull()
     // Second IP now blocked
     expect(limiter(makeRequest('10.0.0.2'))).not.toBeNull()
+  })
+
+  it('evicts oldest entry when maxEntries is reached', () => {
+    const limiter = createRateLimiter({ windowMs: 60_000, maxRequests: 1, maxEntries: 3 })
+
+    // Fill to capacity and exhaust 10.0.0.1's quota
+    limiter(makeRequest('10.0.0.1'))
+    vi.advanceTimersByTime(1)
+    expect(limiter(makeRequest('10.0.0.1'))).not.toBeNull() // blocked: quota consumed
+
+    limiter(makeRequest('10.0.0.2'))
+    vi.advanceTimersByTime(1)
+    limiter(makeRequest('10.0.0.3'))
+    vi.advanceTimersByTime(1)
+
+    // Store has 3 entries (A blocked, B, C). Adding D evicts A (oldest resetAt)
+    limiter(makeRequest('10.0.0.4'))
+
+    // 10.0.0.1 was evicted — counter is gone, this is allowed (fresh entry)
+    expect(limiter(makeRequest('10.0.0.1'))).toBeNull()
+    // Now 10.0.0.1 is back at count=1 and blocked
+    expect(limiter(makeRequest('10.0.0.1'))).not.toBeNull()
+
+    // 10.0.0.3 should still be tracked (not evicted — it had the newest resetAt)
+    expect(limiter(makeRequest('10.0.0.3'))).not.toBeNull()
   })
 })

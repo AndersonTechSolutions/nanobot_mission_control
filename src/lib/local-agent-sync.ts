@@ -12,12 +12,12 @@
  */
 
 import { createHash } from 'node:crypto'
-import { readdirSync, readFileSync, statSync, existsSync, writeFileSync, mkdirSync } from 'node:fs'
+import { closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, existsSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { getDatabase, logAuditEvent } from './db'
 import { logger } from './logger'
-import { discoverAgents } from './agent-discovery'
+import { resolveSharedRuntimeWorkspaceId } from './workspace-isolation'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -88,6 +88,21 @@ function sha256(content: string): string {
   return createHash('sha256').update(content, 'utf8').digest('hex')
 }
 
+function readRegularFile(path: string): string | null {
+  let descriptor: number
+  try {
+    descriptor = openSync(path, 'r')
+  } catch {
+    return null
+  }
+  try {
+    if (!fstatSync(descriptor).isFile()) return null
+    return readFileSync(descriptor, 'utf8')
+  } finally {
+    closeSync(descriptor)
+  }
+}
+
 function extractRole(content: string): string {
   const lines = content.split('\n').map(l => l.trim()).filter(Boolean)
   // Look for "role:" or "theme:" in first 10 lines
@@ -104,6 +119,7 @@ function getLocalAgentRoots(): string[] {
     join(home, '.agents'),
     join(home, '.codex', 'agents'),
     join(home, '.claude', 'agents'),
+    join(home, '.hermes', 'skills'),
   ]
 }
 
@@ -139,7 +155,8 @@ function scanLocalAgents(): DiskAgent[] {
       // --- Flat .md agent files (Claude Code format) ---
       if (stat.isFile() && entry.endsWith('.md') && entry !== 'CLAUDE.md' && entry !== 'AGENTS.md') {
         try {
-          const content = readFileSync(fullPath, 'utf8')
+          const content = readRegularFile(fullPath)
+          if (content === null) continue
           const { frontmatter, body } = parseYamlFrontmatter(content)
           const agentName = frontmatter.name || entry.replace(/\.md$/, '')
           if (seen.has(agentName)) continue
@@ -215,42 +232,6 @@ function scanLocalAgents(): DiskAgent[] {
     }
   }
 
-  // --- Nanobot workspace agents (from ~/.nanobot/workspace/agents/) ---
-  try {
-    const nanobotAgents = discoverAgents()
-    for (const na of nanobotAgents) {
-      if (seen.has(na.name)) continue
-      seen.add(na.name)
-
-      // Read IDENTITY.md as soul content if available
-      let soulContent: string | null = null
-      const identityPath = join(na.workspacePath, 'IDENTITY.md')
-      if (existsSync(identityPath)) {
-        try { soulContent = readFileSync(identityPath, 'utf8') } catch { /* ignore */ }
-      }
-
-      const configObj: Record<string, unknown> = {
-        model: na.model,
-        gatewayPort: na.gatewayPort,
-        gatewayHost: na.gatewayHost,
-      }
-      if (na.icon) configObj.icon = na.icon
-      const configJson = JSON.stringify(configObj)
-
-      const hashInput = (soulContent || '') + configJson
-      agents.push({
-        name: na.name,
-        dir: na.workspacePath,
-        role: extractRole(soulContent || ''),
-        soulContent,
-        configContent: configJson,
-        contentHash: sha256(hashInput),
-      })
-    }
-  } catch {
-    // Non-fatal — nanobot workspace may not exist
-  }
-
   return agents
 }
 
@@ -258,7 +239,12 @@ function scanLocalAgents(): DiskAgent[] {
 // Sync engine
 // ---------------------------------------------------------------------------
 
-export async function syncLocalAgents(): Promise<{ ok: boolean; message: string }> {
+export async function syncLocalAgents(requestedWorkspaceId?: number): Promise<{ ok: boolean; message: string }> {
+  const workspaceId = resolveSharedRuntimeWorkspaceId(requestedWorkspaceId)
+  if (workspaceId === null) {
+    return { ok: false, message: 'Local agent sync requires one unambiguous shared workspace' }
+  }
+
   try {
     const db = getDatabase()
     const diskAgents = scanLocalAgents()
@@ -271,21 +257,12 @@ export async function syncLocalAgents(): Promise<{ ok: boolean; message: string 
 
     // Fetch DB agents with source='local'
     const dbRows = db.prepare(
-      `SELECT id, name, role, soul_content, status, source, content_hash, workspace_path, config FROM agents WHERE source = 'local'`
-    ).all() as AgentRow[]
+      `SELECT id, name, role, soul_content, status, source, content_hash, workspace_path, config FROM agents WHERE source = 'local' AND workspace_id = ?`
+    ).all(workspaceId) as AgentRow[]
 
     const dbMap = new Map<string, AgentRow>()
     for (const r of dbRows) {
       dbMap.set(r.name, r)
-    }
-
-    // Also index all agents by name (any source) to avoid UNIQUE constraint violations
-    const allDbRows = db.prepare(
-      `SELECT id, name, role, soul_content, status, source, content_hash, workspace_path, config FROM agents`
-    ).all() as AgentRow[]
-    const allDbByName = new Map<string, AgentRow>()
-    for (const r of allDbRows) {
-      allDbByName.set(r.name, r)
     }
 
     let created = 0
@@ -293,19 +270,15 @@ export async function syncLocalAgents(): Promise<{ ok: boolean; message: string 
     let removed = 0
 
     const insertStmt = db.prepare(`
-      INSERT INTO agents (name, role, soul_content, status, source, content_hash, workspace_path, config, created_at, updated_at)
-      VALUES (?, ?, ?, 'offline', 'local', ?, ?, ?, ?, ?)
+      INSERT INTO agents (name, role, soul_content, status, source, content_hash, workspace_path, config, created_at, updated_at, workspace_id)
+      VALUES (?, ?, ?, 'offline', 'local', ?, ?, ?, ?, ?, ?)
     `)
     const updateStmt = db.prepare(`
       UPDATE agents SET role = ?, soul_content = ?, content_hash = ?, workspace_path = ?, config = ?, updated_at = ?
-      WHERE id = ?
-    `)
-    const adoptStmt = db.prepare(`
-      UPDATE agents SET source = 'local', role = ?, soul_content = ?, content_hash = ?, workspace_path = ?, config = ?, updated_at = ?
-      WHERE id = ?
+      WHERE id = ? AND workspace_id = ?
     `)
     const markRemovedStmt = db.prepare(`
-      UPDATE agents SET status = 'offline', updated_at = ? WHERE id = ?
+      UPDATE agents SET status = 'offline', updated_at = ? WHERE id = ? AND workspace_id = ?
     `)
 
     db.transaction(() => {
@@ -315,18 +288,10 @@ export async function syncLocalAgents(): Promise<{ ok: boolean; message: string 
         const configJson = disk.configContent ? disk.configContent : null
 
         if (!existing) {
-          // Check if agent exists under a different source (e.g. 'manual')
-          const anyExisting = allDbByName.get(name)
-          if (anyExisting) {
-            // Adopt: switch source to 'local' so future syncs manage it
-            adoptStmt.run(disk.role, disk.soulContent, disk.contentHash, disk.dir, configJson, now, anyExisting.id)
-            updated++
-          } else {
-            insertStmt.run(name, disk.role, disk.soulContent, disk.contentHash, disk.dir, configJson, now, now)
-            created++
-          }
+          insertStmt.run(name, disk.role, disk.soulContent, disk.contentHash, disk.dir, configJson, now, now, workspaceId)
+          created++
         } else if (existing.content_hash !== disk.contentHash) {
-          updateStmt.run(disk.role, disk.soulContent, disk.contentHash, disk.dir, configJson, now, existing.id)
+          updateStmt.run(disk.role, disk.soulContent, disk.contentHash, disk.dir, configJson, now, existing.id, workspaceId)
           updated++
         }
       }
@@ -334,7 +299,7 @@ export async function syncLocalAgents(): Promise<{ ok: boolean; message: string 
       // Agents that vanished from disk — mark offline but don't delete
       for (const [name, row] of dbMap) {
         if (!diskMap.has(name) && row.status !== 'offline') {
-          markRemovedStmt.run(now, row.id)
+          markRemovedStmt.run(now, row.id, workspaceId)
           removed++
         }
       }
@@ -347,6 +312,7 @@ export async function syncLocalAgents(): Promise<{ ok: boolean; message: string 
         action: 'local_agent_sync',
         actor: 'scheduler',
         detail: { created, updated, removed, total: diskAgents.length },
+        workspace_id: workspaceId,
       })
     }
     return { ok: true, message: msg }
@@ -364,10 +330,27 @@ export function writeLocalAgentSoul(agentDir: string, soulContent: string): void
   // Prefer soul.md, fall back to AGENT.md
   const soulPath = join(agentDir, 'soul.md')
   const agentMdPath = join(agentDir, 'AGENT.md')
-  const targetPath = existsSync(soulPath) ? soulPath : existsSync(agentMdPath) ? agentMdPath : soulPath
 
   mkdirSync(agentDir, { recursive: true })
-  writeFileSync(targetPath, soulContent, 'utf8')
+  const writeFlags = constants.O_WRONLY | constants.O_TRUNC | (constants.O_NOFOLLOW || 0)
+  const createFlags = writeFlags | constants.O_CREAT | constants.O_EXCL
+  let descriptor: number
+  try {
+    descriptor = openSync(soulPath, writeFlags)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    try {
+      descriptor = openSync(agentMdPath, writeFlags)
+    } catch (fallbackError) {
+      if ((fallbackError as NodeJS.ErrnoException).code !== 'ENOENT') throw fallbackError
+      descriptor = openSync(soulPath, createFlags, 0o600)
+    }
+  }
+  try {
+    writeFileSync(descriptor, soulContent, 'utf8')
+  } finally {
+    closeSync(descriptor)
+  }
 
   // Update the DB hash so the next sync doesn't re-overwrite
   try {

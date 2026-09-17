@@ -1,10 +1,12 @@
 'use client'
 
+import { useTranslations } from 'next-intl'
 import { useState, useEffect, useCallback, useMemo } from 'react'
 import { Button } from '@/components/ui/button'
 import { Loader } from '@/components/ui/loader'
 import { useMissionControl, CronJob } from '@/store'
 import { createClientLogger } from '@/lib/client-logger'
+import { apiFetch, ApiError } from '@/lib/api-client'
 const log = createClientLogger('CronManagement')
 import { buildDayKey, getCronOccurrences } from '@/lib/cron-occurrences'
 import { describeCronFrequency } from '@/lib/cron-utils'
@@ -29,6 +31,25 @@ const AGENT_COLORS = [
 function getAgentColorClass(agentId: string, allAgents: string[]): string {
   const idx = allAgents.indexOf(agentId)
   return AGENT_COLORS[idx >= 0 ? idx % AGENT_COLORS.length : 0]
+}
+
+/**
+ * Extract the human-readable error message from a thrown ApiError.
+ * The API returns `{ error: string }` bodies on failure; apiFetch attaches
+ * that parsed body to `err.payload` for 403/5xx. Falls back to the error
+ * message (e.g. for 404/401 where no payload is attached).
+ */
+function extractApiErrorMessage(error: ApiError): string {
+  const payload = error.payload
+  if (
+    typeof payload === 'object' &&
+    payload !== null &&
+    'error' in payload &&
+    typeof (payload as { error: unknown }).error === 'string'
+  ) {
+    return (payload as { error: string }).error
+  }
+  return error.message
 }
 
 interface NewJobForm {
@@ -99,6 +120,7 @@ function formatDateLabel(date: Date): string {
 }
 
 export function CronManagementPanel() {
+  const t = useTranslations('cronManagement')
   const { cronJobs, setCronJobs, dashboardMode } = useMissionControl()
   const isLocalMode = dashboardMode === 'local'
   const [isLoading, setIsLoading] = useState(false)
@@ -151,8 +173,7 @@ export function CronManagementPanel() {
   const loadCronJobs = useCallback(async () => {
     setIsLoading(true)
     try {
-      const cronResponse = await fetch('/api/cron?action=list')
-      const cronData = await cronResponse.json()
+      const cronData = await apiFetch<{ jobs?: unknown }>('/api/cron?action=list')
       const cronList = Array.isArray(cronData.jobs) ? cronData.jobs : []
 
       if (!isLocalMode) {
@@ -160,8 +181,7 @@ export function CronManagementPanel() {
         return
       }
 
-      const schedulerResponse = await fetch('/api/scheduler')
-      const schedulerData = await schedulerResponse.json()
+      const schedulerData = await apiFetch<{ tasks?: unknown }>('/api/scheduler')
       const schedulerTasks = Array.isArray(schedulerData.tasks) ? schedulerData.tasks : []
       const mappedSchedulerJobs: CronJob[] = schedulerTasks.map((task: any) => ({
         id: task.id,
@@ -193,9 +213,7 @@ export function CronManagementPanel() {
   useEffect(() => {
     const loadAvailableModels = async () => {
       try {
-        const response = await fetch('/api/status?action=models')
-        if (!response.ok) return
-        const data = await response.json()
+        const data = await apiFetch<{ models?: unknown }>('/api/status?action=models')
         const models = Array.isArray(data.models) ? data.models : []
         const names = models
           .map((model: any) => String(model.name || model.alias || '').trim())
@@ -243,16 +261,14 @@ export function CronManagementPanel() {
 
   const cloneJob = async (job: CronJob) => {
     try {
-      const response = await fetch('/api/cron', {
+      const result = await apiFetch<{ success?: boolean; error?: string }>('/api/cron', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'clone',
           jobId: job.id,
           jobName: job.name,
         })
       })
-      const result = await response.json()
       if (result.success) {
         await loadCronJobs()
       } else {
@@ -260,7 +276,16 @@ export function CronManagementPanel() {
       }
     } catch (error) {
       log.error('Failed to clone job:', error)
-      alert('Network error occurred')
+      if (error instanceof ApiError) {
+        const payloadError = extractApiErrorMessage(error)
+        if (error.code === 'NETWORK_ERROR') {
+          alert('Network error occurred')
+        } else {
+          alert(`Failed to clone job: ${payloadError}`)
+        }
+      } else {
+        alert('Network error occurred')
+      }
     }
   }
 
@@ -272,8 +297,11 @@ export function CronManagementPanel() {
         page: String(page),
         ...(query ? { query } : {}),
       })
-      const response = await fetch(`/api/cron?${params}`)
-      const data = await response.json()
+      const data = await apiFetch<{
+        entries?: RunHistoryEntry[]
+        total?: number
+        hasMore?: boolean
+      }>(`/api/cron?${params}`)
       if (page === 1) {
         setRunHistory(data.entries || [])
       } else {
@@ -332,8 +360,7 @@ export function CronManagementPanel() {
     }
 
     try {
-      const response = await fetch(`/api/cron?action=logs&job=${encodeURIComponent(job.name)}`)
-      const data = await response.json()
+      const data = await apiFetch<{ logs?: any[] }>(`/api/cron?action=logs&job=${encodeURIComponent(job.name)}`)
       setJobLogs(data.logs || [])
     } catch (error) {
       log.error('Failed to load job logs:', error)
@@ -343,25 +370,22 @@ export function CronManagementPanel() {
 
   const toggleJob = async (job: CronJob) => {
     try {
-      const response = await fetch('/api/cron', {
+      await apiFetch('/api/cron', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'toggle',
           jobName: job.name,
           enabled: !job.enabled
         })
       })
-
-      if (response.ok) {
-        await loadCronJobs() // Reload to get updated status
-      } else {
-        const error = await response.json()
-        alert(`Failed to toggle job: ${error.error}`)
-      }
+      await loadCronJobs() // Reload to get updated status
     } catch (error) {
       log.error('Failed to toggle job:', error)
-      alert('Network error occurred')
+      if (error instanceof ApiError && error.code !== 'NETWORK_ERROR') {
+        alert(`Failed to toggle job: ${extractApiErrorMessage(error)}`)
+      } else {
+        alert('Network error occurred')
+      }
     }
   }
 
@@ -370,24 +394,33 @@ export function CronManagementPanel() {
     setRunDropdownJobId(null)
     try {
       if (isLocalAutomation) {
-        const response = await fetch('/api/scheduler', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ task_id: job.id }),
-        })
-        const result = await response.json()
-        if (response.ok && result.ok) {
-          alert(`Local automation executed: ${result.message}`)
-        } else {
-          alert(`Local automation failed: ${result.error || result.message || 'Unknown error'}`)
+        // Original branched on (response.ok && result.ok) and reloaded jobs in
+        // both the success and failure paths. apiFetch throws on non-2xx, so
+        // surface the failure message from the thrown payload and still reload.
+        try {
+          const result = await apiFetch<{ ok?: boolean; message?: string; error?: string }>('/api/scheduler', {
+            method: 'POST',
+            body: JSON.stringify({ task_id: job.id }),
+          })
+          if (result.ok) {
+            alert(`Local automation executed: ${result.message}`)
+          } else {
+            alert(`Local automation failed: ${result.error || result.message || 'Unknown error'}`)
+          }
+        } catch (localError) {
+          if (localError instanceof ApiError && localError.code !== 'NETWORK_ERROR') {
+            const payload = localError.payload as { error?: string; message?: string } | null
+            alert(`Local automation failed: ${payload?.error || payload?.message || localError.message || 'Unknown error'}`)
+          } else {
+            throw localError
+          }
         }
         await loadCronJobs()
         return
       }
 
-      const response = await fetch('/api/cron', {
+      const result = await apiFetch<{ success?: boolean; stdout?: string; error?: string; stderr?: string }>('/api/cron', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'trigger',
           jobId: job.id,
@@ -396,8 +429,6 @@ export function CronManagementPanel() {
         })
       })
 
-      const result = await response.json()
-
       if (result.success) {
         alert(`Job executed successfully:\n${result.stdout}`)
       } else {
@@ -405,7 +436,15 @@ export function CronManagementPanel() {
       }
     } catch (error) {
       log.error('Failed to trigger job:', error)
-      alert('Network error occurred')
+      // The cron-trigger endpoint signals logical failures with HTTP errors as
+      // well as { success: false } bodies; surface the server message instead
+      // of swallowing it as a generic network error.
+      if (error instanceof ApiError && error.code !== 'NETWORK_ERROR') {
+        const payload = error.payload as { error?: string; stderr?: string } | null
+        alert(`Job failed:\n${payload?.error || error.message}\n${payload?.stderr || ''}`)
+      } else {
+        alert('Network error occurred')
+      }
     }
   }
 
@@ -416,9 +455,8 @@ export function CronManagementPanel() {
 
     try {
       const staggerVal = newJob.staggerSeconds.trim() ? Number(newJob.staggerSeconds) : undefined
-      const response = await fetch('/api/cron', {
+      await apiFetch('/api/cron', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'add',
           jobName: newJob.name,
@@ -429,25 +467,24 @@ export function CronManagementPanel() {
         })
       })
 
-      if (response.ok) {
-        setNewJob({
-          name: '',
-          schedule: '0 * * * *',
-          command: '',
-          description: '',
-          model: '',
-          staggerSeconds: '',
-        })
-        setFormErrors({})
-        setShowAddForm(false)
-        await loadCronJobs()
-      } else {
-        const error = await response.json()
-        alert(`Failed to add job: ${error.error}`)
-      }
+      setNewJob({
+        name: '',
+        schedule: '0 * * * *',
+        command: '',
+        description: '',
+        model: '',
+        staggerSeconds: '',
+      })
+      setFormErrors({})
+      setShowAddForm(false)
+      await loadCronJobs()
     } catch (error) {
       log.error('Failed to add job:', error)
-      alert('Network error occurred')
+      if (error instanceof ApiError && error.code !== 'NETWORK_ERROR') {
+        alert(`Failed to add job: ${extractApiErrorMessage(error)}`)
+      } else {
+        alert('Network error occurred')
+      }
     }
   }
 
@@ -457,27 +494,25 @@ export function CronManagementPanel() {
     }
 
     try {
-      const response = await fetch('/api/cron', {
+      await apiFetch('/api/cron', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'remove',
           jobName: job.name
         })
       })
 
-      if (response.ok) {
-        await loadCronJobs()
-        if (selectedJob?.name === job.name) {
-          setSelectedJob(null)
-        }
-      } else {
-        const error = await response.json()
-        alert(`Failed to remove job: ${error.error}`)
+      await loadCronJobs()
+      if (selectedJob?.name === job.name) {
+        setSelectedJob(null)
       }
     } catch (error) {
       log.error('Failed to remove job:', error)
-      alert('Network error occurred')
+      if (error instanceof ApiError && error.code !== 'NETWORK_ERROR') {
+        alert(`Failed to remove job: ${extractApiErrorMessage(error)}`)
+      } else {
+        alert('Network error occurred')
+      }
     }
   }
 
@@ -524,6 +559,7 @@ export function CronManagementPanel() {
   )
 
   const filteredJobs = cronJobs
+    .filter((job) => typeof job.schedule === 'string' && job.schedule.length > 0)
     .filter((job) => {
       const query = searchQuery.trim().toLowerCase()
       const matchesQuery =
@@ -561,7 +597,7 @@ export function CronManagementPanel() {
         case 'name':
           return dir * a.name.localeCompare(b.name)
         case 'schedule':
-          return dir * a.schedule.localeCompare(b.schedule)
+          return dir * (a.schedule || '').localeCompare(b.schedule || '')
         case 'lastRun':
           return dir * ((a.lastRun || 0) - (b.lastRun || 0))
         case 'nextRun':
@@ -679,27 +715,27 @@ export function CronManagementPanel() {
         : calendarDate.toLocaleDateString(undefined, { month: 'long', year: 'numeric' })
 
   return (
-    <div className="p-3 sm:p-6 space-y-4 sm:space-y-6">
+    <div className="p-6 space-y-6">
       <div className="border-b border-border pb-4">
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+        <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-2xl sm:text-3xl font-bold text-foreground">Cron Management</h1>
-            <p className="text-sm sm:text-base text-muted-foreground mt-1 sm:mt-2">
-              Manage automated tasks and scheduled jobs
+            <h1 className="text-3xl font-bold text-foreground">{t('title')}</h1>
+            <p className="text-muted-foreground mt-2">
+              {t('subtitle')}
             </p>
           </div>
-          <div className="flex gap-2">
+          <div className="flex space-x-2">
             <Button
               onClick={loadCronJobs}
               disabled={isLoading}
               className="bg-blue-500/20 text-blue-400 border border-blue-500/30 hover:bg-blue-500/30"
             >
-              {isLoading ? 'Loading...' : 'Refresh'}
+              {isLoading ? t('loading') : t('refresh')}
             </Button>
             <Button
               onClick={() => setShowAddForm(true)}
             >
-              Add Job
+              {t('addJob')}
             </Button>
           </div>
         </div>
@@ -711,11 +747,11 @@ export function CronManagementPanel() {
           <div className="flex flex-col gap-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
-                <h2 className="text-xl font-semibold">Calendar View</h2>
+                <h2 className="text-xl font-semibold">{t('calendarView')}</h2>
                 <p className="text-sm text-muted-foreground">
                   {isLocalMode
-                    ? 'Read-only schedule visibility across local cron jobs and automations'
-                    : 'Interactive schedule across all matching cron jobs'}
+                    ? t('calendarViewDescLocal')
+                    : t('calendarViewDesc')}
                 </p>
               </div>
               <div className="flex items-center gap-2">
@@ -724,21 +760,21 @@ export function CronManagementPanel() {
                   variant="outline"
                   size="sm"
                 >
-                  Prev
+                  {t('prev')}
                 </Button>
                 <Button
                   onClick={() => setCalendarDate(startOfDay(new Date()))}
                   variant="outline"
                   size="sm"
                 >
-                  Today
+                  {t('today')}
                 </Button>
                 <Button
                   onClick={() => moveCalendar(1)}
                   variant="outline"
                   size="sm"
                 >
-                  Next
+                  {t('next')}
                 </Button>
                 <div className="text-sm font-medium text-foreground ml-1">{calendarRangeLabel}</div>
               </div>
@@ -752,7 +788,7 @@ export function CronManagementPanel() {
                   variant={calendarView === mode ? 'default' : 'outline'}
                   size="sm"
                 >
-                  {mode === 'agenda' ? 'Agenda' : mode.charAt(0).toUpperCase() + mode.slice(1)}
+                  {t(`calMode_${mode}` as any)}
                 </Button>
               ))}
             </div>
@@ -761,7 +797,7 @@ export function CronManagementPanel() {
               <input
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search jobs, agents, models..."
+                placeholder={t('searchPlaceholder')}
                 className="px-3 py-2 border border-border rounded-md bg-background text-foreground text-sm"
               />
               <select
@@ -769,7 +805,7 @@ export function CronManagementPanel() {
                 onChange={(e) => setAgentFilter(e.target.value)}
                 className="px-3 py-2 border border-border rounded-md bg-background text-foreground text-sm"
               >
-                <option value="all">All Agents</option>
+                <option value="all">{t('allAgents')}</option>
                 {uniqueAgents.map((agentId) => (
                   <option key={agentId} value={agentId}>
                     {agentId}
@@ -781,9 +817,9 @@ export function CronManagementPanel() {
                 onChange={(e) => setStateFilter(e.target.value as 'all' | 'enabled' | 'disabled')}
                 className="px-3 py-2 border border-border rounded-md bg-background text-foreground text-sm"
               >
-                <option value="all">All States</option>
-                <option value="enabled">Enabled</option>
-                <option value="disabled">Disabled</option>
+                <option value="all">{t('allStates')}</option>
+                <option value="enabled">{t('enabled')}</option>
+                <option value="disabled">{t('disabled')}</option>
               </select>
             </div>
             <div className="grid md:grid-cols-3 gap-3">
@@ -796,7 +832,7 @@ export function CronManagementPanel() {
                     size="sm"
                     className="text-xs"
                   >
-                    {kind === 'all' ? 'All' : kind}
+                    {kind === 'all' ? t('all') : kind}
                   </Button>
                 ))}
               </div>
@@ -805,10 +841,10 @@ export function CronManagementPanel() {
                 onChange={(e) => setSortField(e.target.value as SortField)}
                 className="px-3 py-2 border border-border rounded-md bg-background text-foreground text-sm"
               >
-                <option value="name">Sort: Name</option>
-                <option value="schedule">Sort: Schedule</option>
-                <option value="lastRun">Sort: Last Run</option>
-                <option value="nextRun">Sort: Next Run</option>
+                <option value="name">{t('sortName')}</option>
+                <option value="schedule">{t('sortSchedule')}</option>
+                <option value="lastRun">{t('sortLastRun')}</option>
+                <option value="nextRun">{t('sortNextRun')}</option>
               </select>
               <Button
                 onClick={() => setSortDir(d => d === 'asc' ? 'desc' : 'asc')}
@@ -816,7 +852,7 @@ export function CronManagementPanel() {
                 size="sm"
                 className="text-xs"
               >
-                {sortDir === 'asc' ? 'Ascending' : 'Descending'}
+                {sortDir === 'asc' ? t('ascending') : t('descending')}
               </Button>
             </div>
 
@@ -824,7 +860,7 @@ export function CronManagementPanel() {
               <div className="border border-border rounded-lg overflow-hidden">
                 <div className="max-h-80 overflow-y-auto divide-y divide-border">
                   {calendarOccurrences.length === 0 ? (
-                    <div className="p-4 text-sm text-muted-foreground">No jobs match the current filters.</div>
+                    <div className="p-4 text-sm text-muted-foreground">{t('noJobsMatchFilters')}</div>
                   ) : (
                     calendarOccurrences.map((row) => (
                       <Button
@@ -836,7 +872,7 @@ export function CronManagementPanel() {
                         <div>
                           <div className="font-medium text-foreground">{row.job.name}</div>
                           <div className="text-xs text-muted-foreground">
-                            {row.job.agentId || 'system'} · {row.job.enabled ? 'enabled' : 'disabled'} · {row.job.schedule}
+                            {row.job.agentId || 'system'} · {row.job.enabled ? t('enabled') : t('disabled')} · {row.job.schedule}
                           </div>
                         </div>
                         <div className="text-sm text-muted-foreground">
@@ -852,10 +888,10 @@ export function CronManagementPanel() {
             {calendarView === 'day' && (
               <div className="border border-border rounded-lg p-3">
                 <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs text-muted-foreground">{dayJobSummaries.length} unique jobs</span>
+                  <span className="text-xs text-muted-foreground">{t('uniqueJobs', { count: dayJobSummaries.length })}</span>
                 </div>
                 {dayJobSummaries.length === 0 ? (
-                  <div className="text-sm text-muted-foreground">No scheduled jobs for this day.</div>
+                  <div className="text-sm text-muted-foreground">{t('noJobsForDay')}</div>
                 ) : (
                   <div className="space-y-1.5 max-h-96 overflow-y-auto">
                     {dayJobSummaries.map((row) => (
@@ -872,7 +908,7 @@ export function CronManagementPanel() {
                           </div>
                         </div>
                         <div className="text-xs text-muted-foreground whitespace-nowrap">
-                          {row.runCount > 1 ? `${row.runCount} runs` : new Date(row.firstRunMs).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}
+                          {row.runCount > 1 ? t('runsCount', { count: row.runCount }) : new Date(row.firstRunMs).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}
                         </div>
                       </Button>
                     ))}
@@ -896,7 +932,7 @@ export function CronManagementPanel() {
                           {date.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric' })}
                         </span>
                         {jobs.length > 0 && (
-                          <span className="text-[10px] text-muted-foreground">{jobs.length} jobs</span>
+                          <span className="text-[10px] text-muted-foreground">{t('jobCount', { count: jobs.length })}</span>
                         )}
                       </div>
                       <div className="space-y-1 flex-1 overflow-hidden">
@@ -904,18 +940,18 @@ export function CronManagementPanel() {
                           <div
                             key={`week-job-${row.job.id || row.job.name}`}
                             className={`text-[11px] px-1.5 py-0.5 rounded border truncate ${getAgentColorClass(row.job.agentId || '', uniqueAgents)}`}
-                            title={`${row.job.name} — ${row.runCount} run${row.runCount > 1 ? 's' : ''}`}
+                            title={`${row.job.name} — ${t('runsCount', { count: row.runCount })}`}
                           >
                             {row.job.name}
                           </div>
                         ))}
                         {jobs.length > 5 && (
-                          <div className="text-[10px] text-muted-foreground">+{jobs.length - 5} more</div>
+                          <div className="text-[10px] text-muted-foreground">{t('moreJobs', { count: jobs.length - 5 })}</div>
                         )}
                       </div>
                       {totalRuns > 0 && (
                         <div className="text-[10px] text-muted-foreground mt-1 pt-1 border-t border-border/50">
-                          {totalRuns.toLocaleString()} total runs
+                          {t('totalRunsCount', { count: totalRuns })}
                         </div>
                       )}
                     </div>
@@ -948,15 +984,15 @@ export function CronManagementPanel() {
                           <div
                             key={`month-job-${row.job.id || row.job.name}`}
                             className={`text-[10px] px-1 py-0.5 rounded border truncate ${getAgentColorClass(row.job.agentId || '', uniqueAgents)}`}
-                            title={`${row.job.name} — ${row.runCount} runs`}
+                            title={`${row.job.name} — ${t('runsCount', { count: row.runCount })}`}
                           >
                             {row.job.name}
                           </div>
                         ))}
-                        {jobs.length > 3 && <div className="text-[10px] text-muted-foreground">+{jobs.length - 3}</div>}
+                        {jobs.length > 3 && <div className="text-[10px] text-muted-foreground">{t('moreJobs', { count: jobs.length - 3 })}</div>}
                       </div>
                       {totalRuns > 0 && jobs.length > 0 && (
-                        <div className="text-[9px] text-muted-foreground mt-0.5">{totalRuns.toLocaleString()} runs</div>
+                        <div className="text-[9px] text-muted-foreground mt-0.5">{t('runsCount', { count: totalRuns })}</div>
                       )}
                     </div>
                   )
@@ -971,14 +1007,14 @@ export function CronManagementPanel() {
                     {selectedCalendarDate.toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric', year: 'numeric' })}
                   </h3>
                   <div className="flex items-center gap-2">
-                    <span className="text-xs text-muted-foreground">{selectedDayJobs.length} jobs</span>
+                    <span className="text-xs text-muted-foreground">{t('jobCount', { count: selectedDayJobs.length })}</span>
                     {selectedDayJobs.length > 0 && (
-                      <span className="text-xs text-muted-foreground">· {selectedDayJobs.reduce((s, r) => s + r.runCount, 0).toLocaleString()} total runs</span>
+                      <span className="text-xs text-muted-foreground">· {t('totalRunsCount', { count: selectedDayJobs.reduce((s, r) => s + r.runCount, 0) })}</span>
                     )}
                   </div>
                 </div>
                 {selectedDayJobs.length === 0 ? (
-                  <div className="text-sm text-muted-foreground">No jobs scheduled on this date.</div>
+                  <div className="text-sm text-muted-foreground">{t('noJobsForDay')}</div>
                 ) : (
                   <div className="space-y-1.5 max-h-72 overflow-y-auto">
                     {selectedDayJobs.map((row) => (
@@ -995,9 +1031,9 @@ export function CronManagementPanel() {
                           </div>
                         </div>
                         <div className="text-right whitespace-nowrap">
-                          <div className="text-xs text-foreground">{row.runCount} run{row.runCount > 1 ? 's' : ''}</div>
+                          <div className="text-xs text-foreground">{t('runsCount', { count: row.runCount })}</div>
                           <div className="text-[10px] text-muted-foreground">
-                            first {new Date(row.firstRunMs).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })}
+                            {t('firstRun', { time: new Date(row.firstRunMs).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) })}
                           </div>
                         </div>
                       </Button>
@@ -1012,29 +1048,29 @@ export function CronManagementPanel() {
         {/* Job List — compact table */}
         <div className="lg:col-span-2 bg-card border border-border rounded-lg p-6">
           <div className="flex items-center justify-between mb-4">
-            <h2 className="text-xl font-semibold">Scheduled Jobs</h2>
-            <span className="text-xs text-muted-foreground">{filteredJobs.length} of {cronJobs.length} jobs</span>
+            <h2 className="text-xl font-semibold">{t('scheduledJobs')}</h2>
+            <span className="text-xs text-muted-foreground">{t('jobsCount', { count: filteredJobs.length, total: cronJobs.length })}</span>
           </div>
 
           {isLoading ? (
             <div className="flex items-center justify-center h-32">
-              <Loader variant="inline" label="Loading jobs" />
+              <Loader variant="inline" label={t('loadingJobs')} />
             </div>
           ) : cronJobs.length === 0 ? (
-            <div className="text-center text-muted-foreground py-8">No cron jobs found</div>
+            <div className="text-center text-muted-foreground py-8">{t('noCronJobsFound')}</div>
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="border-b border-border text-left text-xs text-muted-foreground">
-                    <th className="pb-2 pr-3 font-medium">Job Name</th>
-                    <th className="pb-2 pr-3 font-medium">Agent</th>
-                    <th className="pb-2 pr-3 font-medium">Schedule</th>
-                    <th className="pb-2 pr-3 font-medium">Model</th>
-                    <th className="pb-2 pr-3 font-medium">Status</th>
-                    <th className="pb-2 pr-3 font-medium">Last Run</th>
-                    <th className="pb-2 pr-3 font-medium">Next Run</th>
-                    <th className="pb-2 font-medium text-right">Actions</th>
+                    <th className="pb-2 pr-3 font-medium">{t('colJobName')}</th>
+                    <th className="pb-2 pr-3 font-medium">{t('colAgent')}</th>
+                    <th className="pb-2 pr-3 font-medium">{t('colSchedule')}</th>
+                    <th className="pb-2 pr-3 font-medium">{t('colModel')}</th>
+                    <th className="pb-2 pr-3 font-medium">{t('colStatus')}</th>
+                    <th className="pb-2 pr-3 font-medium">{t('colLastRun')}</th>
+                    <th className="pb-2 pr-3 font-medium">{t('colNextRun')}</th>
+                    <th className="pb-2 font-medium text-right">{t('colActions')}</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-border/50">
@@ -1049,7 +1085,7 @@ export function CronManagementPanel() {
                       >
                         <td className="py-2.5 pr-3">
                           <div className="flex items-center gap-2">
-                            <div className={`w-2 h-2 rounded-full flex-shrink-0 ${job.enabled ? 'bg-green-500' : 'bg-gray-500'}`} />
+                            <div className={`w-2 h-2 rounded-full shrink-0 ${job.enabled ? 'bg-green-500' : 'bg-gray-500'}`} />
                             <span className="font-medium text-foreground truncate max-w-48">{job.name}</span>
                           </div>
                         </td>
@@ -1095,7 +1131,7 @@ export function CronManagementPanel() {
                               variant="outline"
                               className="text-[10px] h-6 px-1.5"
                             >
-                              {job.enabled ? 'Disable' : 'Enable'}
+                              {job.enabled ? t('disable') : t('enable')}
                             </Button>
                             <div className="relative">
                               <div className="flex">
@@ -1105,7 +1141,7 @@ export function CronManagementPanel() {
                                   variant="outline"
                                   className="text-[10px] h-6 px-1.5 rounded-r-none border-r-0"
                                 >
-                                  Run
+                                  {t('run')}
                                 </Button>
                                 <Button
                                   onClick={(e) => { e.stopPropagation(); setRunDropdownJobId(prev => prev === (job.id || job.name) ? null : (job.id || job.name)) }}
@@ -1122,13 +1158,13 @@ export function CronManagementPanel() {
                                     onClick={(e) => { e.stopPropagation(); triggerJob(job, 'force') }}
                                     className="w-full text-left px-3 py-1.5 text-xs text-foreground hover:bg-secondary/50"
                                   >
-                                    Run now (force)
+                                    {t('runNowForce')}
                                   </button>
                                   <button
                                     onClick={(e) => { e.stopPropagation(); triggerJob(job, 'due') }}
                                     className="w-full text-left px-3 py-1.5 text-xs text-foreground hover:bg-secondary/50"
                                   >
-                                    Run now (if due)
+                                    {t('runNowIfDue')}
                                   </button>
                                 </div>
                               )}
@@ -1140,7 +1176,7 @@ export function CronManagementPanel() {
                               variant="outline"
                               className="text-[10px] h-6 px-1.5"
                             >
-                              Clone
+                              {t('clone')}
                             </Button>
                             <Button
                               onClick={(e) => { e.stopPropagation(); handleJobSelect(job); openRunHistory(job) }}
@@ -1148,7 +1184,7 @@ export function CronManagementPanel() {
                               variant="outline"
                               className="text-[10px] h-6 px-1.5"
                             >
-                              History
+                              {t('history')}
                             </Button>
                           </div>
                         </td>
@@ -1168,14 +1204,14 @@ export function CronManagementPanel() {
               <h2 className="text-xl font-semibold text-foreground">{selectedJob.name}</h2>
               <div className="flex items-center gap-2">
                 <span className={`px-2 py-1 text-xs rounded-full ${selectedJob.enabled ? 'bg-green-500/20 text-green-400 border border-green-500/30' : 'bg-gray-500/20 text-gray-400 border border-gray-500/30'}`}>
-                  {selectedJob.enabled ? 'Enabled' : 'Disabled'}
+                  {selectedJob.enabled ? t('enabled') : t('disabled')}
                 </span>
                 {selectedJob.lastStatus && (
                   <span className={`px-2 py-1 text-xs rounded-full ${getStatusBg(selectedJob.lastStatus)} ${getStatusColor(selectedJob.lastStatus)}`}>
                     {selectedJob.lastStatus}
                   </span>
                 )}
-                <Button onClick={() => setSelectedJob(null)} variant="ghost" size="sm" className="text-xs">Close</Button>
+                <Button onClick={() => setSelectedJob(null)} variant="ghost" size="sm" className="text-xs">{t('close')}</Button>
               </div>
             </div>
 
@@ -1183,63 +1219,63 @@ export function CronManagementPanel() {
               {/* Left: Configuration */}
               <div className="space-y-4">
                 <div>
-                  <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">Configuration</h3>
+                  <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">{t('configuration')}</h3>
                   <div className="bg-secondary/50 rounded-lg p-4 space-y-3">
                     <div className="grid grid-cols-[100px_1fr] gap-1 text-sm">
-                      <span className="text-muted-foreground">Schedule</span>
+                      <span className="text-muted-foreground">{t('colSchedule')}</span>
                       <div>
                         <code className="font-mono text-foreground">{selectedJob.schedule}</code>
                         <div className="text-xs text-muted-foreground">{describeCronFrequency(selectedJob.schedule)}</div>
                       </div>
                     </div>
                     <div className="grid grid-cols-[100px_1fr] gap-1 text-sm">
-                      <span className="text-muted-foreground">Agent</span>
+                      <span className="text-muted-foreground">{t('colAgent')}</span>
                       <span className={`text-xs px-1.5 py-0.5 rounded border w-fit ${getAgentColorClass(selectedJob.agentId || '', uniqueAgents)}`}>
                         {selectedJob.agentId || 'system'}
                       </span>
                     </div>
                     {selectedJob.model && (
                       <div className="grid grid-cols-[100px_1fr] gap-1 text-sm">
-                        <span className="text-muted-foreground">Model</span>
+                        <span className="text-muted-foreground">{t('colModel')}</span>
                         <code className="font-mono text-xs text-foreground">{selectedJob.model}</code>
                       </div>
                     )}
                     <div className="grid grid-cols-[100px_1fr] gap-1 text-sm">
-                      <span className="text-muted-foreground">Delivery</span>
+                      <span className="text-muted-foreground">{t('delivery')}</span>
                       <span className="text-foreground text-xs">{selectedJob.delivery || 'gateway'}</span>
                     </div>
                     {selectedJob.delivery === 'local' && selectedJob.agentId === 'mission-control-local' && (
                       <div className="grid grid-cols-[100px_1fr] gap-1 text-sm">
-                        <span className="text-muted-foreground">Source</span>
-                        <span className="text-foreground text-xs">Local scheduler automation</span>
+                        <span className="text-muted-foreground">{t('source')}</span>
+                        <span className="text-foreground text-xs">{t('localSchedulerAutomation')}</span>
                       </div>
                     )}
                   </div>
                 </div>
 
                 <div>
-                  <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">Command</h3>
+                  <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">{t('command')}</h3>
                   <pre className="bg-secondary/50 rounded-lg p-4 text-xs font-mono text-foreground whitespace-pre-wrap break-all overflow-x-auto max-h-32">{selectedJob.command}</pre>
                 </div>
 
                 <div>
-                  <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">Timing</h3>
+                  <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">{t('timing')}</h3>
                   <div className="bg-secondary/50 rounded-lg p-4 space-y-2">
                     {selectedJob.lastRun && (
                       <div className="flex justify-between text-sm">
-                        <span className="text-muted-foreground">Last run</span>
+                        <span className="text-muted-foreground">{t('lastRun')}</span>
                         <span className="text-foreground">{new Date(selectedJob.lastRun).toLocaleString()} ({formatRelativeTime(selectedJob.lastRun)})</span>
                       </div>
                     )}
                     {selectedJob.nextRun && (
                       <div className="flex justify-between text-sm">
-                        <span className="text-muted-foreground">Next run</span>
+                        <span className="text-muted-foreground">{t('nextRun')}</span>
                         <span className="text-primary">{new Date(selectedJob.nextRun).toLocaleString()} ({formatRelativeTime(selectedJob.nextRun, true)})</span>
                       </div>
                     )}
                     {selectedJob.timezone && (
                       <div className="flex justify-between text-sm">
-                        <span className="text-muted-foreground">Timezone</span>
+                        <span className="text-muted-foreground">{t('timezone')}</span>
                         <span className="text-foreground">{selectedJob.timezone}</span>
                       </div>
                     )}
@@ -1252,14 +1288,14 @@ export function CronManagementPanel() {
                     size="sm"
                     className="bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 border-blue-500/30"
                   >
-                    Run Now (force)
+                    {t('runNowForce')}
                   </Button>
                   <Button
                     onClick={() => triggerJob(selectedJob, 'due')}
                     size="sm"
                     className="bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 border-blue-500/30"
                   >
-                    Run (if due)
+                    {t('runNowIfDue')}
                   </Button>
                   <Button
                     onClick={() => toggleJob(selectedJob)}
@@ -1269,7 +1305,7 @@ export function CronManagementPanel() {
                       ? 'bg-yellow-500/20 text-yellow-400 hover:bg-yellow-500/30 border-yellow-500/30'
                       : 'bg-green-500/20 text-green-400 hover:bg-green-500/30 border-green-500/30'}
                   >
-                    {selectedJob.enabled ? 'Disable' : 'Enable'}
+                    {selectedJob.enabled ? t('disable') : t('enable')}
                   </Button>
                   <Button
                     onClick={() => cloneJob(selectedJob)}
@@ -1277,14 +1313,14 @@ export function CronManagementPanel() {
                     size="sm"
                     variant="outline"
                   >
-                    Clone
+                    {t('clone')}
                   </Button>
                   <Button
                     onClick={() => openRunHistory(selectedJob)}
                     size="sm"
                     variant="outline"
                   >
-                    History
+                    {t('history')}
                   </Button>
                   <Button
                     onClick={() => removeJob(selectedJob)}
@@ -1292,17 +1328,17 @@ export function CronManagementPanel() {
                     variant="destructive"
                     size="sm"
                   >
-                    Remove
+                    {t('remove')}
                   </Button>
                 </div>
               </div>
 
               {/* Right: Logs */}
               <div>
-                <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">Recent Logs</h3>
+                <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wider mb-2">{t('recentLogs')}</h3>
                 <div className="bg-secondary/50 rounded-lg p-4 max-h-80 overflow-y-auto">
                   {jobLogs.length === 0 ? (
-                    <div className="text-muted-foreground text-sm">No logs available</div>
+                    <div className="text-muted-foreground text-sm">{t('noLogsAvailable')}</div>
                   ) : (
                     <div className="space-y-1.5 text-xs font-mono">
                       {jobLogs.map((logEntry, index) => (
@@ -1324,10 +1360,10 @@ export function CronManagementPanel() {
       {showRunHistory && selectedJob && (
         <div className="bg-card border border-border rounded-lg p-6">
           <div className="flex items-center justify-between mb-4">
-            <h2 className="text-xl font-semibold text-foreground">Run History: {selectedJob.name}</h2>
+            <h2 className="text-xl font-semibold text-foreground">{t('runHistoryTitle', { name: selectedJob.name })}</h2>
             <div className="flex items-center gap-2">
-              <span className="text-xs text-muted-foreground">{runHistoryTotal} total runs</span>
-              <Button onClick={() => setShowRunHistory(false)} variant="ghost" size="sm" className="text-xs">Close</Button>
+              <span className="text-xs text-muted-foreground">{t('totalRuns', { count: runHistoryTotal })}</span>
+              <Button onClick={() => setShowRunHistory(false)} variant="ghost" size="sm" className="text-xs">{t('close')}</Button>
             </div>
           </div>
           <div className="mb-3">
@@ -1337,7 +1373,7 @@ export function CronManagementPanel() {
                 setRunHistoryQuery(e.target.value)
                 loadRunHistory(selectedJob.id || selectedJob.name, 1, e.target.value)
               }}
-              placeholder="Filter runs by status, error..."
+              placeholder={t('filterRunsPlaceholder')}
               className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground text-sm"
             />
           </div>
@@ -1345,16 +1381,16 @@ export function CronManagementPanel() {
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-border text-left text-xs text-muted-foreground">
-                  <th className="pb-2 pr-3 font-medium">Status</th>
-                  <th className="pb-2 pr-3 font-medium">Delivery</th>
-                  <th className="pb-2 pr-3 font-medium">Timestamp</th>
-                  <th className="pb-2 pr-3 font-medium">Duration</th>
-                  <th className="pb-2 font-medium">Error</th>
+                  <th className="pb-2 pr-3 font-medium">{t('colStatus')}</th>
+                  <th className="pb-2 pr-3 font-medium">{t('delivery')}</th>
+                  <th className="pb-2 pr-3 font-medium">{t('timestamp')}</th>
+                  <th className="pb-2 pr-3 font-medium">{t('duration')}</th>
+                  <th className="pb-2 font-medium">{t('error')}</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-border/50">
                 {runHistory.length === 0 ? (
-                  <tr><td colSpan={5} className="py-4 text-center text-muted-foreground">No run history available</td></tr>
+                  <tr><td colSpan={5} className="py-4 text-center text-muted-foreground">{t('noRunHistoryAvailable')}</td></tr>
                 ) : (
                   runHistory.map((entry, idx) => {
                     const ts = entry.timestamp || entry.startedAtMs
@@ -1391,7 +1427,7 @@ export function CronManagementPanel() {
                 variant="outline"
                 size="sm"
               >
-                Load More
+                {t('loadMore')}
               </Button>
             </div>
           )}
@@ -1405,11 +1441,11 @@ export function CronManagementPanel() {
       {showAddForm && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
           <div className="bg-card border border-border rounded-lg p-6 w-full max-w-2xl m-4">
-            <h2 className="text-xl font-semibold mb-4">Add New Cron Job</h2>
+            <h2 className="text-xl font-semibold mb-4">{t('addNewCronJob')}</h2>
             
             <div className="space-y-4">
               <div>
-                <label className="block text-sm font-medium text-foreground mb-2">Job Name</label>
+                <label className="block text-sm font-medium text-foreground mb-2">{t('fieldJobName')}</label>
                 <input
                   type="text"
                   value={newJob.name}
@@ -1421,7 +1457,7 @@ export function CronManagementPanel() {
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-foreground mb-2">Schedule (Cron Format)</label>
+                <label className="block text-sm font-medium text-foreground mb-2">{t('fieldSchedule')}</label>
                 <div className="flex space-x-2">
                   <input
                     type="text"
@@ -1435,7 +1471,7 @@ export function CronManagementPanel() {
                     onChange={(e) => e.target.value && setNewJob(prev => ({ ...prev, schedule: e.target.value }))}
                     className="px-3 py-2 border border-border rounded-md bg-background text-foreground"
                   >
-                    <option value="">Quick select...</option>
+                    <option value="">{t('quickSelect')}</option>
                     {predefinedSchedules.map((sched) => (
                       <option key={sched.value} value={sched.value}>{sched.label}</option>
                     ))}
@@ -1445,13 +1481,13 @@ export function CronManagementPanel() {
                   <div className="mt-1 text-xs text-red-400">{formErrors.schedule}</div>
                 ) : (
                   <div className="mt-1 text-xs text-muted-foreground">
-                    Format: minute hour day month dayOfWeek
+                    {t('scheduleFormatHint')}
                   </div>
                 )}
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-foreground mb-2">Command</label>
+                <label className="block text-sm font-medium text-foreground mb-2">{t('fieldCommand')}</label>
                 <textarea
                   value={newJob.command}
                   onChange={(e) => setNewJob(prev => ({ ...prev, command: e.target.value }))}
@@ -1462,7 +1498,7 @@ export function CronManagementPanel() {
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-foreground mb-2">Model (Optional)</label>
+                <label className="block text-sm font-medium text-foreground mb-2">{t('fieldModelOptional')}</label>
                 <input
                   type="text"
                   value={newJob.model}
@@ -1480,13 +1516,13 @@ export function CronManagementPanel() {
                   <div className="mt-1 text-xs text-red-400">{formErrors.model}</div>
                 ) : (
                   <div className="mt-1 text-xs text-muted-foreground">
-                    Leave empty to use the agent or gateway default model.
+                    {t('modelHint')}
                   </div>
                 )}
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-foreground mb-2">Stagger Offset (Optional)</label>
+                <label className="block text-sm font-medium text-foreground mb-2">{t('fieldStaggerOptional')}</label>
                 <div className="flex items-center gap-2">
                   <input
                     type="text"
@@ -1495,24 +1531,24 @@ export function CronManagementPanel() {
                     placeholder="0"
                     className={`w-32 px-3 py-2 border rounded-md bg-background text-foreground font-mono text-sm ${formErrors.staggerSeconds ? 'border-red-500' : 'border-border'}`}
                   />
-                  <span className="text-sm text-muted-foreground">seconds</span>
+                  <span className="text-sm text-muted-foreground">{t('seconds')}</span>
                 </div>
                 {formErrors.staggerSeconds ? (
                   <div className="mt-1 text-xs text-red-400">{formErrors.staggerSeconds}</div>
                 ) : (
                   <div className="mt-1 text-xs text-muted-foreground">
-                    Delay execution to avoid overlapping with other jobs on the same schedule.
+                    {t('staggerHint')}
                   </div>
                 )}
               </div>
 
               <div>
-                <label className="block text-sm font-medium text-foreground mb-2">Description (Optional)</label>
+                <label className="block text-sm font-medium text-foreground mb-2">{t('fieldDescriptionOptional')}</label>
                 <input
                   type="text"
                   value={newJob.description}
                   onChange={(e) => setNewJob(prev => ({ ...prev, description: e.target.value }))}
-                  placeholder="What does this job do?"
+                  placeholder={t('descriptionPlaceholder')}
                   className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground"
                 />
               </div>
@@ -1523,12 +1559,12 @@ export function CronManagementPanel() {
                 onClick={() => setShowAddForm(false)}
                 variant="ghost"
               >
-                Cancel
+                {t('cancel')}
               </Button>
               <Button
                 onClick={addJob}
               >
-                Add Job
+                {t('addJob')}
               </Button>
             </div>
           </div>
@@ -1539,14 +1575,14 @@ export function CronManagementPanel() {
 }
 
 function ClaudeCodeTeamsSection() {
+  const t = useTranslations('cronManagement')
   const [expanded, setExpanded] = useState(false)
   const [data, setData] = useState<{ teams: any[]; tasks: any[] }>({ teams: [], tasks: [] })
   const [loaded, setLoaded] = useState(false)
 
   useEffect(() => {
     if (!expanded || loaded) return
-    fetch('/api/claude-tasks')
-      .then(r => r.json())
+    apiFetch<{ teams: any[]; tasks: any[] }>('/api/claude-tasks')
       .then(d => { setData(d); setLoaded(true) })
       .catch(() => setLoaded(true))
   }, [expanded, loaded])
@@ -1563,19 +1599,19 @@ function ClaudeCodeTeamsSection() {
         className="w-full flex items-center justify-between px-6 py-4 hover:bg-secondary/50 transition-colors text-left"
       >
         <div className="flex items-center gap-3">
-          <h2 className="text-lg font-semibold text-foreground">Claude Code Teams</h2>
+          <h2 className="text-lg font-semibold text-foreground">{t('claudeCodeTeams')}</h2>
           {data.teams.length > 0 && (
-            <span className="text-xs px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-400">{data.teams.length} teams</span>
+            <span className="text-xs px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-400">{t('teamsCount', { count: data.teams.length })}</span>
           )}
         </div>
-        <span className="text-muted-foreground text-sm">{expanded ? 'Collapse' : 'Expand'}</span>
+        <span className="text-muted-foreground text-sm">{expanded ? t('collapse') : t('expand')}</span>
       </button>
       {expanded && (
         <div className="px-6 pb-6 border-t border-border pt-4 space-y-4">
           {!loaded ? (
-            <div className="text-sm text-muted-foreground">Loading...</div>
+            <div className="text-sm text-muted-foreground">{t('loading')}</div>
           ) : data.teams.length === 0 ? (
-            <div className="text-sm text-muted-foreground">No Claude Code teams found in ~/.claude/teams/</div>
+            <div className="text-sm text-muted-foreground">{t('noClaudeCodeTeams')}</div>
           ) : (
             <>
               {Object.keys(statusCounts).length > 0 && (
@@ -1596,7 +1632,7 @@ function ClaudeCodeTeamsSection() {
                   <div key={team.name} className="border border-border rounded-lg p-4">
                     <div className="flex items-center gap-2 mb-2">
                       <span className="font-medium text-foreground">{team.name}</span>
-                      <span className="text-xs text-muted-foreground">{team.members?.length || 0} members</span>
+                      <span className="text-xs text-muted-foreground">{t('membersCount', { count: team.members?.length || 0 })}</span>
                       {team.description && (
                         <span className="text-xs text-muted-foreground truncate">{team.description}</span>
                       )}

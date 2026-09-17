@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   createTaskSchema,
+  updateTaskSchema,
   createAgentSchema,
   createWebhookSchema,
   createAlertSchema,
@@ -10,6 +11,12 @@ import {
   createPipelineSchema,
   createWorkflowSchema,
   createMessageSchema,
+  updateProjectSchema,
+  createOsUserSchema,
+  installTmuxSchema,
+  releaseUpdateSchema,
+  openClawUpdateSchema,
+  openClawDoctorFixSchema,
 } from '@/lib/validation'
 
 describe('createTaskSchema', () => {
@@ -36,7 +43,7 @@ describe('createTaskSchema', () => {
   })
 
   it('accepts all valid statuses', () => {
-    for (const status of ['inbox', 'assigned', 'in_progress', 'review', 'quality_review', 'done']) {
+    for (const status of ['backlog', 'inbox', 'assigned', 'awaiting_owner', 'in_progress', 'review', 'quality_review', 'done', 'failed']) {
       const result = createTaskSchema.safeParse({ title: 'T', status })
       expect(result.success).toBe(true)
     }
@@ -55,12 +62,80 @@ describe('createTaskSchema', () => {
     expect(result.success).toBe(true)
   })
 
+  it('accepts implementation target metadata fields', () => {
+    const result = createTaskSchema.safeParse({
+      title: 'Route this task',
+      metadata: {
+        implementation_repo: 'builderz-labs/mission-control',
+        code_location: '/apps/api',
+      },
+    })
+    expect(result.success).toBe(true)
+  })
+
   it('rejects invalid feedback_rating', () => {
     const result = createTaskSchema.safeParse({
       title: 'Invalid rating test',
       feedback_rating: 6,
     })
     expect(result.success).toBe(false)
+  })
+
+  it('rejects non-string implementation target metadata fields', () => {
+    const result = createTaskSchema.safeParse({
+      title: 'Bad metadata',
+      metadata: {
+        implementation_repo: 123,
+      },
+    })
+    expect(result.success).toBe(false)
+  })
+})
+
+describe('updateTaskSchema', () => {
+  // Regression: createTaskSchema.partial() preserves the underlying defaults,
+  // so a PUT that omits a field would parse with status='inbox', tags=[], etc.
+  // The route's "if (field !== undefined)" check would then overwrite the
+  // stored row. updateTaskSchema must drop those defaults.
+  it('does not inject defaults for omitted fields', () => {
+    const result = updateTaskSchema.safeParse({})
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.data).not.toHaveProperty('status')
+      expect(result.data).not.toHaveProperty('priority')
+      expect(result.data).not.toHaveProperty('tags')
+      expect(result.data).not.toHaveProperty('metadata')
+      expect(Object.keys(result.data)).toHaveLength(0)
+    }
+  })
+
+  it('does not inject defaults when only one field is provided', () => {
+    const result = updateTaskSchema.safeParse({ title: 'Renamed' })
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.data).toEqual({ title: 'Renamed' })
+    }
+  })
+
+  it('passes through provided fields verbatim', () => {
+    const result = updateTaskSchema.safeParse({
+      status: 'in_progress',
+      tags: ['a', 'b'],
+      metadata: { custom: 'value' },
+    })
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.data.status).toBe('in_progress')
+      expect(result.data.tags).toEqual(['a', 'b'])
+      expect(result.data.metadata).toEqual({ custom: 'value' })
+      expect(result.data).not.toHaveProperty('priority')
+    }
+  })
+
+  it('still validates field constraints', () => {
+    expect(updateTaskSchema.safeParse({ status: 'invalid' }).success).toBe(false)
+    expect(updateTaskSchema.safeParse({ feedback_rating: 6 }).success).toBe(false)
+    expect(updateTaskSchema.safeParse({ title: '' }).success).toBe(false)
   })
 })
 
@@ -124,7 +199,6 @@ describe('createAlertSchema', () => {
 describe('spawnAgentSchema', () => {
   const validSpawn = {
     task: 'Do something',
-    model: 'sonnet',
     label: 'worker-1',
   }
 
@@ -133,6 +207,14 @@ describe('spawnAgentSchema', () => {
     expect(result.success).toBe(true)
     if (result.success) {
       expect(result.data.timeoutSeconds).toBe(300)
+    }
+  })
+
+  it('accepts an explicit model when provided', () => {
+    const result = spawnAgentSchema.safeParse({ ...validSpawn, model: 'sonnet' })
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.data.model).toBe('sonnet')
     }
   })
 
@@ -167,6 +249,97 @@ describe('createUserSchema', () => {
   it('rejects missing password', () => {
     const result = createUserSchema.safeParse({ username: 'x' })
     expect(result.success).toBe(false)
+  })
+})
+
+describe('createOsUserSchema', () => {
+  it('accepts a bounded local provisioning request', () => {
+    const result = createOsUserSchema.safeParse({
+      username: 'builder-01',
+      display_name: 'Builder 01',
+      password: 'secure-passphrase',
+      install_codex: true,
+    })
+
+    expect(result.success).toBe(true)
+  })
+
+  it('normalizes safe usernames and display names', () => {
+    const result = createOsUserSchema.safeParse({
+      username: '  Builder-01  ',
+      display_name: '  Builder 01  ',
+    })
+
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.data.username).toBe('builder-01')
+      expect(result.data.display_name).toBe('Builder 01')
+    }
+  })
+
+  it.each([
+    {},
+    { username: 'ab', display_name: 'Too short username' },
+    { username: 'root;shutdown', display_name: 'Unsafe' },
+    { username: 'valid-user', display_name: '' },
+    { username: 'valid-user', display_name: 'x'.repeat(101) },
+    { username: 'valid-user', display_name: 'Valid', password: 'short' },
+    { username: 'valid-user', display_name: 'Valid', gateway_mode: true },
+    { username: 'valid-user', display_name: 'Valid', gateway_mode: true, gateway_port: 22 },
+    { username: 'valid-user', display_name: 'Valid', unexpected: true },
+  ])('rejects unsafe OS user provisioning input %#', (input) => {
+    expect(createOsUserSchema.safeParse(input).success).toBe(false)
+  })
+})
+
+describe('installTmuxSchema', () => {
+  it('accepts only the explicit installation confirmation', () => {
+    expect(installTmuxSchema.safeParse({ confirmation: 'install_tmux' }).success).toBe(true)
+  })
+
+  it.each([
+    {},
+    { confirmation: true },
+    { confirmation: 'yes' },
+    { confirmation: 'install_tmux', package: 'curl' },
+  ])('rejects unsafe tmux installation input %#', (input) => {
+    expect(installTmuxSchema.safeParse(input).success).toBe(false)
+  })
+})
+
+describe('releaseUpdateSchema', () => {
+  it('accepts a bounded target with the explicit update confirmation', () => {
+    expect(releaseUpdateSchema.safeParse({
+      targetVersion: ' v2.1.0 ',
+      confirmation: 'update_mission_control',
+    }).success).toBe(true)
+  })
+
+  it.each([
+    {},
+    { targetVersion: 'v2.1.0' },
+    { targetVersion: 'v2.1.0', confirmation: true },
+    { targetVersion: 'v2.1.0', confirmation: 'yes' },
+    { targetVersion: 'v2.1.0', confirmation: 'update_mission_control', force: true },
+    { targetVersion: 'v' + '1'.repeat(128), confirmation: 'update_mission_control' },
+  ])('rejects unsafe release update input %#', (input) => {
+    expect(releaseUpdateSchema.safeParse(input).success).toBe(false)
+  })
+})
+
+describe('OpenClaw maintenance schemas', () => {
+  it('accepts only the matching explicit action confirmations', () => {
+    expect(openClawUpdateSchema.safeParse({ confirmation: 'update_openclaw' }).success).toBe(true)
+    expect(openClawDoctorFixSchema.safeParse({ confirmation: 'fix_openclaw' }).success).toBe(true)
+  })
+
+  it.each([
+    {},
+    { confirmation: 'yes' },
+    { confirmation: 'fix_openclaw', force: true },
+  ])('rejects unsafe OpenClaw maintenance input %#', (input) => {
+    expect(openClawUpdateSchema.safeParse(input).success).toBe(false)
+    expect(openClawDoctorFixSchema.safeParse(input).success).toBe(false)
   })
 })
 
@@ -255,5 +428,30 @@ describe('createMessageSchema', () => {
   it('rejects missing message', () => {
     const result = createMessageSchema.safeParse({ to: 'bob' })
     expect(result.success).toBe(false)
+  })
+})
+
+describe('updateProjectSchema', () => {
+  it('accepts an atomic field and assignment update', () => {
+    const result = updateProjectSchema.safeParse({
+      description: 'Updated project',
+      github_sync_enabled: true,
+      assigned_agents: ['builder', 'reviewer'],
+    })
+
+    expect(result.success).toBe(true)
+  })
+
+  it.each([
+    {},
+    { unexpected: true },
+    { status: 'deleted' },
+    { deadline: -1 },
+    { ticket_prefix: 'MC', ticketPrefix: 'OTHER' },
+    { assigned_agents: ['builder', 'builder'] },
+    { assigned_agents: [''] },
+    { assigned_agents: Array.from({ length: 101 }, (_, index) => `agent-${index}`) },
+  ])('rejects unsafe project update input %#', (input) => {
+    expect(updateProjectSchema.safeParse(input).success).toBe(false)
   })
 })

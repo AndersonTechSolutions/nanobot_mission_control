@@ -16,6 +16,14 @@ export const GATEWAY_STEPS: OnboardingStepDefinition[] = [
   { id: 'credentials', title: 'Credentials' },
 ]
 
+/** All canonical step IDs — superset for API validation and persistence. */
+export const ALL_KNOWN_STEPS: OnboardingStepDefinition[] = [
+  { id: 'welcome', title: 'Welcome' },
+  { id: 'interface-mode', title: 'Interface' },
+  { id: 'gateway-link', title: 'Gateway' },
+  { id: 'credentials', title: 'Credentials' },
+]
+
 export function getWizardSteps(gatewayConnected: boolean): OnboardingStepDefinition[] {
   return gatewayConnected ? GATEWAY_STEPS : BASE_STEPS
 }

@@ -1,12 +1,18 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
+import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
+import { LanguageSwitcherSelect } from '@/components/ui/language-switcher'
 import { useMissionControl } from '@/store'
 import { useNavigateToPanel } from '@/lib/navigation'
 import { SecurityScanCard } from '@/components/onboarding/security-scan-card'
+import { AgentRuntimesSection } from '@/components/settings/agent-runtimes-section'
 import { Loader } from '@/components/ui/loader'
 import { clearOnboardingDismissedThisSession, clearOnboardingReplayFromStart } from '@/lib/onboarding-session'
+import { resolveCoordinatorDeliveryTarget, type CoordinatorAgentRecord } from '@/lib/coordinator-routing'
+import type { GatewaySession } from '@/lib/sessions'
+import { apiFetch, ApiError } from '@/lib/api-client'
 
 interface Setting {
   key: string
@@ -20,21 +26,66 @@ interface Setting {
 
 interface ApiKeyInfo {
   masked_key: string | null
+  configured: boolean
   source: string
   last_rotated_at: number | null
   last_rotated_by: string | null
+}
+
+interface CoordinatorTargetAgent {
+  name: string
+  openclawId: string
+  isDefault: boolean
+  sessionKey: string | null
+  configRaw: string
+}
+
+type CoordinatorSession = GatewaySession & { source?: string }
+
+const COORDINATOR_AGENT = (process.env.NEXT_PUBLIC_COORDINATOR_AGENT || 'coordinator').toLowerCase()
+
+function parseCoordinatorTargetAgents(rawAgents: any[]): CoordinatorTargetAgent[] {
+  const out: CoordinatorTargetAgent[] = []
+  for (const raw of rawAgents || []) {
+    const name = typeof raw?.name === 'string' ? raw.name.trim() : ''
+    if (!name) continue
+    const config = raw?.config && typeof raw.config === 'object' ? raw.config : {}
+    const openclawIdRaw = typeof config.openclawId === 'string' && config.openclawId.trim()
+      ? config.openclawId.trim()
+      : name
+    const openclawId = openclawIdRaw.toLowerCase().replace(/\s+/g, '-')
+    out.push({
+      name,
+      openclawId,
+      isDefault: config.isDefault === true,
+      sessionKey: typeof raw?.session_key === 'string' && raw.session_key.trim() ? raw.session_key.trim() : null,
+      configRaw: JSON.stringify(config),
+    })
+  }
+
+  const unique = new Map<string, CoordinatorTargetAgent>()
+  for (const agent of out) {
+    const key = agent.openclawId || agent.name.toLowerCase()
+    if (!unique.has(key)) unique.set(key, agent)
+  }
+
+  return Array.from(unique.values()).sort((a, b) => {
+    if (a.isDefault !== b.isDefault) return a.isDefault ? -1 : 1
+    return a.name.localeCompare(b.name)
+  })
 }
 
 const categoryLabels: Record<string, { label: string; icon: string; description: string }> = {
   general: { label: 'General', icon: '⚙', description: 'Core Mission Control settings' },
   security: { label: 'Security', icon: '🔑', description: 'API key management and security settings' },
   retention: { label: 'Data Retention', icon: '🗄', description: 'How long data is kept before cleanup' },
-  gateway: { label: 'Gateway', icon: '🔌', description: 'Gateway connection settings' },
+  chat: { label: 'Chat', icon: '💬', description: 'Coordinator routing and chat behavior settings' },
+  gateway: { label: 'Gateway', icon: '🔌', description: 'OpenClaw gateway connection settings' },
   profiles: { label: 'Security Profiles', icon: 'shield', description: 'Hook profile controls security scanning strictness' },
   custom: { label: 'Custom', icon: '🔧', description: 'User-defined settings' },
 }
 
-const categoryOrder = ['general', 'security', 'profiles', 'retention', 'gateway', 'custom']
+const categoryOrder = ['general', 'security', 'profiles', 'retention', 'chat', 'gateway', 'custom']
 
 // Dropdown options for subscription plan settings
 const subscriptionDropdowns: Record<string, { label: string; value: string }[]> = {
@@ -56,6 +107,7 @@ const subscriptionDropdowns: Record<string, { label: string; value: string }[]> 
 }
 
 export function SettingsPanel() {
+  const t = useTranslations('settings')
   const { currentUser, setShowOnboarding } = useMissionControl()
   const navigateToPanel = useNavigateToPanel()
   const [settings, setSettings] = useState<Setting[]>([])
@@ -79,9 +131,23 @@ export function SettingsPanel() {
   const [showSecurityScan, setShowSecurityScan] = useState(false)
   const [hookProfile, setHookProfile] = useState<string>('standard')
   const [hookProfileSaving, setHookProfileSaving] = useState(false)
+  const [coordinatorTargetAgents, setCoordinatorTargetAgents] = useState<CoordinatorTargetAgent[]>([])
+  const [coordinatorSessions, setCoordinatorSessions] = useState<CoordinatorSession[]>([])
 
   // Replay onboarding state
   const [replayingOnboarding, setReplayingOnboarding] = useState(false)
+
+  // Hermes integration state
+  const [hermesStatus, setHermesStatus] = useState<{
+    installed: boolean
+    gatewayRunning: boolean
+    hookInstalled: boolean
+    activeSessions: number
+    cronJobCount?: number
+    memoryEntries?: number
+  } | null>(null)
+  const [hermesLoading, setHermesLoading] = useState(false)
+  const [hermesHookAction, setHermesHookAction] = useState(false)
 
   // Backup state
   const [mcBackupRunning, setMcBackupRunning] = useState(false)
@@ -92,9 +158,44 @@ export function SettingsPanel() {
     setTimeout(() => setFeedback(null), 3000)
   }
 
+  const getCoordinatorResolutionPreview = useCallback((configuredTarget: string) => {
+    const allAgents: CoordinatorAgentRecord[] = coordinatorTargetAgents.map(agent => ({
+      name: agent.name,
+      session_key: agent.sessionKey,
+      config: agent.configRaw,
+    }))
+    const directAgent = allAgents.find(agent => agent.name.toLowerCase() === COORDINATOR_AGENT) || null
+    const gatewaySessions = coordinatorSessions.filter(session => (session.source || 'gateway') === 'gateway')
+
+    const resolved = resolveCoordinatorDeliveryTarget({
+      to: COORDINATOR_AGENT,
+      coordinatorAgent: COORDINATOR_AGENT,
+      directAgent,
+      allAgents,
+      sessions: gatewaySessions,
+      configuredCoordinatorTarget: configuredTarget || null,
+    })
+
+    const viaLabel: Record<string, string> = {
+      configured: 'configured target',
+      default: 'default agent',
+      main_session: 'live :main session',
+      direct: 'coordinator record',
+      fallback: 'fallback',
+    }
+
+    const targetLabel = `${resolved.deliveryName}${resolved.openclawAgentId ? ` (${resolved.openclawAgentId})` : ''}`
+    return `Resolves now to ${targetLabel} via ${viaLabel[resolved.resolvedBy] || resolved.resolvedBy}.`
+  }, [coordinatorTargetAgents, coordinatorSessions])
+
   const fetchSettings = useCallback(async () => {
     try {
-      const res = await fetch('/api/settings')
+      // raw + redirectOnUnauthenticated:false to preserve the custom 401 redirect
+      // target (/login?next=%2Fsettings) and the explicit status branching below.
+      const res = await apiFetch<Response>('/api/settings', {
+        raw: true,
+        redirectOnUnauthenticated: false,
+      })
       if (res.status === 401) {
         window.location.assign('/login?next=%2Fsettings')
         return
@@ -114,6 +215,39 @@ export function SettingsPanel() {
       // Load hook profile from settings
       const hpSetting = (data.settings || []).find((s: Setting) => s.key === 'hook_profile')
       if (hpSetting) setHookProfile(hpSetting.value)
+
+      // Load agent options for coordinator routing dropdown
+      try {
+        const agentsData = await apiFetch<{ agents?: any[] }>('/api/agents?limit=200')
+        setCoordinatorTargetAgents(parseCoordinatorTargetAgents(agentsData.agents || []))
+      } catch {
+        // non-critical
+      }
+
+      // Load live sessions to preview coordinator routing resolution
+      try {
+        const sessionsData = await apiFetch<{ sessions?: any[] }>('/api/sessions')
+        const mapped: CoordinatorSession[] = Array.isArray(sessionsData.sessions)
+          ? sessionsData.sessions.map((session: any) => ({
+              key: String(session?.key || ''),
+              agent: String(session?.agent || ''),
+              source: typeof session?.source === 'string' ? session.source : undefined,
+              sessionId: String(session?.id || session?.key || ''),
+              updatedAt: Number(session?.lastActivity || session?.startTime || 0),
+              chatType: String(session?.kind || 'unknown'),
+              channel: String(session?.channel || ''),
+              model: String(session?.model || ''),
+              totalTokens: 0,
+              inputTokens: 0,
+              outputTokens: 0,
+              contextTokens: 0,
+              active: Boolean(session?.active),
+            })).filter((session: CoordinatorSession) => session.key && session.agent)
+          : []
+        setCoordinatorSessions(mapped)
+      } catch {
+        // non-critical
+      }
     } catch {
       setError('Failed to load settings')
     } finally {
@@ -124,11 +258,8 @@ export function SettingsPanel() {
   const fetchApiKeyInfo = useCallback(async () => {
     setApiKeyLoading(true)
     try {
-      const res = await fetch('/api/tokens/rotate')
-      if (res.ok) {
-        const data = await res.json()
-        setApiKeyInfo(data)
-      }
+      const data = await apiFetch<ApiKeyInfo>('/api/tokens/rotate')
+      setApiKeyInfo(data)
     } catch {
       // Silent — non-critical
     } finally {
@@ -139,7 +270,9 @@ export function SettingsPanel() {
   const handleRotateKey = async () => {
     setRotating(true)
     try {
-      const res = await fetch('/api/tokens/rotate', { method: 'POST' })
+      // raw:true preserves the exact res.ok branching — this route returns 400
+      // (with {error}) on failure, which apiFetch does NOT throw on.
+      const res = await apiFetch<Response>('/api/tokens/rotate', { method: 'POST', raw: true })
       const data = await res.json()
       if (res.ok) {
         setNewApiKey(data.key)
@@ -176,7 +309,13 @@ export function SettingsPanel() {
     }
   }
 
-  useEffect(() => { fetchSettings(); fetchApiKeyInfo() }, [fetchSettings, fetchApiKeyInfo])
+  const fetchHermesStatus = useCallback(async () => {
+    try {
+      setHermesStatus(await apiFetch<NonNullable<typeof hermesStatus>>('/api/hermes'))
+    } catch { /* non-critical */ }
+  }, [])
+
+  useEffect(() => { fetchSettings(); fetchApiKeyInfo(); fetchHermesStatus() }, [fetchSettings, fetchApiKeyInfo, fetchHermesStatus])
 
   const handleEdit = (key: string, value: string) => {
     setEdits(prev => ({ ...prev, [key]: value }))
@@ -201,10 +340,10 @@ export function SettingsPanel() {
 
     setSaving(true)
     try {
-      const res = await fetch('/api/settings', {
+      const res = await apiFetch<Response>('/api/settings', {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ settings: changes }),
+        raw: true,
       })
       const data = await res.json()
       if (res.ok) {
@@ -223,7 +362,7 @@ export function SettingsPanel() {
 
   const handleReset = async (key: string) => {
     try {
-      const res = await fetch(`/api/settings?key=${encodeURIComponent(key)}`, { method: 'DELETE' })
+      const res = await apiFetch<Response>(`/api/settings?key=${encodeURIComponent(key)}`, { method: 'DELETE', raw: true })
       const data = await res.json()
       if (res.ok) {
         showFeedback(true, `Reset "${key}" to default`)
@@ -262,19 +401,19 @@ export function SettingsPanel() {
   return (
     <div className="p-4 md:p-6 max-w-4xl mx-auto space-y-6">
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+      <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-lg font-semibold text-foreground">Settings</h2>
-          <p className="text-xs text-muted-foreground mt-0.5">Configure Mission Control behavior and retention policies</p>
+          <h2 className="text-lg font-semibold text-foreground">{t('title')}</h2>
+          <p className="text-xs text-muted-foreground mt-0.5">{t('description')}</p>
         </div>
-        <div className="flex items-center gap-2 flex-shrink-0">
+        <div className="flex items-center gap-2">
           {hasChanges && (
             <Button
               onClick={handleDiscard}
               variant="outline"
               size="sm"
             >
-              Discard
+              {t('discard')}
             </Button>
           )}
           <Button
@@ -284,7 +423,7 @@ export function SettingsPanel() {
             size="sm"
             className={!hasChanges ? 'cursor-not-allowed' : ''}
           >
-            {saving ? 'Saving...' : 'Save Changes'}
+            {saving ? t('saving') : t('saveChanges')}
           </Button>
         </div>
       </div>
@@ -292,17 +431,17 @@ export function SettingsPanel() {
       {/* Workspace Info */}
       {currentUser?.role === 'admin' && (
         <div className="bg-blue-500/10 border border-blue-500/20 rounded-lg p-3 text-xs text-blue-300">
-          <strong className="text-blue-200">Workspace Management:</strong>{' '}
-          To create or manage workspaces (tenant instances), go to the{' '}
+          <strong className="text-blue-200">{t('workspaceManagementLabel')}</strong>{' '}
+          {t('workspaceManagementDesc1')}{' '}
           <Button
             onClick={() => navigateToPanel('super-admin')}
             variant="link"
             size="xs"
             className="text-blue-400 hover:text-blue-300 p-0 h-auto"
           >
-            Super Admin
+            {t('superAdmin')}
           </Button>{' '}
-          panel under Admin &gt; Super Admin in the sidebar. From there you can create new client instances, manage tenants, and monitor provisioning jobs.
+          {t('workspaceManagementDesc2')}
         </div>
       )}
 
@@ -312,8 +451,8 @@ export function SettingsPanel() {
           {/* Security Scan */}
           <div className="flex items-center gap-3 p-3 bg-surface-1/50 border border-border/30 rounded-lg">
             <div className="flex-1">
-              <p className="text-xs font-medium">Security</p>
-              <p className="text-2xs text-muted-foreground">Scan your station security posture</p>
+              <p className="text-xs font-medium">{t('security')}</p>
+              <p className="text-2xs text-muted-foreground">{t('securityDescription')}</p>
             </div>
             <Button
               variant="outline"
@@ -321,7 +460,7 @@ export function SettingsPanel() {
               className="text-2xs"
               onClick={() => setShowSecurityScan(v => !v)}
             >
-              {showSecurityScan ? 'Hide Scan' : 'Security Scan'}
+              {showSecurityScan ? t('hideScan') : t('securityScan')}
             </Button>
           </div>
           {showSecurityScan && (
@@ -331,12 +470,11 @@ export function SettingsPanel() {
           )}
 
           {/* Backup Actions */}
-          <div className="flex flex-col sm:flex-row sm:items-center gap-3 p-3 bg-surface-1/50 border border-border/30 rounded-lg">
+          <div className="flex items-center gap-3 p-3 bg-surface-1/50 border border-border/30 rounded-lg">
             <div className="flex-1">
-              <p className="text-xs font-medium">Backups</p>
-              <p className="text-2xs text-muted-foreground">Create on-demand backups of MC database or gateway state</p>
+              <p className="text-xs font-medium">{t('backups')}</p>
+              <p className="text-2xs text-muted-foreground">{t('backupsDescription')}</p>
             </div>
-            <div className="flex flex-wrap gap-2">
             <Button
               variant="outline"
               size="xs"
@@ -345,7 +483,7 @@ export function SettingsPanel() {
               onClick={async () => {
                 setMcBackupRunning(true)
                 try {
-                  const res = await fetch('/api/backup', { method: 'POST' })
+                  const res = await apiFetch<Response>('/api/backup', { method: 'POST', raw: true })
                   const data = await res.json()
                   if (res.ok) {
                     showFeedback(true, `MC backup created (${(data.backup?.size / 1024).toFixed(0)} KB)`)
@@ -359,7 +497,7 @@ export function SettingsPanel() {
                 }
               }}
             >
-              {mcBackupRunning ? 'Backing up...' : 'Backup MC Database'}
+              {mcBackupRunning ? t('backingUp') : t('backupMcDatabase')}
             </Button>
             <Button
               variant="outline"
@@ -369,7 +507,7 @@ export function SettingsPanel() {
               onClick={async () => {
                 setGwBackupRunning(true)
                 try {
-                  const res = await fetch('/api/backup?target=gateway', { method: 'POST' })
+                  const res = await apiFetch<Response>('/api/backup?target=gateway', { method: 'POST', raw: true })
                   const data = await res.json()
                   if (res.ok) {
                     showFeedback(true, `Gateway backup created: ${data.output}`)
@@ -383,16 +521,15 @@ export function SettingsPanel() {
                 }
               }}
             >
-              {gwBackupRunning ? 'Backing up...' : 'Backup Gateway State'}
+              {gwBackupRunning ? t('backingUp') : t('backupGatewayState')}
             </Button>
-            </div>
           </div>
 
           {/* Replay Onboarding */}
           <div className="flex items-center gap-3 p-3 bg-surface-1/50 border border-border/30 rounded-lg">
             <div className="flex-1">
-              <p className="text-xs font-medium">Onboarding</p>
-              <p className="text-2xs text-muted-foreground">Replay the setup wizard and reset the dashboard checklist</p>
+              <p className="text-xs font-medium">{t('onboarding')}</p>
+              <p className="text-2xs text-muted-foreground">{t('onboardingDescription')}</p>
             </div>
             <Button
               variant="outline"
@@ -402,10 +539,12 @@ export function SettingsPanel() {
               onClick={async () => {
                 setReplayingOnboarding(true)
                 try {
-                  await fetch('/api/onboarding', {
+                  // raw:true keeps this fire-and-forget: original never read the body
+                  // and only the catch (network error) diverted from the success path.
+                  await apiFetch('/api/onboarding', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ action: 'reset' }),
+                    raw: true,
                   })
                   clearOnboardingDismissedThisSession()
                   clearOnboardingReplayFromStart()
@@ -418,10 +557,86 @@ export function SettingsPanel() {
                 }
               }}
             >
-              {replayingOnboarding ? 'Resetting...' : 'Replay Onboarding'}
+              {replayingOnboarding ? t('resetting') : t('replayOnboarding')}
             </Button>
           </div>
 
+          {/* Agent Runtimes */}
+          <AgentRuntimesSection showFeedback={showFeedback} />
+
+          {/* Hermes Agent Integration */}
+          {hermesStatus?.installed && (
+            <div className="p-3 bg-surface-1/50 border border-border/30 rounded-lg space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="flex-1">
+                  <div className="flex items-center gap-2">
+                    <p className="text-xs font-medium">Hermes Agent</p>
+                    <span className={`text-2xs px-1.5 py-0.5 rounded ${
+                      hermesStatus.gatewayRunning
+                        ? 'bg-green-500/15 text-green-400'
+                        : 'bg-muted text-muted-foreground'
+                    }`}>
+                      {hermesStatus.gatewayRunning ? 'Gateway running' : 'Gateway offline'}
+                    </span>
+                    {hermesStatus.activeSessions > 0 && (
+                      <span className="text-2xs px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-400">
+                        {hermesStatus.activeSessions} active
+                      </span>
+                    )}
+                    {(hermesStatus.cronJobCount ?? 0) > 0 && (
+                      <span className="text-2xs px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-400">
+                        {hermesStatus.cronJobCount} cron
+                      </span>
+                    )}
+                    {(hermesStatus.memoryEntries ?? 0) > 0 && (
+                      <span className="text-2xs px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-400">
+                        {hermesStatus.memoryEntries} mem
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-2xs text-muted-foreground mt-0.5">
+                    {hermesStatus.hookInstalled
+                      ? 'MC hook installed — receiving telemetry from hermes-agent'
+                      : 'Install the MC hook for richer telemetry (agent status, session events)'}
+                  </p>
+                </div>
+                <Button
+                  variant="outline"
+                  size="xs"
+                  className="text-2xs"
+                  disabled={hermesHookAction}
+                  onClick={async () => {
+                    setHermesHookAction(true)
+                    const action = hermesStatus.hookInstalled ? 'uninstall-hook' : 'install-hook'
+                    try {
+                      const res = await apiFetch<Response>('/api/hermes', {
+                        method: 'POST',
+                        body: JSON.stringify({ action }),
+                        raw: true,
+                      })
+                      const data = await res.json()
+                      if (res.ok) {
+                        showFeedback(true, data.message || `Hook ${action === 'install-hook' ? 'installed' : 'uninstalled'}`)
+                        fetchHermesStatus()
+                      } else {
+                        showFeedback(false, data.error || 'Hook operation failed')
+                      }
+                    } catch {
+                      showFeedback(false, 'Network error')
+                    } finally {
+                      setHermesHookAction(false)
+                    }
+                  }}
+                >
+                  {hermesHookAction
+                    ? 'Working...'
+                    : hermesStatus.hookInstalled
+                      ? 'Uninstall Hook'
+                      : 'Install MC Hook'}
+                </Button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -433,6 +648,9 @@ export function SettingsPanel() {
           {feedback.text}
         </div>
       )}
+
+      {/* Language */}
+      <LanguageSection />
 
       {/* Category tabs */}
       <div className="flex gap-1 border-b border-border pb-px">
@@ -485,7 +703,10 @@ export function SettingsPanel() {
             {/* Current key display */}
             <div className="mt-3 flex items-center gap-2">
               <code className="text-xs font-mono bg-background border border-border rounded px-2 py-1 text-muted-foreground">
-                {apiKeyLoading ? 'Loading...' : apiKeyInfo?.masked_key || 'No API key configured'}
+                {apiKeyLoading
+                  ? 'Loading...'
+                  : apiKeyInfo?.masked_key
+                    || (apiKeyInfo?.configured ? 'Configured (stored as hash — not displayable)' : 'No API key configured')}
               </code>
             </div>
 
@@ -590,10 +811,10 @@ export function SettingsPanel() {
                     setHookProfile(profile.value)
                     setHookProfileSaving(true)
                     try {
-                      const res = await fetch('/api/settings', {
+                      const res = await apiFetch<Response>('/api/settings', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ key: 'hook_profile', value: profile.value }),
+                        raw: true,
                       })
                       if (res.ok) {
                         showFeedback(true, `Hook profile set to ${profile.label}`)
@@ -643,7 +864,19 @@ export function SettingsPanel() {
           const isChanged = edits[setting.key] !== undefined && edits[setting.key] !== setting.value
           const isBooleanish = setting.value === 'true' || setting.value === 'false'
           const isNumeric = /^\d+$/.test(setting.value)
-          const dropdownOptions = subscriptionDropdowns[setting.key]
+          const coordinatorTargetOptions = setting.key === 'chat.coordinator_target_agent'
+            ? [
+                { label: 'Auto (default/main-session fallback)', value: '' },
+                ...coordinatorTargetAgents.map(agent => ({
+                  label: `${agent.name}${agent.isDefault ? ' (default)' : ''} — ${agent.openclawId}`,
+                  value: agent.openclawId,
+                })),
+              ]
+            : null
+          const dropdownOptions = coordinatorTargetOptions || subscriptionDropdowns[setting.key]
+          const coordinatorPreview = setting.key === 'chat.coordinator_target_agent'
+            ? getCoordinatorResolutionPreview(currentValue)
+            : null
           const shortKey = setting.key.split('.').pop() || setting.key
 
           return (
@@ -668,18 +901,22 @@ export function SettingsPanel() {
                   <p className="text-2xs text-muted-foreground/60 mt-1 font-mono">{setting.key}</p>
                 </div>
 
-                <div className="flex items-center gap-2 shrink-0">
-                  {dropdownOptions ? (
-                    <select
-                      value={currentValue}
-                      onChange={e => handleEdit(setting.key, e.target.value)}
-                      className="w-48 px-2 py-1 text-sm bg-background border border-border rounded-md focus:border-primary focus:outline-none"
-                    >
-                      {dropdownOptions.map(opt => (
-                        <option key={opt.value} value={opt.value}>{opt.label}</option>
-                      ))}
-                    </select>
-                  ) : isBooleanish ? (
+                <div className="flex flex-col items-end gap-1 shrink-0">
+                  <div className="flex items-center gap-2">
+                    {dropdownOptions ? (
+                      <select
+                        value={currentValue}
+                        onChange={e => handleEdit(setting.key, e.target.value)}
+                        className="w-64 px-2 py-1 text-sm bg-background border border-border rounded-md focus:border-primary focus:outline-hidden"
+                      >
+                        {dropdownOptions.map(opt => (
+                          <option key={opt.value} value={opt.value}>{opt.label}</option>
+                        ))}
+                        {currentValue && !dropdownOptions.some(opt => opt.value === currentValue) && (
+                          <option value={currentValue}>Custom: {currentValue}</option>
+                        )}
+                      </select>
+                    ) : isBooleanish ? (
                     <button
                       onClick={() => handleEdit(setting.key, currentValue === 'true' ? 'false' : 'true')}
                       className={`w-10 h-5 rounded-full relative transition-colors select-none ${
@@ -695,30 +932,34 @@ export function SettingsPanel() {
                       type="number"
                       value={currentValue}
                       onChange={e => handleEdit(setting.key, e.target.value)}
-                      className="w-24 px-2 py-1 text-sm text-right bg-background border border-border rounded-md focus:border-primary focus:outline-none font-mono"
+                      className="w-24 px-2 py-1 text-sm text-right bg-background border border-border rounded-md focus:border-primary focus:outline-hidden font-mono"
                     />
                   ) : (
                     <input
                       type="text"
                       value={currentValue}
                       onChange={e => handleEdit(setting.key, e.target.value)}
-                      className="w-48 px-2 py-1 text-sm bg-background border border-border rounded-md focus:border-primary focus:outline-none"
+                      className="w-48 px-2 py-1 text-sm bg-background border border-border rounded-md focus:border-primary focus:outline-hidden"
                     />
                   )}
 
-                  {!setting.is_default && (
-                    <Button
-                      onClick={() => handleReset(setting.key)}
-                      title="Reset to default"
-                      variant="ghost"
-                      size="icon-xs"
-                      className="w-6 h-6"
-                    >
-                      <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
-                        <path d="M2 8a6 6 0 1111.3-2.8" strokeLinecap="round" />
-                        <path d="M14 2v3.5h-3.5" strokeLinecap="round" strokeLinejoin="round" />
-                      </svg>
-                    </Button>
+                    {!setting.is_default && (
+                      <Button
+                        onClick={() => handleReset(setting.key)}
+                        title="Reset to default"
+                        variant="ghost"
+                        size="icon-xs"
+                        className="w-6 h-6"
+                      >
+                        <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+                          <path d="M2 8a6 6 0 1111.3-2.8" strokeLinecap="round" />
+                          <path d="M14 2v3.5h-3.5" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                      </Button>
+                    )}
+                  </div>
+                  {coordinatorPreview && (
+                    <p className="text-2xs text-muted-foreground max-w-72 text-right">{coordinatorPreview}</p>
                   )}
                 </div>
               </div>
@@ -751,14 +992,14 @@ export function SettingsPanel() {
             variant="ghost"
             size="xs"
           >
-            Discard
+            {t('discard')}
           </Button>
           <Button
             onClick={handleSave}
             disabled={saving}
             size="xs"
           >
-            {saving ? 'Saving...' : 'Save'}
+            {saving ? t('saving') : t('save')}
           </Button>
         </div>
       )}
@@ -774,21 +1015,31 @@ function InterfaceModeSelector() {
   const handleChange = async (mode: 'essential' | 'full') => {
     setInterfaceMode(mode)
     setSaving(true)
+    // Original behavior: the redirect ran for any completed request regardless of
+    // HTTP status, and was only skipped on a network failure. apiFetch throws on
+    // 4xx/5xx too, so treat a server-status error (not NETWORK_ERROR) as "reached
+    // the server" and still redirect to match the prior behavior.
+    let reachedServer = false
     try {
-      await fetch('/api/settings', {
+      await apiFetch('/api/settings', {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ settings: { 'general.interface_mode': mode } }),
+        raw: true,
       })
-      // If switching to essential and on a hidden panel, redirect
-      if (mode === 'essential') {
-        const essentialIds = new Set(['overview', 'agents', 'tasks', 'chat', 'activity', 'logs', 'settings'])
-        const store = useMissionControl.getState()
-        if (!essentialIds.has(store.activeTab)) {
-          navigateToPanel('overview')
-        }
+      reachedServer = true
+    } catch (err) {
+      if (err instanceof ApiError && err.code !== 'NETWORK_ERROR') {
+        reachedServer = true
       }
-    } catch {}
+    }
+    // If switching to essential and on a hidden panel, redirect
+    if (reachedServer && mode === 'essential') {
+      const essentialIds = new Set(['overview', 'agents', 'tasks', 'chat', 'activity', 'logs', 'settings'])
+      const store = useMissionControl.getState()
+      if (!essentialIds.has(store.activeTab)) {
+        navigateToPanel('overview')
+      }
+    }
     setSaving(false)
   }
 
@@ -832,6 +1083,21 @@ function InterfaceModeSelector() {
   )
 }
 
+function LanguageSection() {
+  const ts = useTranslations('settings')
+  return (
+    <div className="bg-card border border-border rounded-lg p-4">
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <p className="text-sm font-medium text-foreground">{ts('language')}</p>
+          <p className="text-2xs text-muted-foreground mt-0.5">{ts('languageDescription')}</p>
+        </div>
+        <LanguageSwitcherSelect />
+      </div>
+    </div>
+  )
+}
+
 /** Convert snake_case key to Title Case label */
 function formatLabel(key: string): string {
   return key
@@ -855,7 +1121,7 @@ function AccountOAuthSection() {
   const handleDisconnect = async () => {
     setDisconnecting(true)
     try {
-      const res = await fetch('/api/auth/google/disconnect', { method: 'POST' })
+      const res = await apiFetch<Response>('/api/auth/google/disconnect', { method: 'POST', raw: true })
       const data = await res.json().catch(() => ({}))
       if (res.ok) {
         setFeedback({ ok: true, text: 'Google account disconnected. You can now sign in with username and password.' })

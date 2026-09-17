@@ -8,6 +8,9 @@ import { config } from '@/lib/config'
 import { getDatabase } from '@/lib/db'
 import { logger } from '@/lib/logger'
 import { FIX_SAFETY, runSecurityScan, type FixSafety } from '@/lib/security-scan'
+import { securityFixLimiter } from '@/lib/rate-limit'
+import { acquireFileLockSync, atomicReplaceFileSync } from '@/lib/atomic-file'
+import { z } from 'zod'
 
 export interface FixResult {
   id: string
@@ -16,6 +19,12 @@ export interface FixResult {
   detail: string
   fixSafety?: FixSafety
 }
+
+const fixRequestSchema = z.object({
+  ids: z.array(
+    z.string().min(1).max(128).refine((id) => id in FIX_SAFETY, 'Unknown security check id'),
+  ).min(1).max(50).optional(),
+}).strict()
 
 function shouldMutateRuntimeEnv() {
   return process.env.MISSION_CONTROL_TEST_MODE !== '1'
@@ -59,14 +68,15 @@ export async function POST(request: NextRequest) {
   const auth = requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
-  // Optional: pass { ids: ["check_id"] } to fix only specific issues
-  let targetIds: Set<string> | null = null
-  try {
-    const body = await request.json()
-    if (Array.isArray(body?.ids) && body.ids.length > 0) {
-      targetIds = new Set(body.ids as string[])
-    }
-  } catch { /* no body = fix all */ }
+  const rateCheck = securityFixLimiter(`${auth.user.workspace_id}:${auth.user.id}`)
+  if (rateCheck) return rateCheck
+
+  // Omit ids to intentionally fix all currently supported checks.
+  const parsed = fixRequestSchema.safeParse(await request.json().catch(() => null))
+  if (!parsed.success) {
+    return NextResponse.json({ error: 'Invalid security fix request' }, { status: 400 })
+  }
+  const targetIds = parsed.data.ids ? new Set(parsed.data.ids) : null
 
   const shouldFix = (id: string) => !targetIds || targetIds.has(id)
 
@@ -204,12 +214,20 @@ export async function POST(request: NextRequest) {
   const ocFixIds = ['config_permissions', 'gateway_auth', 'gateway_bind', 'elevated_disabled', 'dm_isolation', 'exec_restricted', 'control_ui_device_auth', 'control_ui_insecure_auth', 'fs_workspace_only', 'log_redaction']
   const configPath = config.openclawConfigPath
   if (ocFixIds.some(id => shouldFix(id)) && configPath && existsSync(configPath)) {
+    let releaseConfigLock: (() => void) | undefined
     let ocConfig: any
     try {
+      releaseConfigLock = acquireFileLockSync(configPath)
       ocConfig = JSON.parse(readFileSync(configPath, 'utf-8'))
-    } catch { ocConfig = null }
+    } catch (error: any) {
+      ocConfig = null
+      if (error?.code === 'EBUSY') {
+        results.push({ id: 'config_write', name: 'Write OpenClaw config', fixed: false, detail: error.message })
+      }
+    }
 
-    if (ocConfig) {
+    try {
+      if (ocConfig) {
       let configChanged = false
 
       // Fix config file permissions
@@ -272,10 +290,10 @@ export async function POST(request: NextRequest) {
       if (shouldFix('exec_restricted')) {
         if (!ocConfig.tools) ocConfig.tools = {}
         if (!ocConfig.tools.exec) ocConfig.tools.exec = {}
-        if (ocConfig.tools.exec.security !== 'sandbox' && ocConfig.tools.exec.security !== 'deny') {
-          ocConfig.tools.exec.security = 'sandbox'
+        if (ocConfig.tools.exec.security !== 'allowlist' && ocConfig.tools.exec.security !== 'deny') {
+          ocConfig.tools.exec.security = 'allowlist'
           configChanged = true
-          results.push({ id: 'exec_restricted', name: 'Exec tool restriction', fixed: true, detail: 'Set exec security to "sandbox"', fixSafety: FIX_SAFETY['exec_restricted'] })
+          results.push({ id: 'exec_restricted', name: 'Exec tool restriction', fixed: true, detail: 'Set exec security to "allowlist"', fixSafety: FIX_SAFETY['exec_restricted'] })
         }
       }
 
@@ -320,11 +338,14 @@ export async function POST(request: NextRequest) {
 
       if (configChanged) {
         try {
-          writeFileSync(configPath, JSON.stringify(ocConfig, null, 2) + '\n', 'utf-8')
+          atomicReplaceFileSync(configPath, JSON.stringify(ocConfig, null, 2) + '\n')
         } catch (e: any) {
           results.push({ id: 'config_write', name: 'Write OpenClaw config', fixed: false, detail: e.message })
         }
       }
+    }
+    } finally {
+      releaseConfigLock?.()
     }
   }
 
@@ -338,7 +359,14 @@ export async function POST(request: NextRequest) {
       const files = wwOutput.split('\n').filter(Boolean).slice(0, 20)
       let fixedCount = 0
       for (const f of files) {
-        try { chmodSync(f, 0o755); fixedCount++ } catch { /* skip */ }
+        try {
+          const currentMode = statSync(f).mode & 0o777
+          const hardenedMode = currentMode & ~0o002
+          if (hardenedMode !== currentMode) {
+            chmodSync(f, hardenedMode)
+            fixedCount++
+          }
+        } catch { /* skip */ }
       }
       if (fixedCount > 0) {
         results.push({ id: 'world_writable', name: 'World-writable files', fixed: true, detail: `Fixed permissions on ${fixedCount} file(s)`, fixSafety: FIX_SAFETY['world_writable'] })
@@ -350,8 +378,8 @@ export async function POST(request: NextRequest) {
   try {
     const db = getDatabase()
     db.prepare(
-      'INSERT INTO audit_log (action, actor, detail) VALUES (?, ?, ?)'
-    ).run('security.auto_fix', auth.user.username, JSON.stringify({ fixes: results.filter(r => r.fixed).map(r => r.id) }))
+      'INSERT INTO audit_log (action, actor, detail, workspace_id) VALUES (?, ?, ?, ?)'
+    ).run('security.auto_fix', auth.user.username, JSON.stringify({ fixes: results.filter(r => r.fixed).map(r => r.id) }), auth.user.workspace_id ?? 1)
   } catch { /* non-critical */ }
 
   const fixed = results.filter(r => r.fixed).length

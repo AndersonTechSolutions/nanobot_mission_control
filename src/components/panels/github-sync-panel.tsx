@@ -1,7 +1,23 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
+import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
+import { apiFetch, ApiError } from '@/lib/api-client'
+
+/** Pull a server-provided `error` string out of an ApiError's parsed payload, if present. */
+function apiErrorMessage(err: unknown): string | undefined {
+  if (
+    err instanceof ApiError &&
+    typeof err.payload === 'object' &&
+    err.payload !== null &&
+    'error' in err.payload &&
+    typeof (err.payload as { error: unknown }).error === 'string'
+  ) {
+    return (err.payload as { error: string }).error
+  }
+  return undefined
+}
 
 interface GitHubLabel {
   name: string
@@ -46,6 +62,7 @@ interface LinkedTask {
 }
 
 export function GitHubSyncPanel() {
+  const t = useTranslations('githubSync')
   // Connection status
   const [tokenStatus, setTokenStatus] = useState<{ connected: boolean; user?: string } | null>(null)
 
@@ -89,13 +106,12 @@ export function GitHubSyncPanel() {
   // Check GitHub token status
   const checkToken = useCallback(async () => {
     try {
-      const res = await fetch('/api/integrations', {
+      const data = await apiFetch<{ ok?: boolean; detail?: string }>('/api/integrations', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'test', integrationId: 'github' }),
         signal: AbortSignal.timeout(8000),
+        redirectOnUnauthenticated: false,
       })
-      const data = await res.json()
       setTokenStatus({
         connected: data.ok === true,
         user: data.detail?.replace('User: ', ''),
@@ -108,52 +124,49 @@ export function GitHubSyncPanel() {
   // Fetch sync history
   const fetchSyncHistory = useCallback(async () => {
     try {
-      const res = await fetch('/api/github', {
+      const data = await apiFetch<{ syncs?: SyncRecord[] }>('/api/github', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'status' }),
         signal: AbortSignal.timeout(8000),
+        redirectOnUnauthenticated: false,
       })
-      if (res.ok) {
-        const data = await res.json()
-        setSyncHistory(data.syncs || [])
-      }
+      setSyncHistory(data.syncs || [])
     } catch { /* ignore */ }
   }, [])
 
   // Fetch linked tasks
   const fetchLinkedTasks = useCallback(async () => {
     try {
-      const res = await fetch('/api/tasks?limit=200', { signal: AbortSignal.timeout(8000) })
-      if (res.ok) {
-        const data = await res.json()
-        const linked = (data.tasks || []).filter(
-          (t: LinkedTask) => t.metadata?.github_repo
-        )
-        setLinkedTasks(linked)
-      }
+      const data = await apiFetch<{ tasks?: LinkedTask[] }>('/api/tasks?limit=200', {
+        signal: AbortSignal.timeout(8000),
+        redirectOnUnauthenticated: false,
+      })
+      const linked = (data.tasks || []).filter(
+        (t: LinkedTask) => t.metadata?.github_repo
+      )
+      setLinkedTasks(linked)
     } catch { /* ignore */ }
   }, [])
 
   // Fetch projects for two-way sync
   const fetchProjects = useCallback(async () => {
     try {
-      const res = await fetch('/api/projects', { signal: AbortSignal.timeout(8000) })
-      if (res.ok) {
-        const data = await res.json()
-        setProjects(data.projects || [])
-      }
+      const data = await apiFetch<{ projects?: typeof projects }>('/api/projects', {
+        signal: AbortSignal.timeout(8000),
+        redirectOnUnauthenticated: false,
+      })
+      setProjects(data.projects || [])
     } catch { /* ignore */ }
   }, [])
 
   // Fetch agents for assign dropdown
   const fetchAgents = useCallback(async () => {
     try {
-      const res = await fetch('/api/agents', { signal: AbortSignal.timeout(8000) })
-      if (res.ok) {
-        const data = await res.json()
-        setAgents((data.agents || []).map((a: any) => ({ name: a.name })))
-      }
+      const data = await apiFetch<{ agents?: { name: string }[] }>('/api/agents', {
+        signal: AbortSignal.timeout(8000),
+        redirectOnUnauthenticated: false,
+      })
+      setAgents((data.agents || []).map((a: any) => ({ name: a.name })))
     } catch { /* ignore */ }
   }, [])
 
@@ -165,7 +178,7 @@ export function GitHubSyncPanel() {
   // Preview issues from GitHub
   const handlePreview = async () => {
     if (!repo) {
-      showFeedback(false, 'Enter a repository (owner/repo)')
+      showFeedback(false, t('enterRepo'))
       return
     }
     setPreviewing(true)
@@ -174,16 +187,18 @@ export function GitHubSyncPanel() {
     try {
       const params = new URLSearchParams({ action: 'issues', repo, state: stateFilter })
       if (labelFilter) params.set('labels', labelFilter)
-      const res = await fetch(`/api/github?${params}`)
-      const data = await res.json()
-      if (res.ok) {
-        setPreviewIssues(data.issues || [])
-        if (data.issues?.length === 0) showFeedback(true, 'No issues found matching filters')
+      const data = await apiFetch<{ issues?: GitHubIssue[] }>(`/api/github?${params}`)
+      setPreviewIssues(data.issues || [])
+      if (data.issues?.length === 0) showFeedback(true, t('noIssuesFound'))
+    } catch (err) {
+      // Preserve the original two-tier failure handling: HTTP errors surfaced the
+      // server-provided message (or a generic fetch-issues failure), while genuine
+      // network failures showed the network error string.
+      if (err instanceof ApiError && err.code !== 'NETWORK_ERROR') {
+        showFeedback(false, apiErrorMessage(err) || t('failedFetchIssues'))
       } else {
-        showFeedback(false, data.error || 'Failed to fetch issues')
+        showFeedback(false, t('networkError'))
       }
-    } catch {
-      showFeedback(false, 'Network error')
     } finally {
       setPreviewing(false)
     }
@@ -195,9 +210,8 @@ export function GitHubSyncPanel() {
     setSyncing(true)
     setSyncResult(null)
     try {
-      const res = await fetch('/api/github', {
+      const data = await apiFetch<{ imported: number; skipped: number; errors: number }>('/api/github', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'sync',
           repo,
@@ -206,18 +220,17 @@ export function GitHubSyncPanel() {
           assignAgent: assignAgent || undefined,
         }),
       })
-      const data = await res.json()
-      if (res.ok) {
-        setSyncResult({ imported: data.imported, skipped: data.skipped, errors: data.errors })
-        showFeedback(true, `Imported ${data.imported} issue${data.imported === 1 ? '' : 's'}, skipped ${data.skipped}`)
-        setPreviewIssues([])
-        fetchSyncHistory()
-        fetchLinkedTasks()
+      setSyncResult({ imported: data.imported, skipped: data.skipped, errors: data.errors })
+      showFeedback(true, t('importedFeedback', { imported: data.imported, skipped: data.skipped }))
+      setPreviewIssues([])
+      fetchSyncHistory()
+      fetchLinkedTasks()
+    } catch (err) {
+      if (err instanceof ApiError && err.code !== 'NETWORK_ERROR') {
+        showFeedback(false, apiErrorMessage(err) || t('syncFailed'))
       } else {
-        showFeedback(false, data.error || 'Sync failed')
+        showFeedback(false, t('networkError'))
       }
-    } catch {
-      showFeedback(false, 'Network error')
     } finally {
       setSyncing(false)
     }
@@ -226,40 +239,36 @@ export function GitHubSyncPanel() {
   // Two-way sync handlers
   const handleToggleSync = async (project: typeof projects[number]) => {
     try {
-      const res = await fetch(`/api/projects/${project.id}`, {
+      await apiFetch(`/api/projects/${project.id}`, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ github_sync_enabled: !project.github_sync_enabled }),
       })
-      if (res.ok) {
-        await fetchProjects()
-        showFeedback(true, `Sync ${project.github_sync_enabled ? 'disabled' : 'enabled'} for ${project.name}`)
+      await fetchProjects()
+      showFeedback(true, `Sync ${project.github_sync_enabled ? 'disabled' : 'enabled'} for ${project.name}`)
+    } catch (err) {
+      if (err instanceof ApiError && err.code !== 'NETWORK_ERROR') {
+        showFeedback(false, apiErrorMessage(err) || t('failedToggleSync'))
       } else {
-        const data = await res.json()
-        showFeedback(false, data.error || 'Failed to toggle sync')
+        showFeedback(false, t('networkError'))
       }
-    } catch {
-      showFeedback(false, 'Network error')
     }
   }
 
   const handleSyncProject = async (projectId: number) => {
     setSyncingProjectId(projectId)
     try {
-      const res = await fetch('/api/github/sync', {
+      const data = await apiFetch<{ message?: string }>('/api/github/sync', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'trigger', project_id: projectId }),
       })
-      const data = await res.json()
-      if (res.ok) {
-        showFeedback(true, data.message || 'Sync triggered')
-        fetchSyncHistory()
+      showFeedback(true, data.message || 'Sync triggered')
+      fetchSyncHistory()
+    } catch (err) {
+      if (err instanceof ApiError && err.code !== 'NETWORK_ERROR') {
+        showFeedback(false, apiErrorMessage(err) || t('syncFailed'))
       } else {
-        showFeedback(false, data.error || 'Sync failed')
+        showFeedback(false, t('networkError'))
       }
-    } catch {
-      showFeedback(false, 'Network error')
     } finally {
       setSyncingProjectId(null)
     }
@@ -268,20 +277,18 @@ export function GitHubSyncPanel() {
   const handleSyncAll = async () => {
     setSyncingProjectId(-1)
     try {
-      const res = await fetch('/api/github/sync', {
+      const data = await apiFetch<{ message?: string }>('/api/github/sync', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'trigger-all' }),
       })
-      const data = await res.json()
-      if (res.ok) {
-        showFeedback(true, data.message || 'Sync triggered for all projects')
-        fetchSyncHistory()
+      showFeedback(true, data.message || 'Sync triggered for all projects')
+      fetchSyncHistory()
+    } catch (err) {
+      if (err instanceof ApiError && err.code !== 'NETWORK_ERROR') {
+        showFeedback(false, apiErrorMessage(err) || t('syncFailed'))
       } else {
-        showFeedback(false, data.error || 'Sync failed')
+        showFeedback(false, t('networkError'))
       }
-    } catch {
-      showFeedback(false, 'Network error')
     } finally {
       setSyncingProjectId(null)
     }
@@ -291,7 +298,7 @@ export function GitHubSyncPanel() {
     return (
       <div className="p-6 flex flex-col items-center justify-center gap-3 min-h-[200px]">
         <div className="w-5 h-5 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-        <span className="text-sm text-muted-foreground">Loading GitHub sync...</span>
+        <span className="text-sm text-muted-foreground">{t('loading')}</span>
       </div>
     )
   }
@@ -301,9 +308,9 @@ export function GitHubSyncPanel() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-lg font-semibold text-foreground">GitHub Issues Sync</h2>
+          <h2 className="text-lg font-semibold text-foreground">{t('title')}</h2>
           <p className="text-xs text-muted-foreground mt-0.5">
-            Import GitHub issues as Mission Control tasks
+            {t('subtitle')}
           </p>
         </div>
         {/* Connection status badge */}
@@ -317,8 +324,8 @@ export function GitHubSyncPanel() {
               tokenStatus?.connected ? 'bg-green-500' : 'bg-destructive'
             }`} />
             {tokenStatus?.connected
-              ? `GitHub: ${tokenStatus.user || 'connected'}`
-              : 'GitHub: not configured'}
+              ? t('connectedAs', { user: tokenStatus.user || 'connected' })
+              : t('notConfigured')}
           </span>
         </div>
       </div>
@@ -329,10 +336,9 @@ export function GitHubSyncPanel() {
           <div className="flex items-start gap-3">
             <span className="text-amber-400 text-lg mt-0.5">!</span>
             <div className="space-y-1">
-              <p className="text-sm font-medium text-foreground">GitHub token not configured</p>
+              <p className="text-sm font-medium text-foreground">{t('tokenNotConfigured')}</p>
               <p className="text-xs text-muted-foreground">
-                Set <code className="px-1 py-0.5 rounded bg-secondary text-foreground font-mono text-2xs">GITHUB_TOKEN</code> in
-                Integrations to enable issue sync. You can still browse sync history and linked tasks below.
+                {t.rich('tokenNotConfiguredDesc', { code: (chunks) => <code className="px-1 py-0.5 rounded bg-secondary text-foreground font-mono text-2xs">{chunks}</code> })}
               </p>
             </div>
           </div>
@@ -351,66 +357,66 @@ export function GitHubSyncPanel() {
       {/* Sync result banner */}
       {syncResult && (
         <div className="rounded-lg p-3 text-xs bg-blue-500/10 text-blue-400 flex items-center gap-4">
-          <span>Imported: {syncResult.imported}</span>
-          <span>Skipped: {syncResult.skipped}</span>
-          {syncResult.errors > 0 && <span className="text-destructive">Errors: {syncResult.errors}</span>}
+          <span>{t('syncResultImported', { count: syncResult.imported })}</span>
+          <span>{t('syncResultSkipped', { count: syncResult.skipped })}</span>
+          {syncResult.errors > 0 && <span className="text-destructive">{t('syncResultErrors', { count: syncResult.errors })}</span>}
         </div>
       )}
 
       {/* Import Issues Form */}
       <div className="rounded-lg border border-border bg-card overflow-hidden">
         <div className="px-4 py-3 border-b border-border">
-          <h3 className="text-sm font-medium text-foreground">Import Issues</h3>
+          <h3 className="text-sm font-medium text-foreground">{t('importIssues')}</h3>
         </div>
         <div className="p-4 space-y-3">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             {/* Repo input */}
             <div>
-              <label className="text-xs text-muted-foreground mb-1 block">Repository</label>
+              <label className="text-xs text-muted-foreground mb-1 block">{t('labelRepository')}</label>
               <input
                 type="text"
                 value={repo}
                 onChange={e => setRepo(e.target.value)}
-                placeholder="owner/repo"
-                className="w-full px-3 py-1.5 text-sm rounded-md border border-border bg-background text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary"
+                placeholder={t('placeholderRepo')}
+                className="w-full px-3 py-1.5 text-sm rounded-md border border-border bg-background text-foreground placeholder:text-muted-foreground/50 focus:outline-hidden focus:ring-1 focus:ring-primary"
               />
             </div>
 
             {/* Label filter */}
             <div>
-              <label className="text-xs text-muted-foreground mb-1 block">Labels (optional)</label>
+              <label className="text-xs text-muted-foreground mb-1 block">{t('labelLabels')}</label>
               <input
                 type="text"
                 value={labelFilter}
                 onChange={e => setLabelFilter(e.target.value)}
-                placeholder="bug,enhancement"
-                className="w-full px-3 py-1.5 text-sm rounded-md border border-border bg-background text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary"
+                placeholder={t('placeholderLabels')}
+                className="w-full px-3 py-1.5 text-sm rounded-md border border-border bg-background text-foreground placeholder:text-muted-foreground/50 focus:outline-hidden focus:ring-1 focus:ring-primary"
               />
             </div>
 
             {/* State filter */}
             <div>
-              <label className="text-xs text-muted-foreground mb-1 block">State</label>
+              <label className="text-xs text-muted-foreground mb-1 block">{t('labelState')}</label>
               <select
                 value={stateFilter}
                 onChange={e => setStateFilter(e.target.value as any)}
-                className="w-full px-3 py-1.5 text-sm rounded-md border border-border bg-background text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                className="w-full px-3 py-1.5 text-sm rounded-md border border-border bg-background text-foreground focus:outline-hidden focus:ring-1 focus:ring-primary"
               >
-                <option value="open">Open</option>
-                <option value="closed">Closed</option>
-                <option value="all">All</option>
+                <option value="open">{t('stateOpen')}</option>
+                <option value="closed">{t('stateClosed')}</option>
+                <option value="all">{t('stateAll')}</option>
               </select>
             </div>
 
             {/* Assign to agent */}
             <div>
-              <label className="text-xs text-muted-foreground mb-1 block">Assign to Agent (optional)</label>
+              <label className="text-xs text-muted-foreground mb-1 block">{t('labelAssignAgent')}</label>
               <select
                 value={assignAgent}
                 onChange={e => setAssignAgent(e.target.value)}
-                className="w-full px-3 py-1.5 text-sm rounded-md border border-border bg-background text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+                className="w-full px-3 py-1.5 text-sm rounded-md border border-border bg-background text-foreground focus:outline-hidden focus:ring-1 focus:ring-primary"
               >
-                <option value="">Unassigned</option>
+                <option value="">{t('unassigned')}</option>
                 {agents.map(a => (
                   <option key={a.name} value={a.name}>{a.name}</option>
                 ))}
@@ -435,7 +441,7 @@ export function GitHubSyncPanel() {
                   <path d="M11 11l3 3" />
                 </svg>
               )}
-              Preview
+              {t('buttonPreview')}
             </Button>
             <Button
               onClick={handleImport}
@@ -453,7 +459,7 @@ export function GitHubSyncPanel() {
                   <path d="M3 12v2h10v-2" />
                 </svg>
               )}
-              Import
+              {t('buttonImport')}
             </Button>
           </div>
         </div>
@@ -462,7 +468,7 @@ export function GitHubSyncPanel() {
       {/* Two-Way Sync */}
       <div className="rounded-lg border border-border bg-card overflow-hidden">
         <div className="px-4 py-3 border-b border-border flex items-center justify-between">
-          <h3 className="text-sm font-medium text-foreground">Two-Way Sync</h3>
+          <h3 className="text-sm font-medium text-foreground">{t('twoWaySync')}</h3>
           <Button
             variant="outline"
             size="xs"
@@ -470,7 +476,7 @@ export function GitHubSyncPanel() {
             disabled={syncingProjectId !== null}
             className="flex items-center gap-1.5"
           >
-            Sync All
+            {t('syncAll')}
           </Button>
         </div>
         <div className="divide-y divide-border/50">
@@ -490,7 +496,7 @@ export function GitHubSyncPanel() {
                   onClick={() => handleToggleSync(project)}
                   className="text-xs"
                 >
-                  {project.github_sync_enabled ? 'Disable' : 'Enable'}
+                  {project.github_sync_enabled ? t('disableSync') : t('enableSync')}
                 </Button>
                 {project.github_sync_enabled && (
                   <Button
@@ -508,7 +514,7 @@ export function GitHubSyncPanel() {
                         <path d="M13 2v4h-4M3 14v-4h4" />
                       </svg>
                     )}
-                    Sync
+                    {t('syncButton')}
                   </Button>
                 )}
               </div>
@@ -516,7 +522,7 @@ export function GitHubSyncPanel() {
           ))}
           {projects.filter(p => p.github_repo).length === 0 && (
             <div className="px-4 py-6 text-center text-xs text-muted-foreground">
-              No projects linked to GitHub repos. Set a GitHub repo in Project Management.
+              {t('noProjectsLinked')}
             </div>
           )}
         </div>
@@ -527,18 +533,18 @@ export function GitHubSyncPanel() {
         <div className="rounded-lg border border-border bg-card overflow-hidden">
           <div className="px-4 py-3 border-b border-border flex items-center justify-between">
             <h3 className="text-sm font-medium text-foreground">
-              Preview ({previewIssues.length} issues)
+              {t('previewTitle', { count: previewIssues.length })}
             </h3>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-border text-muted-foreground">
-                  <th className="text-left px-4 py-2 font-medium">#</th>
-                  <th className="text-left px-4 py-2 font-medium">Title</th>
-                  <th className="text-left px-4 py-2 font-medium">Labels</th>
-                  <th className="text-left px-4 py-2 font-medium">State</th>
-                  <th className="text-left px-4 py-2 font-medium">Created</th>
+                  <th className="text-left px-4 py-2 font-medium">{t('colNumber')}</th>
+                  <th className="text-left px-4 py-2 font-medium">{t('colTitle')}</th>
+                  <th className="text-left px-4 py-2 font-medium">{t('colLabels')}</th>
+                  <th className="text-left px-4 py-2 font-medium">{t('colState')}</th>
+                  <th className="text-left px-4 py-2 font-medium">{t('colCreated')}</th>
                 </tr>
               </thead>
               <tbody>
@@ -590,17 +596,17 @@ export function GitHubSyncPanel() {
       {/* Sync History */}
       <div className="rounded-lg border border-border bg-card overflow-hidden">
         <div className="px-4 py-3 border-b border-border">
-          <h3 className="text-sm font-medium text-foreground">Sync History</h3>
+          <h3 className="text-sm font-medium text-foreground">{t('syncHistory')}</h3>
         </div>
         {syncHistory.length > 0 ? (
           <div className="overflow-x-auto">
             <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-border text-muted-foreground">
-                  <th className="text-left px-4 py-2 font-medium">Repo</th>
-                  <th className="text-left px-4 py-2 font-medium">Issues</th>
-                  <th className="text-left px-4 py-2 font-medium">Status</th>
-                  <th className="text-left px-4 py-2 font-medium">Synced At</th>
+                  <th className="text-left px-4 py-2 font-medium">{t('colRepo')}</th>
+                  <th className="text-left px-4 py-2 font-medium">{t('colIssues')}</th>
+                  <th className="text-left px-4 py-2 font-medium">{t('colStatus')}</th>
+                  <th className="text-left px-4 py-2 font-medium">{t('colSyncedAt')}</th>
                 </tr>
               </thead>
               <tbody>
@@ -629,7 +635,7 @@ export function GitHubSyncPanel() {
           </div>
         ) : (
           <div className="px-4 py-6 text-center text-xs text-muted-foreground">
-            No sync history yet. Import issues above to get started.
+            {t('noSyncHistory')}
           </div>
         )}
       </div>
@@ -638,7 +644,7 @@ export function GitHubSyncPanel() {
       <div className="rounded-lg border border-border bg-card overflow-hidden">
         <div className="px-4 py-3 border-b border-border">
           <h3 className="text-sm font-medium text-foreground">
-            Linked Tasks{linkedTasks.length > 0 ? ` (${linkedTasks.length})` : ''}
+            {linkedTasks.length > 0 ? t('linkedTasksWithCount', { count: linkedTasks.length }) : t('linkedTasks')}
           </h3>
         </div>
         {linkedTasks.length > 0 ? (
@@ -646,11 +652,11 @@ export function GitHubSyncPanel() {
             <table className="w-full text-xs">
               <thead>
                 <tr className="border-b border-border text-muted-foreground">
-                  <th className="text-left px-4 py-2 font-medium">Task</th>
-                  <th className="text-left px-4 py-2 font-medium">Status</th>
-                  <th className="text-left px-4 py-2 font-medium">Priority</th>
-                  <th className="text-left px-4 py-2 font-medium">GitHub</th>
-                  <th className="text-left px-4 py-2 font-medium">Synced</th>
+                  <th className="text-left px-4 py-2 font-medium">{t('colTask')}</th>
+                  <th className="text-left px-4 py-2 font-medium">{t('colStatus')}</th>
+                  <th className="text-left px-4 py-2 font-medium">{t('colPriority')}</th>
+                  <th className="text-left px-4 py-2 font-medium">{t('colGitHub')}</th>
+                  <th className="text-left px-4 py-2 font-medium">{t('colSynced')}</th>
                 </tr>
               </thead>
               <tbody>
@@ -698,7 +704,7 @@ export function GitHubSyncPanel() {
           </div>
         ) : (
           <div className="px-4 py-6 text-center text-xs text-muted-foreground">
-            No tasks linked to GitHub issues yet.
+            {t('noLinkedTasks')}
           </div>
         )}
       </div>

@@ -1,7 +1,9 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
+import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
+import { apiFetch, ApiError } from '@/lib/api-client'
 
 interface WorkflowTemplate {
   id: number
@@ -49,7 +51,30 @@ interface PipelineRun {
   created_at: number
 }
 
+interface PipelineMutationResult {
+  error?: string
+  run?: { id?: number }
+}
+
+function pipelineError(error: unknown, fallback: string): string {
+  if (
+    error instanceof ApiError &&
+    error.payload !== null &&
+    typeof error.payload === 'object' &&
+    'error' in error.payload &&
+    typeof (error.payload as { error?: unknown }).error === 'string'
+  ) {
+    return (error.payload as { error: string }).error
+  }
+  return fallback
+}
+
+function isPipelineNetworkFailure(error: unknown): boolean {
+  return error instanceof ApiError && error.code === 'NETWORK_ERROR'
+}
+
 export function PipelineTab() {
+  const t = useTranslations('pipeline')
   const [templates, setTemplates] = useState<WorkflowTemplate[]>([])
   const [pipelines, setPipelines] = useState<Pipeline[]>([])
   const [runs, setRuns] = useState<PipelineRun[]>([])
@@ -68,9 +93,12 @@ export function PipelineTab() {
 
   const fetchData = useCallback(async () => {
     const [tRes, pRes, rRes] = await Promise.all([
-      fetch('/api/workflows').then(r => r.json()).catch(() => ({ templates: [] })),
-      fetch('/api/pipelines').then(r => r.json()).catch(() => ({ pipelines: [] })),
-      fetch('/api/pipelines/run?limit=10').then(r => r.json()).catch(() => ({ runs: [] })),
+      apiFetch<{ templates?: WorkflowTemplate[] }>('/api/workflows')
+        .catch(() => ({ templates: [] })),
+      apiFetch<{ pipelines?: Pipeline[] }>('/api/pipelines')
+        .catch(() => ({ pipelines: [] })),
+      apiFetch<{ runs?: PipelineRun[] }>('/api/pipelines/run?limit=10')
+        .catch(() => ({ runs: [] })),
     ])
     setTemplates(tRes.templates || [])
     setPipelines(pRes.pipelines || [])
@@ -123,21 +151,19 @@ export function PipelineTab() {
         description: formDesc || null,
         steps: formSteps.map(s => ({ template_id: s.template_id, on_failure: s.on_failure })),
       }
-      const res = await fetch('/api/pipelines', {
+      await apiFetch<Response>('/api/pipelines', {
         method: formMode === 'edit' ? 'PUT' : 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
+        raw: true,
       })
-      if (res.ok) {
-        closeForm()
-        fetchData()
-        setResult({ ok: true, text: formMode === 'edit' ? 'Pipeline updated' : 'Pipeline created' })
-      } else {
-        const data = await res.json()
-        setResult({ ok: false, text: data.error || 'Failed' })
-      }
-    } catch {
-      setResult({ ok: false, text: 'Network error' })
+      closeForm()
+      fetchData()
+      setResult({ ok: true, text: formMode === 'edit' ? 'Pipeline updated' : 'Pipeline created' })
+    } catch (err) {
+      setResult({
+        ok: false,
+        text: pipelineError(err, isPipelineNetworkFailure(err) ? 'Network error' : 'Failed'),
+      })
     }
   }
 
@@ -150,7 +176,11 @@ export function PipelineTab() {
   }
 
   const deletePipeline = async (id: number) => {
-    await fetch(`/api/pipelines?id=${id}`, { method: 'DELETE' })
+    try {
+      await apiFetch<Response>(`/api/pipelines?id=${id}`, { method: 'DELETE', raw: true })
+    } catch (err) {
+      if (isPipelineNetworkFailure(err)) return
+    }
     if (expandedId === id) setExpandedId(null)
     fetchData()
   }
@@ -158,20 +188,20 @@ export function PipelineTab() {
   const runPipeline = async (id: number) => {
     setSpawning(id)
     try {
-      const res = await fetch('/api/pipelines/run', {
+      const data = await apiFetch<PipelineMutationResult>('/api/pipelines/run', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'start', pipeline_id: id }),
       })
-      const data = await res.json()
-      if (res.ok) {
-        setResult({ ok: true, text: `Pipeline started (run #${data.run?.id})` })
-        fetchData()
-      } else {
-        setResult({ ok: false, text: data.error || 'Failed to start' })
-      }
-    } catch {
-      setResult({ ok: false, text: 'Network error' })
+      setResult({ ok: true, text: `Pipeline started (run #${data.run?.id})` })
+      fetchData()
+    } catch (err) {
+      setResult({
+        ok: false,
+        text: pipelineError(
+          err,
+          isPipelineNetworkFailure(err) ? 'Network error' : 'Failed to start',
+        ),
+      })
     } finally {
       setSpawning(null)
     }
@@ -179,24 +209,28 @@ export function PipelineTab() {
 
   const advanceRun = async (runId: number, success: boolean) => {
     try {
-      await fetch('/api/pipelines/run', {
+      await apiFetch<Response>('/api/pipelines/run', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'advance', run_id: runId, success }),
+        raw: true,
       })
-      fetchData()
-    } catch { /* ignore */ }
+    } catch (err) {
+      if (isPipelineNetworkFailure(err)) return
+    }
+    fetchData()
   }
 
   const cancelRun = async (runId: number) => {
     try {
-      await fetch('/api/pipelines/run', {
+      await apiFetch<Response>('/api/pipelines/run', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'cancel', run_id: runId }),
+        raw: true,
       })
-      fetchData()
-    } catch { /* ignore */ }
+    } catch (err) {
+      if (isPipelineNetworkFailure(err)) return
+    }
+    fetchData()
   }
 
   // Active runs (running pipelines shown at top)
@@ -222,30 +256,30 @@ export function PipelineTab() {
 
       {/* Header */}
       <div className="flex items-center justify-between">
-        <span className="text-xs text-muted-foreground">{pipelines.length} pipelines</span>
+        <span className="text-xs text-muted-foreground">{t('pipelineCount', { count: pipelines.length })}</span>
         <Button
           onClick={() => formMode !== 'hidden' ? closeForm() : setFormMode('create')}
           variant="link"
           size="xs"
         >
-          {formMode !== 'hidden' ? 'Cancel' : '+ New Pipeline'}
+          {formMode !== 'hidden' ? t('cancel') : t('newPipeline')}
         </Button>
       </div>
 
       {/* Create/Edit form */}
       {formMode !== 'hidden' && (
         <div className="p-3 rounded-lg bg-secondary/50 border border-border space-y-2">
-          <span className="text-xs font-medium">{formMode === 'edit' ? 'Edit Pipeline' : 'New Pipeline'}</span>
+          <span className="text-xs font-medium">{formMode === 'edit' ? t('editPipeline') : t('newPipeline')}</span>
           <input
             value={formName}
             onChange={e => setFormName(e.target.value)}
-            placeholder="Pipeline name"
+            placeholder={t('pipelineNamePlaceholder')}
             className="w-full h-8 px-2 rounded-md bg-secondary border border-border text-sm text-foreground"
           />
           <input
             value={formDesc}
             onChange={e => setFormDesc(e.target.value)}
-            placeholder="Description (optional)"
+            placeholder={t('descriptionPlaceholder')}
             className="w-full h-8 px-2 rounded-md bg-secondary border border-border text-sm text-foreground"
           />
 
@@ -263,8 +297,8 @@ export function PipelineTab() {
                   onChange={e => setFormSteps(s => s.map((st, idx) => idx === i ? { ...st, on_failure: e.target.value as 'stop' | 'continue' } : st))}
                   className="h-5 px-1 text-2xs rounded bg-secondary border border-border text-foreground"
                 >
-                  <option value="stop">Stop on fail</option>
-                  <option value="continue">Continue on fail</option>
+                  <option value="stop">{t('stopOnFail')}</option>
+                  <option value="continue">{t('continueOnFail')}</option>
                 </select>
                 <Button onClick={() => moveStep(i, -1)} variant="ghost" size="icon-xs" className="w-5 h-5" title="Move up">
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" className="w-3 h-3"><path d="M8 3v10M4 7l4-4 4 4" /></svg>
@@ -284,7 +318,7 @@ export function PipelineTab() {
               className="w-full h-7 px-2 rounded-md bg-secondary border border-border text-xs text-muted-foreground"
               defaultValue=""
             >
-              <option value="" disabled>+ Add workflow template as step...</option>
+              <option value="" disabled>{t('addStepPlaceholder')}</option>
               {templates.map(t => (
                 <option key={t.id} value={t.id}>{t.name} ({t.model})</option>
               ))}
@@ -297,7 +331,7 @@ export function PipelineTab() {
               disabled={!formName || formSteps.length < 2}
               size="xs"
             >
-              {formMode === 'edit' ? 'Update' : 'Save Pipeline'}
+              {formMode === 'edit' ? t('update') : t('savePipeline')}
             </Button>
           </div>
         </div>
@@ -306,8 +340,8 @@ export function PipelineTab() {
       {/* Pipeline list */}
       {pipelines.length === 0 && formMode === 'hidden' ? (
         <div className="text-center py-4">
-          <p className="text-sm text-muted-foreground mb-2">No pipelines yet</p>
-          <p className="text-xs text-muted-foreground">Create a pipeline to chain workflow templates together</p>
+          <p className="text-sm text-muted-foreground mb-2">{t('noPipelines')}</p>
+          <p className="text-xs text-muted-foreground">{t('noPipelinesHint')}</p>
         </div>
       ) : (
         <div className="space-y-1.5 max-h-64 overflow-y-auto">

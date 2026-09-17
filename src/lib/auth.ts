@@ -1,8 +1,35 @@
 import { createHash, randomBytes } from 'crypto'
 import { getDatabase } from './db'
-import { hashPassword, verifyPassword } from './password'
+import { hashPassword, verifyPassword, verifyPasswordWithRehashCheck } from './password'
 import { safeCompare } from './safe-compare'
 import { logSecurityEvent } from './security-events'
+import { extractClientIpFromTrusted } from './request'
+import { parseMcSessionCookieHeader } from './session-cookie'
+
+// Trusted IPs for proxy auth header (comma-separated)
+const PROXY_AUTH_TRUSTED_IPS = new Set(
+  (process.env.MC_PROXY_AUTH_TRUSTED_IPS || '').split(',').map(s => s.trim()).filter(Boolean)
+)
+
+// Log once at startup if proxy auth is misconfigured.
+// Deferred to avoid DB access during module initialization.
+let _proxyAuthMisconfigWarned = false
+function warnProxyAuthMisconfigOnce(): void {
+  if (_proxyAuthMisconfigWarned) return
+  _proxyAuthMisconfigWarned = true
+  try {
+    logSecurityEvent({
+      event_type: 'proxy_auth_misconfigured',
+      severity: 'critical',
+      source: 'auth',
+      detail: JSON.stringify({
+        reason: 'MC_PROXY_AUTH_HEADER is set but MC_PROXY_AUTH_TRUSTED_IPS is empty — proxy auth disabled',
+      }),
+      workspace_id: 1,
+      tenant_id: 1,
+    })
+  } catch {}
+}
 
 // Plugin hook: extensions can register a custom API key resolver without modifying this file.
 type AuthResolverHook = (apiKey: string, agentName: string | null) => User | null
@@ -21,7 +48,7 @@ export interface User {
   role: 'admin' | 'operator' | 'viewer'
   workspace_id: number
   tenant_id: number
-  provider?: 'local' | 'google'
+  provider?: 'local' | 'google' | 'proxy'
   email?: string | null
   avatar_url?: string | null
   is_approved?: number
@@ -30,6 +57,8 @@ export interface User {
   last_login_at: number | null
   /** Agent name when request is made on behalf of a specific agent (via X-Agent-Name header) */
   agent_name?: string | null
+  /** Numeric agent DB id — set only when authenticated via an agent-scoped API key */
+  agent_id?: number | null
 }
 
 export interface UserSession {
@@ -128,10 +157,11 @@ export function createSession(
   const resolvedWorkspaceId = workspaceId ?? ((db.prepare('SELECT workspace_id FROM users WHERE id = ?').get(userId) as { workspace_id?: number } | undefined)?.workspace_id || getDefaultWorkspaceContext().workspaceId)
   const resolvedTenantId = resolveTenantForWorkspace(resolvedWorkspaceId)
 
+  const tokenHash = hashSessionToken(token)
   db.prepare(`
     INSERT INTO user_sessions (token, user_id, expires_at, ip_address, user_agent, workspace_id, tenant_id)
     VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(token, userId, expiresAt, ipAddress || null, userAgent || null, resolvedWorkspaceId, resolvedTenantId)
+  `).run(tokenHash, userId, expiresAt, ipAddress || null, userAgent || null, resolvedWorkspaceId, resolvedTenantId)
 
   // Update user's last login
   db.prepare('UPDATE users SET last_login_at = ?, updated_at = ? WHERE id = ?').run(now, now, userId)
@@ -146,6 +176,7 @@ export function validateSession(token: string): (User & { sessionId: number }) |
   if (!token) return null
   const db = getDatabase()
   const now = Math.floor(Date.now() / 1000)
+  const tokenHash = hashSessionToken(token)
 
   const row = db.prepare(`
     SELECT u.id, u.username, u.display_name, u.role, u.provider, u.email, u.avatar_url, u.is_approved,
@@ -157,7 +188,7 @@ export function validateSession(token: string): (User & { sessionId: number }) |
     JOIN users u ON u.id = s.user_id
     LEFT JOIN workspaces w ON w.id = COALESCE(s.workspace_id, u.workspace_id, 1)
     WHERE s.token = ? AND s.expires_at > ?
-  `).get(token, now) as SessionQueryRow | undefined
+  `).get(tokenHash, now) as SessionQueryRow | undefined
 
   if (!row) return null
 
@@ -181,7 +212,8 @@ export function validateSession(token: string): (User & { sessionId: number }) |
 
 export function destroySession(token: string): void {
   const db = getDatabase()
-  db.prepare('DELETE FROM user_sessions WHERE token = ?').run(token)
+  const tokenHash = hashSessionToken(token)
+  db.prepare('DELETE FROM user_sessions WHERE token = ?').run(tokenHash)
 }
 
 export function destroyAllUserSessions(userId: number): void {
@@ -214,9 +246,17 @@ export function authenticateUser(username: string, password: string): User | nul
     try { logSecurityEvent({ event_type: 'auth_failure', severity: 'warning', source: 'auth', detail: JSON.stringify({ username, reason: 'not_approved' }), workspace_id: 1, tenant_id: 1 }) } catch {}
     return null
   }
-  if (!verifyPassword(password, row.password_hash)) {
+  const { valid, needsRehash } = verifyPasswordWithRehashCheck(password, row.password_hash)
+  if (!valid) {
     try { logSecurityEvent({ event_type: 'auth_failure', severity: 'warning', source: 'auth', detail: JSON.stringify({ username, reason: 'invalid_password' }), workspace_id: 1, tenant_id: 1 }) } catch {}
     return null
+  }
+  // Progressive rehash: upgrade hash to current scrypt cost on successful login
+  if (needsRehash) {
+    try {
+      db.prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?')
+        .run(hashPassword(password), Math.floor(Date.now() / 1000), row.id)
+    } catch { /* non-fatal — will rehash on next login */ }
   }
   return {
     id: row.id,
@@ -328,13 +368,87 @@ export function deleteUser(id: number): boolean {
  * Get user from request - checks session cookie or API key.
  * For API key auth, returns a synthetic "api" user.
  */
+/**
+ * Resolve a user by username for proxy auth.
+ * If the user does not exist and MC_PROXY_AUTH_DEFAULT_ROLE is set, auto-provisions them.
+ * Auto-provisioned users receive a random unusable password — they cannot log in locally.
+ */
+function resolveOrProvisionProxyUser(username: string): User | null {
+  try {
+    const db = getDatabase()
+    const { workspaceId } = getDefaultWorkspaceContext()
+
+    const row = db.prepare(`
+      SELECT u.id, u.username, u.display_name, u.role, u.workspace_id,
+             COALESCE(w.tenant_id, 1) as tenant_id,
+             u.provider, u.email, u.avatar_url, u.is_approved,
+             u.created_at, u.updated_at, u.last_login_at
+      FROM users u
+      LEFT JOIN workspaces w ON w.id = u.workspace_id
+      WHERE u.username = ?
+    `).get(username) as UserQueryRow | undefined
+
+    if (row) {
+      if ((row.is_approved ?? 1) !== 1) return null
+      return {
+        id: row.id,
+        username: row.username,
+        display_name: row.display_name,
+        role: row.role,
+        workspace_id: row.workspace_id || workspaceId,
+        tenant_id: resolveTenantForWorkspace(row.workspace_id || workspaceId),
+        provider: row.provider || 'local',
+        email: row.email ?? null,
+        avatar_url: row.avatar_url ?? null,
+        is_approved: row.is_approved ?? 1,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        last_login_at: row.last_login_at,
+      }
+    }
+
+    // Auto-provision if MC_PROXY_AUTH_DEFAULT_ROLE is configured
+    const defaultRole = (process.env.MC_PROXY_AUTH_DEFAULT_ROLE || '').trim()
+    if (!defaultRole || !(['viewer', 'operator', 'admin'] as const).includes(defaultRole as User['role'])) {
+      return null
+    }
+
+    // Random password — proxy users cannot log in via the local login form
+    return createUser(username, randomBytes(32).toString('hex'), username, defaultRole as User['role'])
+  } catch {
+    return null
+  }
+}
+
 export function getUserFromRequest(request: Request): User | null {
   // Extract agent identity header (optional, for attribution)
   const agentName = (request.headers.get('x-agent-name') || '').trim() || null
 
+  // Proxy / trusted-header auth (MC_PROXY_AUTH_HEADER)
+  // When the gateway has already authenticated the user and injects their username
+  // as a trusted header (e.g. X-Auth-Username from Envoy OIDC claimToHeaders),
+  // skip the local login form entirely.
+  // Requires MC_PROXY_AUTH_TRUSTED_IPS — without it, proxy auth is disabled
+  // and a critical security event is logged on the first request.
+  const proxyAuthHeader = (process.env.MC_PROXY_AUTH_HEADER || '').trim()
+  if (proxyAuthHeader) {
+    if (PROXY_AUTH_TRUSTED_IPS.size === 0) {
+      warnProxyAuthMisconfigOnce()
+    } else {
+      const clientIp = extractClientIpFromTrusted(request, PROXY_AUTH_TRUSTED_IPS, '')
+      if (clientIp && PROXY_AUTH_TRUSTED_IPS.has(clientIp)) {
+        const proxyUsername = (request.headers.get(proxyAuthHeader) || '').trim()
+        if (proxyUsername) {
+          const user = resolveOrProvisionProxyUser(proxyUsername)
+          if (user) return { ...user, agent_name: agentName }
+        }
+      }
+    }
+  }
+
   // Check session cookie
   const cookieHeader = request.headers.get('cookie') || ''
-  const sessionToken = parseCookie(cookieHeader, 'mc-session')
+  const sessionToken = parseMcSessionCookieHeader(cookieHeader)
   if (sessionToken) {
     const user = validateSession(sessionToken)
     if (user) return { ...user, agent_name: agentName }
@@ -342,9 +456,22 @@ export function getUserFromRequest(request: Request): User | null {
 
   // Check API key - DB override first, then env var
   const apiKey = extractApiKeyFromHeaders(request.headers)
-  const configuredApiKey = resolveActiveApiKey()
 
-  if (configuredApiKey && apiKey && safeCompare(apiKey, configuredApiKey)) {
+  if (apiKey && matchesGlobalApiKey(apiKey)) {
+    // FR-D2: Log warning when global admin API key is used.
+    // Prefer agent-scoped keys (POST /api/agents/{id}/keys) for least-privilege access.
+    try {
+      logSecurityEvent({
+        event_type: 'global_api_key_used',
+        severity: 'info',
+        source: 'auth',
+        agent_name: agentName || undefined,
+        detail: JSON.stringify({ hint: 'Consider using agent-scoped API keys for least-privilege access' }),
+        ip_address: request.headers.get('x-real-ip') || 'unknown',
+        workspace_id: getDefaultWorkspaceContext().workspaceId,
+        tenant_id: getDefaultWorkspaceContext().tenantId,
+      })
+    } catch { /* startup race */ }
     return {
       id: 0,
       username: 'api',
@@ -403,6 +530,7 @@ export function getUserFromRequest(request: Request): User | null {
             updated_at: now,
             last_login_at: now,
             agent_name: agent.name,
+            agent_id: agent.id,
           }
         }
       }
@@ -441,19 +569,36 @@ export function getUserFromRequest(request: Request): User | null {
 }
 
 /**
- * Resolve the active API key: check DB settings override first, then env var.
+ * Check a presented key against the active global API key.
+ *
+ * DB settings override the env var (same precedence as before):
+ * - 'security.api_key_hash' stores sha256(key) — compare hash-to-hash so the
+ *   plaintext key is never at rest in SQLite (S1).
+ * - Legacy 'security.api_key' (plaintext) is only honored when no hash row
+ *   exists; migration 051 converts and deletes it, so this is dead post-migration.
+ * - API_KEY env var is operator-controlled plaintext and compared directly.
  */
-function resolveActiveApiKey(): string {
+function matchesGlobalApiKey(presentedKey: string): boolean {
   try {
     const db = getDatabase()
-    const row = db.prepare(
+    const hashRow = db.prepare(
+      "SELECT value FROM settings WHERE key = 'security.api_key_hash'"
+    ).get() as { value: string } | undefined
+    if (hashRow?.value) {
+      return safeCompare(hashApiKey(presentedKey), hashRow.value)
+    }
+    // Legacy plaintext row (pre-migration databases only)
+    const legacyRow = db.prepare(
       "SELECT value FROM settings WHERE key = 'security.api_key'"
     ).get() as { value: string } | undefined
-    if (row?.value) return row.value
+    if (legacyRow?.value) {
+      return safeCompare(presentedKey, legacyRow.value)
+    }
   } catch {
     // DB not ready yet — fall back to env
   }
-  return (process.env.API_KEY || '').trim()
+  const envKey = (process.env.API_KEY || '').trim()
+  return envKey ? safeCompare(presentedKey, envKey) : false
 }
 
 function extractApiKeyFromHeaders(headers: Headers): string | null {
@@ -474,8 +619,12 @@ function extractApiKeyFromHeaders(headers: Headers): string | null {
   return null
 }
 
-function hashApiKey(rawKey: string): string {
+export function hashApiKey(rawKey: string): string {
   return createHash('sha256').update(rawKey).digest('hex')
+}
+
+function hashSessionToken(rawToken: string): string {
+  return createHash('sha256').update(rawToken).digest('hex')
 }
 
 function parseAgentScopes(raw: string): Set<string> {
@@ -498,7 +647,7 @@ function deriveRoleFromScopes(scopes: Set<string>): User['role'] {
  * Role hierarchy levels for access control.
  * viewer < operator < admin
  */
-const ROLE_LEVELS: Record<string, number> = { viewer: 0, operator: 1, admin: 2 }
+export const ROLE_LEVELS: Record<string, number> = { viewer: 0, operator: 1, admin: 2 }
 
 /**
  * Check if a user meets the minimum role requirement.
@@ -516,9 +665,4 @@ export function requireRole(
     return { error: `Requires ${minRole} role or higher`, status: 403 }
   }
   return { user }
-}
-
-function parseCookie(cookieHeader: string, name: string): string | null {
-  const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`))
-  return match ? decodeURIComponent(match[1]) : null
 }

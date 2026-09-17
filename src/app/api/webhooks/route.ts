@@ -5,32 +5,8 @@ import { randomBytes } from 'crypto'
 import { mutationLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
 import { validateBody, createWebhookSchema } from '@/lib/validation'
-
-const WEBHOOK_BLOCKED_HOSTNAMES = new Set([
-  'localhost', '127.0.0.1', '::1', '0.0.0.0',
-  'metadata.google.internal', 'metadata.internal', 'instance-data',
-])
-
-function isBlockedWebhookUrl(urlStr: string): boolean {
-  try {
-    const url = new URL(urlStr)
-    const hostname = url.hostname
-    if (WEBHOOK_BLOCKED_HOSTNAMES.has(hostname)) return true
-    if (hostname.endsWith('.local')) return true
-    // Block private IPv4 ranges
-    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname)) {
-      const parts = hostname.split('.').map(Number)
-      if (parts[0] === 10) return true
-      if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true
-      if (parts[0] === 192 && parts[1] === 168) return true
-      if (parts[0] === 169 && parts[1] === 254) return true
-      if (parts[0] === 127) return true
-    }
-    return false
-  } catch {
-    return true
-  }
-}
+import { requireWorkspaceId } from '@/lib/enforcement/workspace-scope'
+import { isBlockedWebhookUrl } from '@/lib/webhooks'
 
 /**
  * GET /api/webhooks - List all webhooks with delivery stats
@@ -41,7 +17,9 @@ export async function GET(request: NextRequest) {
 
   try {
     const db = getDatabase()
-    const workspaceId = auth.user.workspace_id ?? 1
+    const wsResult = requireWorkspaceId(auth.user)
+    if (!('workspaceId' in wsResult)) return wsResult.response
+    const { workspaceId } = wsResult
     const webhooks = db.prepare(`
       SELECT w.*,
         (SELECT COUNT(*) FROM webhook_deliveries wd WHERE wd.webhook_id = w.id AND wd.workspace_id = w.workspace_id) as total_deliveries,
@@ -82,7 +60,9 @@ export async function POST(request: NextRequest) {
 
   try {
     const db = getDatabase()
-    const workspaceId = auth.user.workspace_id ?? 1
+    const wsResult = requireWorkspaceId(auth.user)
+    if (!('workspaceId' in wsResult)) return wsResult.response
+    const { workspaceId } = wsResult
     const validated = await validateBody(request, createWebhookSchema)
     if ('error' in validated) return validated.error
     const body = validated.data
@@ -127,7 +107,9 @@ export async function PUT(request: NextRequest) {
 
   try {
     const db = getDatabase()
-    const workspaceId = auth.user.workspace_id ?? 1
+    const wsResult = requireWorkspaceId(auth.user)
+    if (!('workspaceId' in wsResult)) return wsResult.response
+    const { workspaceId } = wsResult
     const body = await request.json()
     const { id, name, url, events, enabled, regenerate_secret, reset_circuit } = body
 
@@ -195,7 +177,9 @@ export async function DELETE(request: NextRequest) {
 
   try {
     const db = getDatabase()
-    const workspaceId = auth.user.workspace_id ?? 1
+    const wsResult = requireWorkspaceId(auth.user)
+    if (!('workspaceId' in wsResult)) return wsResult.response
+    const { workspaceId } = wsResult
     let body: any
     try { body = await request.json() } catch { return NextResponse.json({ error: 'Request body required' }, { status: 400 }) }
     const id = body.id

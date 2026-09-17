@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth'
-import { runClawdbot } from '@/lib/command'
+import { callOpenClawGateway } from '@/lib/openclaw-gateway'
 import { db_helpers } from '@/lib/db'
 import { mutationLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
+import { denyUnscopedResourceForStrictWorkspace } from '@/lib/workspace-isolation'
 
 // Only allow alphanumeric, hyphens, and underscores in session IDs
 const SESSION_ID_RE = /^[a-zA-Z0-9_-]+$/
@@ -14,6 +15,8 @@ export async function POST(
 ) {
   const auth = requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDenied = denyUnscopedResourceForStrictWorkspace(auth.user, 'gateway_sessions', new URL(request.url).pathname)
+  if (isolationDenied) return isolationDenied
 
   const rateCheck = mutationLimiter(request)
   if (rateCheck) return rateCheck
@@ -36,20 +39,14 @@ export async function POST(
       )
     }
 
-    let result
+    let result: unknown
     if (action === 'terminate') {
-      result = await runClawdbot(
-        ['-c', `sessions_kill("${id}")`],
-        { timeoutMs: 10000 }
-      )
+      result = await callOpenClawGateway('sessions_kill', { sessionKey: id }, 10_000)
     } else {
       const message = action === 'monitor'
-        ? JSON.stringify({ type: 'control', action: 'monitor' })
-        : JSON.stringify({ type: 'control', action: 'pause' })
-      result = await runClawdbot(
-        ['-c', `sessions_send("${id}", ${JSON.stringify(message)})`],
-        { timeoutMs: 10000 }
-      )
+        ? { type: 'control', action: 'monitor' }
+        : { type: 'control', action: 'pause' }
+      result = await callOpenClawGateway('sessions_send', { sessionKey: id, message }, 10_000)
     }
 
     db_helpers.logActivity(
@@ -65,7 +62,7 @@ export async function POST(
       success: true,
       action,
       session: id,
-      stdout: result.stdout.trim(),
+      result,
     })
   } catch (error: any) {
     logger.error({ err: error }, 'Session control error')

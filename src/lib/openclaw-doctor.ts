@@ -14,11 +14,21 @@ export interface OpenClawDoctorStatus {
 }
 
 function normalizeLine(line: string): string {
-  return line.replace(/\u001b\[[0-9;]*m/g, '').trim()
+  return line
+    .replace(/\u001b\[[0-9;]*m/g, '')
+    .replace(/^[\s│┃║┆┊╎╏]+/, '')
+    .trim()
 }
 
 function isSessionAgingLine(line: string): boolean {
   return /^agent:[\w:-]+ \(\d+[mh] ago\)$/i.test(line)
+}
+
+function isPositiveOrInstructionalLine(line: string): boolean {
+  return /^no .* warnings? detected/i.test(line) ||
+    /^no issues/i.test(line) ||
+    /^run:\s/i.test(line) ||
+    /^all .* (healthy|ok|valid|passed)/i.test(line)
 }
 
 function isDecorativeLine(line: string): boolean {
@@ -127,10 +137,12 @@ export function parseOpenClawDoctorOutput(
   const issues = lines
     .filter(line => /^[-*]\s+/.test(line))
     .map(line => line.replace(/^[-*]\s+/, '').trim())
-    .filter(line => !isSessionAgingLine(line) && !isStateDirectoryListLine(line))
+    .filter(line => !isSessionAgingLine(line) && !isStateDirectoryListLine(line) && !isPositiveOrInstructionalLine(line))
 
-  const mentionsWarnings = /\bwarning|warnings|problem|problems|invalid config|fix\b/i.test(raw)
-  const mentionsHealthy = /\bok\b|\bhealthy\b|\bno issues\b|\bvalid\b/i.test(raw)
+  // Strip positive/negated phrases before checking for warning keywords
+  const rawForWarningCheck = raw.replace(/\bno\s+\w+\s+(?:security\s+)?warnings?\s+detected\b/gi, '')
+  const mentionsWarnings = /\bwarning|warnings|problem|problems|invalid config|fix\b/i.test(rawForWarningCheck)
+  const mentionsHealthy = /\bok\b|\bhealthy\b|\bno issues\b|\bno\b.*\bwarnings?\s+detected\b|\bvalid\b/i.test(raw)
 
   let level: OpenClawDoctorLevel = 'healthy'
   if (exitCode !== 0 || /invalid config|failed|error/i.test(raw)) {

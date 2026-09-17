@@ -1,9 +1,11 @@
 'use client'
 
 import { useEffect, useState, useCallback } from 'react'
+import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
 import { Loader } from '@/components/ui/loader'
 import { useSmartPoll } from '@/lib/use-smart-poll'
+import { apiFetch } from '@/lib/api-client'
 
 interface Notification {
   id: number
@@ -19,6 +21,7 @@ interface Notification {
 }
 
 export function NotificationsPanel() {
+  const t = useTranslations('notifications')
   const [recipient, setRecipient] = useState<string>(() => {
     if (typeof window === 'undefined') return ''
     return window.localStorage.getItem('mc.notifications.recipient') || ''
@@ -32,9 +35,9 @@ export function NotificationsPanel() {
     try {
       setLoading(true)
       setError(null)
-      const response = await fetch(`/api/notifications?recipient=${encodeURIComponent(recipient)}`)
-      if (!response.ok) throw new Error('Failed to fetch notifications')
-      const data = await response.json()
+      const data = await apiFetch<{ notifications?: Notification[] }>(
+        `/api/notifications?recipient=${encodeURIComponent(recipient)}`,
+      )
       setNotifications(data.notifications || [])
     } catch (err) {
       setError('Failed to fetch notifications')
@@ -46,20 +49,19 @@ export function NotificationsPanel() {
   useEffect(() => {
     if (recipient) {
       window.localStorage.setItem('mc.notifications.recipient', recipient)
+      fetchNotifications()
     }
-  }, [recipient])
+  }, [recipient, fetchNotifications])
 
   useSmartPoll(fetchNotifications, 30000, { enabled: !!recipient, pauseWhenSseConnected: true })
 
   const markAllRead = async () => {
     if (!recipient) return
     try {
-      const res = await fetch('/api/notifications', {
+      await apiFetch<{ success: boolean; markedAsRead: number }>('/api/notifications', {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ recipient, markAllRead: true })
       })
-      if (!res.ok) throw new Error('Failed to mark all as read')
       fetchNotifications()
     } catch {
       // Silent — notification state will resync on next poll
@@ -68,12 +70,10 @@ export function NotificationsPanel() {
 
   const markRead = async (id: number) => {
     try {
-      const res = await fetch('/api/notifications', {
+      await apiFetch<{ success: boolean; markedAsRead: number }>('/api/notifications', {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids: [id] })
       })
-      if (!res.ok) throw new Error('Failed to mark as read')
       fetchNotifications()
     } catch {
       // Silent — notification state will resync on next poll
@@ -82,24 +82,24 @@ export function NotificationsPanel() {
 
   return (
     <div className="h-full flex flex-col">
-      <div className="flex justify-between items-center p-4 border-b border-border flex-shrink-0">
-        <h2 className="text-xl font-bold text-foreground">Notifications</h2>
+      <div className="flex justify-between items-center p-4 border-b border-border shrink-0">
+        <h2 className="text-xl font-bold text-foreground">{t('title')}</h2>
         <Button
           onClick={markAllRead}
           variant="secondary"
           size="sm"
         >
-          Mark All Read
+          {t('markAllRead')}
         </Button>
       </div>
 
-      <div className="p-4 border-b border-border flex-shrink-0">
-        <label className="block text-sm text-muted-foreground mb-2">Recipient</label>
+      <div className="p-4 border-b border-border shrink-0">
+        <label className="block text-sm text-muted-foreground mb-2">{t('recipientLabel')}</label>
         <input
           value={recipient}
           onChange={(e) => setRecipient(e.target.value)}
-          className="w-full bg-surface-1 text-foreground rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-primary/50"
-          placeholder="Agent name (e.g., my-agent)"
+          className="w-full bg-surface-1 text-foreground rounded-md px-3 py-2 text-sm focus:outline-hidden focus:ring-1 focus:ring-primary/50"
+          placeholder={t('recipientPlaceholder')}
         />
       </div>
 
@@ -120,7 +120,7 @@ export function NotificationsPanel() {
               <path d="M12 5a4 4 0 00-8 0c0 4-2 5-2 5h12s-2-1-2-5" />
               <path d="M9.15 14a1.25 1.25 0 01-2.3 0" />
             </svg>
-            <span className="text-sm">No notifications</span>
+            <span className="text-sm">{t('noNotifications')}</span>
           </div>
         ) : (
           notifications.map((n) => (
@@ -140,9 +140,9 @@ export function NotificationsPanel() {
                     onClick={() => markRead(n.id)}
                     variant="link"
                     size="xs"
-                    className="flex-shrink-0 ml-2"
+                    className="shrink-0 ml-2"
                   >
-                    Mark read
+                    {t('markRead')}
                   </Button>
                 )}
               </div>

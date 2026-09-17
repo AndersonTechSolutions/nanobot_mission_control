@@ -16,8 +16,18 @@ import { GithubSignalWidget } from './widgets/github-signal-widget'
 import { SecurityAuditWidget } from './widgets/security-audit-widget'
 import { MaintenanceWidget } from './widgets/maintenance-widget'
 import { QuickActionsWidget } from './widgets/quick-actions-widget'
+import { BriefingBarWidget } from './widgets/briefing-bar-widget'
+import { ActivityTimelineWidget } from './widgets/activity-timeline-widget'
+import { FleetStatusWidget } from './widgets/fleet-status-widget'
+import { TaskPipelineWidget } from './widgets/task-pipeline-widget'
+import { SystemHealthWidget } from './widgets/system-health-widget'
 
 const WIDGET_COMPONENTS: Record<string, React.ComponentType<{ data: DashboardData }>> = {
+  'briefing-bar': BriefingBarWidget,
+  'activity-timeline': ActivityTimelineWidget,
+  'fleet-status': FleetStatusWidget,
+  'task-pipeline': TaskPipelineWidget,
+  'system-health': SystemHealthWidget,
   'metric-cards': MetricCardsWidget,
   'runtime-health': RuntimeHealthWidget,
   'gateway-health': GatewayHealthWidget,
@@ -207,13 +217,13 @@ export function WidgetGrid({ data }: { data: DashboardData }) {
       >
         {customizing && (
           <div className="absolute top-1 right-1 z-10 flex items-center gap-1">
-            <span className="text-2xs text-muted-foreground bg-card/80 backdrop-blur-sm rounded px-1.5 py-0.5 border border-border/50 cursor-grab">
+            <span className="text-2xs text-muted-foreground bg-card/80 backdrop-blur-xs rounded px-1.5 py-0.5 border border-border/50 cursor-grab">
               :::
             </span>
             <button
               type="button"
               onClick={() => removeWidget(widgetId)}
-              className="text-2xs text-red-400 hover:text-red-300 bg-card/80 backdrop-blur-sm rounded px-1.5 py-0.5 border border-border/50"
+              className="text-2xs text-red-400 hover:text-red-300 bg-card/80 backdrop-blur-xs rounded px-1.5 py-0.5 border border-border/50"
             >
               x
             </button>

@@ -3,7 +3,8 @@ import { execSync } from 'node:child_process'
 import path from 'node:path'
 import os from 'node:os'
 import { config } from '@/lib/config'
-import { getDatabase } from '@/lib/db'
+import { getDatabase, resolveSeedAuthPassword } from '@/lib/db'
+import { getSchedulerStatus } from '@/lib/scheduler'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -38,6 +39,88 @@ export interface ScanResult {
     openclaw: Category
     runtime: Category
     os: Category
+  }
+}
+
+export interface BackupAutomationState {
+  enabled: boolean | null
+  schedulerRegistered: boolean
+  schedulerLastRun: number | null
+  schedulerLastResult?: { ok: boolean; message: string }
+}
+
+export function buildBackupCheck(
+  ageHours: number | null,
+  automation: BackupAutomationState,
+): Check {
+  if (ageHours !== null && ageHours < 24) {
+    return {
+      id: 'backup_recent',
+      name: 'Recent backup exists',
+      status: 'pass',
+      detail: `Latest backup is ${ageHours}h old`,
+      fix: '',
+      severity: 'medium',
+    }
+  }
+
+  const ageDetail = ageHours === null
+    ? 'No backups found'
+    : `Latest backup is ${ageHours}h old`
+  let detail: string
+  let fix: string
+
+  if (automation.enabled === false) {
+    detail = `${ageDetail}; automatic backups are disabled`
+    fix = 'Enable automatic backups in Settings, or create a backup from Settings → Backups'
+  } else if (automation.enabled === null) {
+    detail = `${ageDetail}; automatic backup status could not be read`
+    fix = 'Check automatic backup status in Settings, or create a backup from Settings → Backups'
+  } else if (!automation.schedulerRegistered) {
+    detail = `${ageDetail}; automatic backups are enabled but the scheduler is not running`
+    fix = 'Restart Mission Control to start the scheduler, or create a backup from Settings → Backups'
+  } else if (automation.schedulerLastResult?.ok === false) {
+    detail = `${ageDetail}; the last scheduled backup failed`
+    fix = 'Review the scheduler error, then create a backup from Settings → Backups'
+  } else if (automation.schedulerLastRun === null) {
+    detail = `${ageDetail}; automatic backups are enabled and waiting for the first scheduled run`
+    fix = 'Keep Mission Control running until the scheduled run, or create a backup from Settings → Backups'
+  } else {
+    detail = `${ageDetail}; automatic backups are enabled but the backup is overdue`
+    fix = 'Check scheduler status, or create a backup from Settings → Backups'
+  }
+
+  return {
+    id: 'backup_recent',
+    name: 'Recent backup exists',
+    status: ageHours !== null && ageHours >= 168 ? 'fail' : 'warn',
+    detail,
+    fix,
+    severity: 'medium',
+  }
+}
+
+function getBackupAutomationState(): BackupAutomationState {
+  let enabled: boolean | null = null
+  try {
+    const row = getDatabase()
+      .prepare('SELECT value FROM settings WHERE key = ?')
+      .get('general.auto_backup') as { value: string } | undefined
+    enabled = row?.value === 'true'
+  } catch {
+    // Keep the state unknown so the scan does not make a false configuration claim.
+  }
+
+  try {
+    const task = getSchedulerStatus().find((item) => item.id === 'auto_backup')
+    return {
+      enabled,
+      schedulerRegistered: Boolean(task),
+      schedulerLastRun: task?.lastRun ?? null,
+      schedulerLastResult: task?.lastResult,
+    }
+  } catch {
+    return { enabled, schedulerRegistered: false, schedulerLastRun: null }
   }
 }
 
@@ -162,15 +245,15 @@ function tryExecBatch(script: string): Record<string, string> {
 function scanCredentials(): Category {
   const checks: Check[] = []
 
-  const authPass = process.env.AUTH_PASS || ''
+  const authPass = resolveSeedAuthPassword() || ''
   if (!authPass) {
-    checks.push({ id: 'auth_pass', name: 'Admin password configured', status: 'fail', detail: 'AUTH_PASS is not configured', fix: 'Set AUTH_PASS in .env to a strong password (12+ characters)', severity: 'critical' })
+    checks.push({ id: 'auth_pass', name: 'Admin password configured', status: 'fail', detail: 'Admin password is not configured', fix: 'Set AUTH_PASS or AUTH_PASS_B64 in .env to a strong password (12+ characters)', severity: 'critical' })
   } else if (INSECURE_PASSWORDS.has(authPass)) {
-    checks.push({ id: 'auth_pass', name: 'Admin password strength', status: 'fail', detail: 'AUTH_PASS is set to a known insecure default', fix: 'Change AUTH_PASS to a unique password with 12+ characters', severity: 'critical' })
+    checks.push({ id: 'auth_pass', name: 'Admin password strength', status: 'fail', detail: 'Admin password is set to a known insecure default', fix: 'Change AUTH_PASS or AUTH_PASS_B64 to a unique password with 12+ characters', severity: 'critical' })
   } else if (authPass.length < 12) {
-    checks.push({ id: 'auth_pass', name: 'Admin password strength', status: 'warn', detail: `AUTH_PASS is only ${authPass.length} characters`, fix: 'Use a password with at least 12 characters', severity: 'critical' })
+    checks.push({ id: 'auth_pass', name: 'Admin password strength', status: 'warn', detail: `Admin password is only ${authPass.length} characters`, fix: 'Use a password with at least 12 characters', severity: 'critical' })
   } else {
-    checks.push({ id: 'auth_pass', name: 'Admin password strength', status: 'pass', detail: 'AUTH_PASS is a strong, non-default password', fix: '', severity: 'critical' })
+    checks.push({ id: 'auth_pass', name: 'Admin password strength', status: 'pass', detail: 'Admin password is strong and non-default', fix: '', severity: 'critical' })
   }
 
   const apiKey = process.env.API_KEY || ''
@@ -265,13 +348,16 @@ function scanOpenClaw(): Category {
   const configPath = config.openclawConfigPath
 
   if (!configPath || !existsSync(configPath)) {
+    const gatewayOptional = process.env.NEXT_PUBLIC_GATEWAY_OPTIONAL === 'true'
     checks.push({
       id: 'config_found',
       name: 'OpenClaw config found',
-      status: 'warn',
-      detail: 'openclaw.json not found — OpenClaw checks skipped',
-      fix: 'Set OPENCLAW_HOME or OPENCLAW_CONFIG_PATH in .env',
-      severity: 'medium',
+      status: gatewayOptional ? 'pass' : 'warn',
+      detail: gatewayOptional
+        ? 'OpenClaw not configured (standalone mode — gateway optional)'
+        : 'openclaw.json not found — OpenClaw checks skipped',
+      fix: gatewayOptional ? '' : 'Set OPENCLAW_HOME or OPENCLAW_CONFIG_PATH in .env',
+      severity: 'low',
     })
     return scoreCategory(checks)
   }
@@ -306,12 +392,23 @@ function scanOpenClaw(): Category {
   } catch { /* skip */ }
 
   const gwAuth = ocConfig?.gateway?.auth
+  // gateway.auth.token / .password may be a plain string OR a SecretRef object
+  // (e.g. {source:"vault", ref:"op://..."} or {source:"file", path:"..."}).
+  // Calling .trim() on the object crashes. Treat any non-null value as
+  // "credential configured" — the resolved value is checked at runtime by OpenClaw.
+  const hasCredential = (value: unknown): boolean => {
+    if (typeof value === 'string') return value.trim().length > 0
+    return value != null
+  }
+  const tokenOk = gwAuth?.mode === 'token' && hasCredential(gwAuth?.token)
+  const passwordOk = gwAuth?.mode === 'password' && hasCredential(gwAuth?.password)
+  const authOk = tokenOk || passwordOk
   checks.push({
     id: 'gateway_auth',
     name: 'Gateway authentication',
-    status: gwAuth?.mode === 'token' && gwAuth?.token ? 'pass' : 'fail',
-    detail: gwAuth?.mode === 'token' ? 'Token auth enabled' : `Auth mode: ${gwAuth?.mode || 'none'}`,
-    fix: gwAuth?.mode !== 'token' ? 'Set gateway.auth.mode to "token" with a strong random token' : '',
+    status: authOk ? 'pass' : 'fail',
+    detail: tokenOk ? 'Token auth enabled' : passwordOk ? 'Password auth enabled' : `Auth mode: ${gwAuth?.mode || 'none'} (credential required)`,
+    fix: !authOk ? 'Set gateway.auth.mode to "token" with gateway.auth.token, or "password" with gateway.auth.password' : '',
     severity: 'critical',
   })
 
@@ -359,9 +456,9 @@ function scanOpenClaw(): Category {
   checks.push({
     id: 'exec_restricted',
     name: 'Exec tool restricted',
-    status: execSecurity === 'deny' ? 'pass' : execSecurity === 'sandbox' ? 'pass' : 'warn',
+    status: execSecurity === 'deny' ? 'pass' : execSecurity === 'allowlist' ? 'pass' : 'warn',
     detail: `Exec security: ${execSecurity || 'default'}`,
-    fix: execSecurity !== 'deny' && execSecurity !== 'sandbox' ? 'Set tools.exec.security to "deny" or "sandbox"' : '',
+    fix: execSecurity !== 'deny' && execSecurity !== 'allowlist' ? 'Set tools.exec.security to "deny" or "allowlist"' : '',
     severity: 'high',
   })
 
@@ -521,6 +618,8 @@ function scanRuntime(): Category {
 
   try {
     const backupDir = path.join(path.dirname(config.dbPath), 'backups')
+    let ageHours: number | null = null
+
     if (existsSync(backupDir)) {
       const files = readdirSync(backupDir)
         .filter((f: string) => f.endsWith('.db'))
@@ -531,21 +630,11 @@ function scanRuntime(): Category {
         .sort((a: any, b: any) => b.mtime - a.mtime)
 
       if (files.length > 0) {
-        const ageHours = Math.round((Date.now() - files[0].mtime) / 3600000)
-        checks.push({
-          id: 'backup_recent',
-          name: 'Recent backup exists',
-          status: ageHours < 24 ? 'pass' : ageHours < 168 ? 'warn' : 'fail',
-          detail: `Latest backup is ${ageHours}h old`,
-          fix: ageHours >= 24 ? 'Enable auto_backup in Settings or run: curl -X POST /api/backup' : '',
-          severity: 'medium',
-        })
-      } else {
-        checks.push({ id: 'backup_recent', name: 'Recent backup exists', status: 'warn', detail: 'No backups found', fix: 'Enable auto_backup in Settings', severity: 'medium' })
+        ageHours = Math.round((Date.now() - files[0].mtime) / 3600000)
       }
-    } else {
-      checks.push({ id: 'backup_recent', name: 'Recent backup exists', status: 'warn', detail: 'No backup directory', fix: 'Enable auto_backup in Settings', severity: 'medium' })
     }
+
+    checks.push(buildBackupCheck(ageHours, getBackupAutomationState()))
   } catch {
     checks.push({ id: 'backup_recent', name: 'Recent backup exists', status: 'warn', detail: 'Could not check backups', fix: '', severity: 'medium' })
   }
@@ -563,6 +652,42 @@ function scanRuntime(): Category {
     })
   } catch {
     checks.push({ id: 'db_integrity', name: 'Database integrity', status: 'warn', detail: 'Could not run integrity check', fix: '', severity: 'critical' })
+  }
+
+  // Check if MCP audit receipts are being signed
+  try {
+    const db = getDatabase()
+    const recent = db.prepare(
+      "SELECT COUNT(*) as total, SUM(CASE WHEN signature IS NOT NULL THEN 1 ELSE 0 END) as signed FROM mcp_call_log WHERE created_at > unixepoch() - 86400"
+    ).get() as { total: number; signed: number } | undefined
+
+    const total = recent?.total ?? 0
+    const signed = recent?.signed ?? 0
+
+    if (total === 0) {
+      checks.push({
+        id: 'receipt_signing',
+        name: 'MCP audit receipt signing',
+        status: 'warn',
+        detail: 'No MCP calls logged in the last 24h',
+        fix: '',
+        severity: 'medium',
+      })
+    } else {
+      const allSigned = signed === total
+      checks.push({
+        id: 'receipt_signing',
+        name: 'MCP audit receipt signing',
+        status: allSigned ? 'pass' : 'warn',
+        detail: allSigned
+          ? `${signed}/${total} audit records have Ed25519 receipts`
+          : `${signed}/${total} records signed (${total - signed} unsigned)`,
+        fix: allSigned ? '' : 'Unsigned records may be from before receipt signing was enabled',
+        severity: 'medium',
+      })
+    }
+  } catch {
+    checks.push({ id: 'receipt_signing', name: 'MCP audit receipt signing', status: 'warn', detail: 'Could not check receipt status', fix: '', severity: 'medium' })
   }
 
   return scoreCategory(checks)

@@ -49,10 +49,10 @@ const endpoints: Endpoint[] = [
   { path: '/api/chat/session-prefs', methods: ['GET', 'PATCH'], description: 'Local session chat preferences (rename + color)', tag: 'Chat', auth: 'viewer/operator' },
 
   // ── Sessions ──────────────────────────────────────
-  { path: '/api/sessions', methods: ['GET'], description: 'List gateway sessions', tag: 'Sessions', auth: 'viewer' },
+  { path: '/api/sessions', methods: ['GET', 'POST', 'DELETE'], description: 'List and control gateway/local runtime sessions', tag: 'Sessions', auth: 'viewer/operator' },
   { path: '/api/sessions/:id/control', methods: ['POST'], description: 'Session control (stop, message)', tag: 'Sessions', auth: 'operator' },
-  { path: '/api/sessions/continue', methods: ['POST'], description: 'Continue a local Claude/Codex session with a prompt', tag: 'Sessions', auth: 'operator' },
-  { path: '/api/sessions/transcript', methods: ['GET'], description: 'Read local Claude/Codex session transcript snippets', tag: 'Sessions', auth: 'viewer' },
+  { path: '/api/sessions/continue', methods: ['POST'], description: 'Continue a local Claude/Codex/OpenCode session with a prompt', tag: 'Sessions', auth: 'operator' },
+  { path: '/api/sessions/transcript', methods: ['GET'], description: 'Read local Claude/Codex/Hermes/OpenCode session transcript snippets', tag: 'Sessions', auth: 'viewer' },
   { path: '/api/claude/sessions', methods: ['GET'], description: 'Claude CLI session scanner', tag: 'Sessions', auth: 'viewer' },
 
   // ── Activities & Notifications ────────────────────
@@ -138,6 +138,7 @@ const endpoints: Endpoint[] = [
   { path: '/api/export', methods: ['GET'], description: 'Data export', tag: 'System', auth: 'viewer' },
   { path: '/api/workload', methods: ['GET'], description: 'Agent workload stats', tag: 'System', auth: 'viewer' },
   { path: '/api/releases/check', methods: ['GET'], description: 'Check for updates', tag: 'System', auth: 'public' },
+  { path: '/api/releases/update', methods: ['POST'], description: 'Update Mission Control to a specific release tag', tag: 'System', auth: 'admin' },
   { path: '/api/openclaw/version', methods: ['GET'], description: 'Installed OpenClaw version and latest release metadata', tag: 'System', auth: 'public' },
   { path: '/api/openclaw/update', methods: ['POST'], description: 'Update OpenClaw to the latest stable release', tag: 'System', auth: 'admin' },
   { path: '/api/openclaw/doctor', methods: ['GET', 'POST'], description: 'Inspect and fix OpenClaw configuration drift', tag: 'System', auth: 'admin' },

@@ -1,17 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { readdir, readFile, stat, lstat, realpath, writeFile, mkdir, unlink } from 'fs/promises'
+import { readdir, readFile, stat, writeFile, mkdir, unlink } from 'fs/promises'
 import { existsSync, mkdirSync } from 'fs'
-import { join, dirname, sep } from 'path'
-import { config } from '@/lib/config'
-import { db_helpers } from '@/lib/db'
-import { resolveWithin } from '@/lib/paths'
+import { join, dirname } from 'path'
+import { db_helpers, getDatabase } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
 import { readLimiter, mutationLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
 import { validateSchema, extractWikiLinks } from '@/lib/memory-utils'
-
-const MEMORY_PATH = config.memoryDir
-const MEMORY_ALLOWED_PREFIXES = (config.memoryAllowedPrefixes || []).map((p) => p.replace(/\\/g, '/'))
+import { MEMORY_PATH, MEMORY_ALLOWED_PREFIXES, canonicalizeMemoryRelativePath, isPathAllowed, resolveSafeMemoryPath } from '@/lib/memory-path'
+import { searchMemory, indexFile, removeFromIndex } from '@/lib/memory-search'
+import { resolveWorkspaceMemoryAccess } from '@/lib/workspace-isolation'
+import { atomicReplaceFileSync } from '@/lib/atomic-file'
 
 // Ensure memory directory exists on startup
 if (MEMORY_PATH && !existsSync(MEMORY_PATH)) {
@@ -25,66 +24,6 @@ interface MemoryFile {
   size?: number
   modified?: number
   children?: MemoryFile[]
-}
-
-function normalizeRelativePath(value: string): string {
-  return String(value || '').replace(/\\/g, '/').replace(/^\/+/, '')
-}
-
-function isPathAllowed(relativePath: string): boolean {
-  if (!MEMORY_ALLOWED_PREFIXES.length) return true
-  const normalized = normalizeRelativePath(relativePath)
-  return MEMORY_ALLOWED_PREFIXES.some((prefix) => normalized === prefix.slice(0, -1) || normalized.startsWith(prefix))
-}
-
-function isWithinBase(base: string, candidate: string): boolean {
-  if (candidate === base) return true
-  return candidate.startsWith(base + sep)
-}
-
-async function resolveSafeMemoryPath(baseDir: string, relativePath: string): Promise<string> {
-  const baseReal = await realpath(baseDir)
-  const fullPath = resolveWithin(baseDir, relativePath)
-
-  // For non-existent targets, validate containment using the nearest existing ancestor.
-  // This allows nested creates (mkdir -p) while still blocking symlink escapes.
-  let current = dirname(fullPath)
-  let parentReal = ''
-  while (!parentReal) {
-    try {
-      parentReal = await realpath(current)
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code
-      if (code !== 'ENOENT') throw err
-      const next = dirname(current)
-      if (next === current) {
-        throw new Error('Parent directory not found')
-      }
-      current = next
-    }
-  }
-  if (!isWithinBase(baseReal, parentReal)) {
-    throw new Error('Path escapes base directory (symlink)')
-  }
-
-  // If the file exists, ensure it also resolves within base and is not a symlink.
-  try {
-    const st = await lstat(fullPath)
-    if (st.isSymbolicLink()) {
-      throw new Error('Symbolic links are not allowed')
-    }
-    const fileReal = await realpath(fullPath)
-    if (!isWithinBase(baseReal, fileReal)) {
-      throw new Error('Path escapes base directory (symlink)')
-    }
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code
-    if (code !== 'ENOENT') {
-      throw err
-    }
-  }
-
-  return fullPath
 }
 
 async function buildFileTree(
@@ -152,6 +91,9 @@ export async function GET(request: NextRequest) {
   const rateCheck = readLimiter(request)
   if (rateCheck) return rateCheck
 
+  const memoryAccess = resolveWorkspaceMemoryAccess(auth.user)
+  const memoryPath = memoryAccess?.root || ''
+
   try {
     const { searchParams } = new URL(request.url)
     const path = searchParams.get('path')
@@ -161,26 +103,27 @@ export async function GET(request: NextRequest) {
 
     if (action === 'tree') {
       // Return the file tree
-      if (!MEMORY_PATH) {
+      if (!memoryPath || !existsSync(memoryPath)) {
         return NextResponse.json({ tree: [] })
       }
       if (path) {
         if (!isPathAllowed(path)) {
           return NextResponse.json({ error: 'Path not allowed' }, { status: 403 })
         }
-        const fullPath = await resolveSafeMemoryPath(MEMORY_PATH, path)
+        const canonicalPath = canonicalizeMemoryRelativePath(path)
+        const fullPath = await resolveSafeMemoryPath(memoryPath, canonicalPath)
         const stats = await stat(fullPath).catch(() => null)
         if (!stats?.isDirectory()) {
           return NextResponse.json({ error: 'Directory not found' }, { status: 404 })
         }
-        const tree = await buildFileTree(fullPath, path, maxDepth)
+        const tree = await buildFileTree(fullPath, canonicalPath, maxDepth)
         return NextResponse.json({ tree })
       }
       if (MEMORY_ALLOWED_PREFIXES.length) {
         const tree: MemoryFile[] = []
         for (const prefix of MEMORY_ALLOWED_PREFIXES) {
           const folder = prefix.replace(/\/$/, '')
-          const fullPath = join(MEMORY_PATH, folder)
+          const fullPath = join(memoryPath, folder)
           if (!existsSync(fullPath)) continue
           try {
             const stats = await stat(fullPath)
@@ -198,7 +141,7 @@ export async function GET(request: NextRequest) {
         }
         return NextResponse.json({ tree })
       }
-      const tree = await buildFileTree(MEMORY_PATH, '', maxDepth)
+      const tree = await buildFileTree(memoryPath, '', maxDepth)
       return NextResponse.json({ tree })
     }
 
@@ -207,17 +150,18 @@ export async function GET(request: NextRequest) {
       if (!isPathAllowed(path)) {
         return NextResponse.json({ error: 'Path not allowed' }, { status: 403 })
       }
-      if (!MEMORY_PATH) {
+      if (!memoryPath || !existsSync(memoryPath)) {
         return NextResponse.json({ error: 'Memory directory not configured' }, { status: 500 })
       }
-      const fullPath = await resolveSafeMemoryPath(MEMORY_PATH, path)
+      const canonicalPath = canonicalizeMemoryRelativePath(path)
+      const fullPath = await resolveSafeMemoryPath(memoryPath, canonicalPath)
       
       try {
         const content = await readFile(fullPath, 'utf-8')
         const stats = await stat(fullPath)
 
         // Extract wiki-links and schema validation for .md files
-        const isMarkdown = path.endsWith('.md')
+        const isMarkdown = canonicalPath.endsWith('.md')
         const wikiLinks = isMarkdown ? extractWikiLinks(content) : []
         const schemaResult = isMarkdown ? validateSchema(content) : null
 
@@ -225,7 +169,7 @@ export async function GET(request: NextRequest) {
           content,
           size: stats.size,
           modified: stats.mtime.getTime(),
-          path,
+          path: canonicalPath,
           wikiLinks,
           schema: schemaResult,
         })
@@ -239,80 +183,13 @@ export async function GET(request: NextRequest) {
       if (!query) {
         return NextResponse.json({ error: 'Query required' }, { status: 400 })
       }
-      if (!MEMORY_PATH) {
+      if (!memoryPath || !existsSync(memoryPath)) {
         return NextResponse.json({ query, results: [] })
       }
 
-      // Simple file search - in production you'd want a more sophisticated search
-      const results: Array<{path: string, name: string, matches: number}> = []
-      
-      const searchInFile = async (filePath: string, relativePath: string) => {
-        try {
-          const st = await stat(filePath)
-          // Avoid large-file scanning and memory blowups.
-          if (st.size > 1_000_000) {
-            return
-          }
-          const content = await readFile(filePath, 'utf-8')
-          const haystack = content.toLowerCase()
-          const needle = query.toLowerCase()
-          if (!needle) return
-          let matches = 0
-          let idx = haystack.indexOf(needle)
-          while (idx !== -1) {
-            matches += 1
-            idx = haystack.indexOf(needle, idx + needle.length)
-          }
-          
-          if (matches > 0) {
-            results.push({
-              path: relativePath,
-              name: relativePath.split('/').pop() || '',
-              matches
-            })
-          }
-        } catch (error) {
-          // Skip files that can't be read
-        }
-      }
-
-      const searchDirectory = async (dirPath: string, relativePath: string = '') => {
-        try {
-          const items = await readdir(dirPath, { withFileTypes: true })
-          
-          for (const item of items) {
-            if (item.isSymbolicLink()) {
-              continue
-            }
-            const itemPath = join(dirPath, item.name)
-            const itemRelativePath = join(relativePath, item.name)
-            
-            if (item.isDirectory()) {
-              await searchDirectory(itemPath, itemRelativePath)
-            } else if (item.isFile() && (item.name.endsWith('.md') || item.name.endsWith('.txt'))) {
-              await searchInFile(itemPath, itemRelativePath)
-            }
-          }
-        } catch (error) {
-          logger.error({ err: error, path: dirPath }, 'Error searching directory')
-        }
-      }
-
-      if (MEMORY_ALLOWED_PREFIXES.length) {
-        for (const prefix of MEMORY_ALLOWED_PREFIXES) {
-          const folder = prefix.replace(/\/$/, '')
-          const fullPath = join(MEMORY_PATH, folder)
-          if (!existsSync(fullPath)) continue
-          await searchDirectory(fullPath, folder)
-        }
-      } else {
-        await searchDirectory(MEMORY_PATH)
-      }
-      
-      return NextResponse.json({ 
-        query,
-        results: results.sort((a, b) => b.matches - a.matches)
-      })
+      // FTS5-powered full-text search with BM25 ranking and snippets
+      const response = await searchMemory(memoryPath, MEMORY_ALLOWED_PREFIXES, query, { scope: memoryAccess!.scope })
+      return NextResponse.json(response)
     }
 
     return NextResponse.json({ error: 'Invalid action' }, { status: 400 })
@@ -329,6 +206,9 @@ export async function POST(request: NextRequest) {
   const rateCheck = mutationLimiter(request)
   if (rateCheck) return rateCheck
 
+  const memoryAccess = resolveWorkspaceMemoryAccess(auth.user)
+  const memoryPath = memoryAccess?.root || ''
+
   try {
     const body = await request.json()
     const { action, path, content } = body
@@ -340,10 +220,12 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Path not allowed' }, { status: 403 })
     }
 
-    if (!MEMORY_PATH) {
+    if (!memoryPath) {
       return NextResponse.json({ error: 'Memory directory not configured' }, { status: 500 })
     }
-    const fullPath = await resolveSafeMemoryPath(MEMORY_PATH, path)
+    const canonicalPath = canonicalizeMemoryRelativePath(path)
+    await mkdir(memoryPath, { recursive: true })
+    const fullPath = await resolveSafeMemoryPath(memoryPath, canonicalPath)
 
     if (action === 'save') {
       // Save file content
@@ -352,12 +234,14 @@ export async function POST(request: NextRequest) {
       }
 
       // Validate schema if present (warn but don't block save)
-      const schemaResult = path.endsWith('.md') ? validateSchema(content) : null
+      const schemaResult = canonicalPath.endsWith('.md') ? validateSchema(content) : null
       const schemaWarnings = schemaResult?.errors ?? []
 
-      await writeFile(fullPath, content, 'utf-8')
+      atomicReplaceFileSync(fullPath, content)
+      // Incrementally update FTS index
+      try { indexFile(getDatabase(), memoryPath, canonicalPath, memoryAccess!.scope) } catch { /* best-effort */ }
       try {
-        db_helpers.logActivity('memory_file_saved', 'memory', 0, auth.user.username || 'unknown', `Updated ${path}`, { path, size: content.length })
+        db_helpers.logActivity('memory_file_saved', 'memory', 0, auth.user.username || 'unknown', `Updated ${canonicalPath}`, { path: canonicalPath, size: content.length })
       } catch { /* best-effort */ }
       return NextResponse.json({
         success: true,
@@ -377,17 +261,18 @@ export async function POST(request: NextRequest) {
         // Directory might already exist
       }
 
-      // Check if file already exists
       try {
-        await stat(fullPath)
-        return NextResponse.json({ error: 'File already exists' }, { status: 409 })
+        await writeFile(fullPath, content || '', { encoding: 'utf-8', flag: 'wx', mode: 0o600 })
       } catch (error) {
-        // File doesn't exist, which is what we want
+        if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+          return NextResponse.json({ error: 'File already exists' }, { status: 409 })
+        }
+        throw error
       }
 
-      await writeFile(fullPath, content || '', 'utf-8')
+      try { indexFile(getDatabase(), memoryPath, canonicalPath, memoryAccess!.scope) } catch { /* best-effort */ }
       try {
-        db_helpers.logActivity('memory_file_created', 'memory', 0, auth.user.username || 'unknown', `Created ${path}`, { path })
+        db_helpers.logActivity('memory_file_created', 'memory', 0, auth.user.username || 'unknown', `Created ${canonicalPath}`, { path: canonicalPath })
       } catch { /* best-effort */ }
       return NextResponse.json({ success: true, message: 'File created successfully' })
     }
@@ -406,6 +291,9 @@ export async function DELETE(request: NextRequest) {
   const rateCheck = mutationLimiter(request)
   if (rateCheck) return rateCheck
 
+  const memoryAccess = resolveWorkspaceMemoryAccess(auth.user)
+  const memoryPath = memoryAccess?.root || ''
+
   try {
     const body = await request.json()
     const { action, path } = body
@@ -417,10 +305,11 @@ export async function DELETE(request: NextRequest) {
       return NextResponse.json({ error: 'Path not allowed' }, { status: 403 })
     }
 
-    if (!MEMORY_PATH) {
+    if (!memoryPath || !existsSync(memoryPath)) {
       return NextResponse.json({ error: 'Memory directory not configured' }, { status: 500 })
     }
-    const fullPath = await resolveSafeMemoryPath(MEMORY_PATH, path)
+    const canonicalPath = canonicalizeMemoryRelativePath(path)
+    const fullPath = await resolveSafeMemoryPath(memoryPath, canonicalPath)
 
     if (action === 'delete') {
       // Check if file exists
@@ -431,8 +320,9 @@ export async function DELETE(request: NextRequest) {
       }
 
       await unlink(fullPath)
+      try { removeFromIndex(getDatabase(), canonicalPath, memoryAccess!.scope) } catch { /* best-effort */ }
       try {
-        db_helpers.logActivity('memory_file_deleted', 'memory', 0, auth.user.username || 'unknown', `Deleted ${path}`, { path })
+        db_helpers.logActivity('memory_file_deleted', 'memory', 0, auth.user.username || 'unknown', `Deleted ${canonicalPath}`, { path: canonicalPath })
       } catch { /* best-effort */ }
       return NextResponse.json({ success: true, message: 'File deleted successfully' })
     }

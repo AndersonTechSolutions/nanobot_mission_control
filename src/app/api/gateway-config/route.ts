@@ -4,8 +4,11 @@ import { requireRole } from '@/lib/auth'
 import { logAuditEvent } from '@/lib/db'
 import { config } from '@/lib/config'
 import { validateBody, gatewayConfigUpdateSchema } from '@/lib/validation'
-import { mutationLimiter } from '@/lib/rate-limit'
+import { gatewayConfigMutationLimiter } from '@/lib/rate-limit'
 import { getDetectedGatewayToken } from '@/lib/gateway-runtime'
+import { parseJsonRelaxed } from '@/lib/json-relaxed'
+import { denyUnscopedResourceForStrictWorkspace } from '@/lib/workspace-isolation'
+import { setNestedConfigValue } from '@/lib/config-path'
 
 function getConfigPath(): string | null {
   return config.nanobotConfigPath || null
@@ -33,6 +36,8 @@ function computeHash(raw: string): string {
 export async function GET(request: NextRequest) {
   const auth = requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDeny = denyUnscopedResourceForStrictWorkspace(auth.user, 'runtime_configuration', new URL(request.url).pathname)
+  if (isolationDeny) return isolationDeny
 
   const action = request.nextUrl.searchParams.get('action')
 
@@ -48,7 +53,7 @@ export async function GET(request: NextRequest) {
   try {
     const { readFile } = require('fs/promises')
     const raw = await readFile(configPath, 'utf-8')
-    const parsed = JSON.parse(raw)
+    const parsed = parseJsonRelaxed<Record<string, unknown>>(raw)
     const hash = computeHash(raw)
 
     // Redact sensitive fields for display
@@ -60,11 +65,11 @@ export async function GET(request: NextRequest) {
       raw_size: raw.length,
       hash,
     })
-  } catch (err: any) {
-    if (err.code === 'ENOENT') {
+  } catch (error: unknown) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
       return NextResponse.json({ error: 'Config file not found', path: configPath }, { status: 404 })
     }
-    return NextResponse.json({ error: `Failed to read config: ${err.message}` }, { status: 500 })
+    return NextResponse.json({ error: 'Failed to read gateway configuration' }, { status: 500 })
   }
 }
 
@@ -104,8 +109,11 @@ async function getSchema(): Promise<NextResponse> {
 export async function PUT(request: NextRequest) {
   const auth = requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDeny = denyUnscopedResourceForStrictWorkspace(auth.user, 'runtime_configuration', new URL(request.url).pathname)
+  if (isolationDeny) return isolationDeny
 
-  const rateCheck = mutationLimiter(request)
+  const limitKey = `${auth.user.tenant_id ?? 1}:${auth.user.workspace_id ?? 1}:${auth.user.id}`
+  const rateCheck = gatewayConfigMutationLimiter(limitKey)
   if (rateCheck) return rateCheck
 
   const action = request.nextUrl.searchParams.get('action')
@@ -128,7 +136,7 @@ export async function PUT(request: NextRequest) {
   const body = result.data
 
   // Block writes to sensitive paths
-  const blockedPaths = ['gateway.auth.password', 'gateway.auth.secret']
+  const blockedPaths = ['gateway.auth.password', 'gateway.auth.secret', 'gateway.auth.token']
   for (const key of Object.keys(body.updates)) {
     if (blockedPaths.some(bp => key.startsWith(bp))) {
       return NextResponse.json({ error: `Cannot modify protected field: ${key}` }, { status: 403 })
@@ -151,11 +159,11 @@ export async function PUT(request: NextRequest) {
       }
     }
 
-    const parsed = JSON.parse(raw)
+    const parsed = parseJsonRelaxed<Record<string, unknown>>(raw)
 
     for (const dotPath of Object.keys(body.updates)) {
       const [rootKey] = dotPath.split('.')
-      if (!rootKey || !(rootKey in parsed)) {
+      if (!rootKey || !Object.hasOwn(parsed, rootKey)) {
         return NextResponse.json(
           { error: `Unknown config root: ${rootKey || dotPath}` },
           { status: 400 },
@@ -166,7 +174,7 @@ export async function PUT(request: NextRequest) {
     // Apply updates via dot-notation
     const appliedKeys: string[] = []
     for (const [dotPath, value] of Object.entries(body.updates)) {
-      setNestedValue(parsed, dotPath, value)
+      setNestedConfigValue(parsed, dotPath, value)
       appliedKeys.push(dotPath)
     }
 
@@ -188,8 +196,8 @@ export async function PUT(request: NextRequest) {
       count: appliedKeys.length,
       hash: computeHash(newRaw),
     })
-  } catch (err: any) {
-    return NextResponse.json({ error: `Failed to update config: ${err.message}` }, { status: 500 })
+  } catch {
+    return NextResponse.json({ error: 'Failed to update gateway configuration' }, { status: 500 })
   }
 }
 
@@ -214,9 +222,8 @@ async function applyConfig(request: NextRequest, auth: any): Promise<NextRespons
     })
 
     if (!res.ok) {
-      const text = await res.text().catch(() => '')
       return NextResponse.json(
-        { error: `Apply failed (${res.status}): ${text}` },
+        { error: `Gateway rejected config apply with status ${res.status}` },
         { status: 502 },
       )
     }
@@ -252,9 +259,8 @@ async function updateSystem(request: NextRequest, auth: any): Promise<NextRespon
     })
 
     if (!res.ok) {
-      const text = await res.text().catch(() => '')
       return NextResponse.json(
-        { error: `Update failed (${res.status}): ${text}` },
+        { error: `Gateway rejected system update with status ${res.status}` },
         { status: 502 },
       )
     }
@@ -267,17 +273,6 @@ async function updateSystem(request: NextRequest, auth: any): Promise<NextRespon
       { status: 502 },
     )
   }
-}
-
-/** Set a value in a nested object using dot-notation path */
-function setNestedValue(obj: any, path: string, value: any) {
-  const keys = path.split('.')
-  let current = obj
-  for (let i = 0; i < keys.length - 1; i++) {
-    if (current[keys[i]] === undefined) current[keys[i]] = {}
-    current = current[keys[i]]
-  }
-  current[keys[keys.length - 1]] = value
 }
 
 /** Redact sensitive values for display */

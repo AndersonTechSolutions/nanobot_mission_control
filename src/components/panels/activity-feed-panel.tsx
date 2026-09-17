@@ -1,9 +1,11 @@
 'use client'
 
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
 import { Loader } from '@/components/ui/loader'
 import { useMissionControl } from '@/store'
+import { apiFetch } from '@/lib/api-client'
 import { useSmartPoll } from '@/lib/use-smart-poll'
 
 interface Activity {
@@ -90,11 +92,12 @@ function groupByDay(activities: Activity[]): Record<string, Activity[]> {
 
 // ── Activity row (flat feed) ────────────────────
 function ActivityRow({ activity }: { activity: Activity }) {
+  const t = useTranslations('activityFeed')
   return (
     <div className="bg-card rounded-lg p-3 border-l-2 border-border hover:bg-surface-1 transition-smooth">
       <div className="flex items-start gap-3">
         <div
-          className={`flex-shrink-0 w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold ${
+          className={`shrink-0 w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold ${
             activityColors[activity.type]
               ?.replace('text-', 'bg-')
               .replace('-400', '-500/15') || 'bg-surface-2'
@@ -117,7 +120,7 @@ function ActivityRow({ activity }: { activity: Activity }) {
                 <div className="mt-2 p-2 bg-surface-1 rounded-md text-xs border border-border/50">
                   {activity.entity.type === 'task' && (
                     <div>
-                      <span className="text-muted-foreground">Task:</span>
+                      <span className="text-muted-foreground">{t('entityTask')}</span>
                       <span className="text-foreground ml-1">{activity.entity.title}</span>
                       {activity.entity.status && (
                         <span className="ml-2 px-1.5 py-0.5 bg-primary/10 text-primary rounded text-[10px]">
@@ -128,7 +131,7 @@ function ActivityRow({ activity }: { activity: Activity }) {
                   )}
                   {activity.entity.type === 'comment' && (
                     <div>
-                      <span className="text-muted-foreground">Comment on:</span>
+                      <span className="text-muted-foreground">{t('entityCommentOn')}</span>
                       <span className="text-foreground ml-1">{activity.entity.task_title}</span>
                       {activity.entity.content_preview && (
                         <div className="mt-1 text-muted-foreground/70 italic">
@@ -139,7 +142,7 @@ function ActivityRow({ activity }: { activity: Activity }) {
                   )}
                   {activity.entity.type === 'agent' && (
                     <div>
-                      <span className="text-muted-foreground">Agent:</span>
+                      <span className="text-muted-foreground">{t('entityAgent')}</span>
                       <span className="text-foreground ml-1">{activity.entity.name}</span>
                       {activity.entity.status && (
                         <span className="ml-2 px-1.5 py-0.5 bg-green-500/10 text-green-400 rounded text-[10px]">
@@ -154,7 +157,7 @@ function ActivityRow({ activity }: { activity: Activity }) {
               {activity.data && Object.keys(activity.data).length > 0 && (
                 <details className="mt-2">
                   <summary className="text-xs text-muted-foreground/60 cursor-pointer hover:text-muted-foreground">
-                    Show details
+                    {t('showDetails')}
                   </summary>
                   <pre className="mt-1 text-xs text-muted-foreground bg-surface-1 p-2 rounded-md overflow-auto max-h-32 border border-border/50">
                     {JSON.stringify(activity.data, null, 2)}
@@ -163,7 +166,7 @@ function ActivityRow({ activity }: { activity: Activity }) {
               )}
             </div>
 
-            <div className="flex-shrink-0 text-[10px] text-muted-foreground/50">
+            <div className="shrink-0 text-[10px] text-muted-foreground/50">
               {formatRelativeTime(activity.created_at)}
             </div>
           </div>
@@ -178,7 +181,7 @@ function TimelineRow({ activity }: { activity: Activity }) {
   return (
     <div className="flex items-start gap-2.5 pl-3 py-1.5 hover:bg-secondary/30 rounded-r-lg transition-smooth relative">
       <span
-        className={`absolute -left-[5px] top-3 w-2 h-2 rounded-full bg-card border-2 ${
+        className={`absolute left-[-5px] top-3 w-2 h-2 rounded-full bg-card border-2 ${
           activity.type === 'agent_status_change'
             ? 'border-yellow-400'
             : activity.type.startsWith('task')
@@ -195,7 +198,7 @@ function TimelineRow({ activity }: { activity: Activity }) {
         <p className="text-xs text-foreground">{activity.description}</p>
         {activity.entity?.title && (
           <p className="text-2xs text-muted-foreground mt-0.5 truncate">
-            {activity.entity.type === 'task' ? `Task: ${activity.entity.title}` : activity.entity.title}
+            {activity.entity.type === 'task' ? `${activity.entity.title}` : activity.entity.title}
           </p>
         )}
       </div>
@@ -211,6 +214,7 @@ function TimelineRow({ activity }: { activity: Activity }) {
 
 // ── Main Component ──────────────────────────────
 export function ActivityFeedPanel() {
+  const t = useTranslations('activityFeed')
   const { agents } = useMissionControl()
 
   const [activities, setActivities] = useState<Activity[]>([])
@@ -286,9 +290,7 @@ export function ActivityFeedPanel() {
   // ── Fetch sessions (for agent sidebar) ────────
   const fetchSessions = useCallback(async () => {
     try {
-      const res = await fetch('/api/sessions')
-      if (!res.ok) return
-      const data = await res.json()
+      const data = await apiFetch<{ sessions?: SessionInfo[] }>('/api/sessions')
       setSessions(data.sessions || [])
     } catch {
       /* silent */
@@ -309,9 +311,9 @@ export function ActivityFeedPanel() {
   return (
     <div className="h-full flex flex-col">
       {/* Header */}
-      <div className="flex justify-between items-center p-4 border-b border-border flex-shrink-0">
+      <div className="flex justify-between items-center p-4 border-b border-border shrink-0">
         <div className="flex items-center gap-3">
-          <h2 className="text-xl font-bold text-foreground">Activity</h2>
+          <h2 className="text-xl font-bold text-foreground">{t('title')}</h2>
           <div
             className={`w-2.5 h-2.5 rounded-full ${autoRefresh ? 'bg-green-500 animate-pulse' : 'bg-muted-foreground/30'}`}
           />
@@ -322,20 +324,20 @@ export function ActivityFeedPanel() {
             variant={autoRefresh ? 'success' : 'secondary'}
             size="sm"
           >
-            {autoRefresh ? 'Live' : 'Paused'}
+            {autoRefresh ? t('live') : t('paused')}
           </Button>
           <Button onClick={() => fetchActivities()} size="sm">
-            Refresh
+            {t('refresh')}
           </Button>
         </div>
       </div>
 
       {/* Filters + Agent Selector */}
-      <div className="p-4 border-b border-border bg-surface-1 flex-shrink-0">
+      <div className="p-4 border-b border-border bg-surface-1 shrink-0">
         <div className="flex gap-4 flex-wrap items-end">
           {/* Agent filter */}
           <div>
-            <label className="block text-xs text-muted-foreground mb-1">Agent</label>
+            <label className="block text-xs text-muted-foreground mb-1">{t('filterAgent')}</label>
             <div className="flex gap-1 flex-wrap">
               <Button
                 onClick={() => {
@@ -345,7 +347,7 @@ export function ActivityFeedPanel() {
                 variant={selectedAgent === '' ? 'default' : 'secondary'}
                 size="xs"
               >
-                All
+                {t('filterAll')}
               </Button>
               {agents.map((a) => (
                 <Button
@@ -377,13 +379,13 @@ export function ActivityFeedPanel() {
 
           {/* Type filter */}
           <div>
-            <label className="block text-xs text-muted-foreground mb-1">Type</label>
+            <label className="block text-xs text-muted-foreground mb-1">{t('filterType')}</label>
             <select
               value={filter.type}
               onChange={(e) => setFilter((prev) => ({ ...prev, type: e.target.value }))}
-              className="bg-surface-2 text-foreground text-sm rounded-md px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-primary/50 border border-border"
+              className="bg-surface-2 text-foreground text-sm rounded-md px-3 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-primary/50 border border-border"
             >
-              <option value="">All Types</option>
+              <option value="">{t('allTypes')}</option>
               {activityTypes.map((type) => (
                 <option key={type} value={type}>
                   {activityIcons[type] || '•'} {type.replace('_', ' ')}
@@ -394,11 +396,11 @@ export function ActivityFeedPanel() {
 
           {/* Limit */}
           <div>
-            <label className="block text-xs text-muted-foreground mb-1">Limit</label>
+            <label className="block text-xs text-muted-foreground mb-1">{t('filterLimit')}</label>
             <select
               value={filter.limit}
               onChange={(e) => setFilter((prev) => ({ ...prev, limit: parseInt(e.target.value) }))}
-              className="bg-surface-2 text-foreground text-sm rounded-md px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-primary/50 border border-border"
+              className="bg-surface-2 text-foreground text-sm rounded-md px-3 py-1.5 focus:outline-hidden focus:ring-1 focus:ring-primary/50 border border-border"
             >
               <option value={25}>25</option>
               <option value={50}>50</option>
@@ -428,7 +430,7 @@ export function ActivityFeedPanel() {
       <div className="flex-1 overflow-y-auto p-4">
         {loading && activities.length === 0 ? (
           <div className="flex items-center justify-center h-32">
-            <Loader variant="inline" label="Loading activities" />
+            <Loader variant="inline" label={t('loadingActivities')} />
           </div>
         ) : activities.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-32 text-muted-foreground/50">
@@ -444,9 +446,9 @@ export function ActivityFeedPanel() {
             >
               <path d="M2 4h12M2 8h8M2 12h10" />
             </svg>
-            <p className="text-sm">No activities found</p>
+            <p className="text-sm">{t('noActivities')}</p>
             <p className="text-xs mt-1">
-              {selectedAgent ? `No activity recorded for ${selectedAgent}` : 'Try adjusting your filters'}
+              {selectedAgent ? t('noActivityForAgent', { agent: selectedAgent }) : t('tryAdjustingFilters')}
             </p>
           </div>
         ) : isAgentView ? (
@@ -470,7 +472,7 @@ export function ActivityFeedPanel() {
 
                   <div className="space-y-2 text-xs">
                     <div className="flex justify-between">
-                      <span className="text-muted-foreground">Status</span>
+                      <span className="text-muted-foreground">{t('agentStatus')}</span>
                       <span
                         className={`font-medium ${
                           selectedAgentData.status === 'busy'
@@ -487,7 +489,7 @@ export function ActivityFeedPanel() {
                     </div>
                     {selectedAgentData.last_seen && (
                       <div className="flex justify-between">
-                        <span className="text-muted-foreground">Last seen</span>
+                        <span className="text-muted-foreground">{t('lastSeen')}</span>
                         <span className="text-foreground font-mono-tight">
                           {formatRelativeTime(selectedAgentData.last_seen)}
                         </span>
@@ -495,7 +497,7 @@ export function ActivityFeedPanel() {
                     )}
                     {selectedAgentData.last_activity && (
                       <div className="flex justify-between">
-                        <span className="text-muted-foreground">Last action</span>
+                        <span className="text-muted-foreground">{t('lastAction')}</span>
                         <span
                           className="text-foreground truncate max-w-[140px]"
                           title={selectedAgentData.last_activity}
@@ -508,15 +510,15 @@ export function ActivityFeedPanel() {
                       <>
                         <div className="border-t border-border pt-2 mt-2" />
                         <div className="flex justify-between">
-                          <span className="text-muted-foreground">Tasks assigned</span>
+                          <span className="text-muted-foreground">{t('tasksAssigned')}</span>
                           <span className="text-foreground">{selectedAgentData.taskStats.assigned}</span>
                         </div>
                         <div className="flex justify-between">
-                          <span className="text-muted-foreground">In progress</span>
+                          <span className="text-muted-foreground">{t('inProgress')}</span>
                           <span className="text-foreground">{selectedAgentData.taskStats.in_progress}</span>
                         </div>
                         <div className="flex justify-between">
-                          <span className="text-muted-foreground">Completed</span>
+                          <span className="text-muted-foreground">{t('completed')}</span>
                           <span className="text-foreground">{selectedAgentData.taskStats.completed}</span>
                         </div>
                       </>
@@ -527,7 +529,7 @@ export function ActivityFeedPanel() {
 
               {agentSessions.length > 0 && (
                 <div className="rounded-lg border border-border p-4">
-                  <h4 className="text-xs font-semibold text-foreground mb-2">Active Sessions</h4>
+                  <h4 className="text-xs font-semibold text-foreground mb-2">{t('activeSessions')}</h4>
                   <div className="space-y-2">
                     {agentSessions.map((s) => (
                       <div key={s.id} className="text-xs space-y-0.5">
@@ -557,7 +559,7 @@ export function ActivityFeedPanel() {
                     <div className="flex items-center gap-2 mb-2">
                       <span className="text-xs font-semibold text-muted-foreground">{day}</span>
                       <span className="flex-1 h-px bg-border" />
-                      <span className="text-2xs text-muted-foreground">{dayActivities.length} events</span>
+                      <span className="text-2xs text-muted-foreground">{t('events', { count: dayActivities.length })}</span>
                     </div>
                     <div className="space-y-1 pl-2 border-l-2 border-border/50">
                       {dayActivities.map((act) => (
@@ -575,10 +577,10 @@ export function ActivityFeedPanel() {
                       variant="ghost"
                       size="xs"
                     >
-                      Newer
+                      {t('newer')}
                     </Button>
                     <span className="text-xs text-muted-foreground">
-                      Page {page + 1} of {totalPages}
+                      {t('pageOf', { page: page + 1, total: totalPages })}
                     </span>
                     <Button
                       onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
@@ -586,7 +588,7 @@ export function ActivityFeedPanel() {
                       variant="ghost"
                       size="xs"
                     >
-                      Older
+                      {t('older')}
                     </Button>
                   </div>
                 )}
@@ -604,14 +606,14 @@ export function ActivityFeedPanel() {
       </div>
 
       {/* Footer */}
-      <div className="border-t border-border p-3 bg-surface-1 text-xs text-muted-foreground flex-shrink-0">
+      <div className="border-t border-border p-3 bg-surface-1 text-xs text-muted-foreground shrink-0">
         <div className="flex justify-between items-center">
           <span>
             {isAgentView
-              ? `${total} events for ${selectedAgent}`
-              : `Showing ${activities.length} activities${filter.type ? ' (filtered)' : ''}`}
+              ? t('footerAgentEvents', { total, agent: selectedAgent })
+              : t('footerShowing', { count: activities.length, filtered: filter.type ? ` ${t('filtered')}` : '' })}
           </span>
-          <span>Last updated: {new Date(lastRefresh).toLocaleTimeString()}</span>
+          <span>{t('lastUpdated', { time: new Date(lastRefresh).toLocaleTimeString() })}</span>
         </div>
       </div>
     </div>

@@ -3,6 +3,7 @@ import { getDatabase, db_helpers } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
 import { eventBus } from '@/lib/event-bus'
 import { logger } from '@/lib/logger'
+import { denyUnscopedResourceForStrictWorkspace } from '@/lib/workspace-isolation'
 
 interface PipelineStep {
   template_id: number
@@ -101,6 +102,11 @@ export async function POST(request: NextRequest) {
     const body = await request.json()
     const { action, pipeline_id, run_id } = body
 
+    if (action === 'start' || action === 'advance') {
+      const isolationDeny = denyUnscopedResourceForStrictWorkspace(auth.user, 'runtime_tasks', new URL(request.url).pathname)
+      if (isolationDeny) return isolationDeny
+    }
+
     if (action === 'start') {
       return startPipeline(db, pipeline_id, auth.user?.username || 'system', workspaceId)
     } else if (action === 'advance') {
@@ -160,8 +166,8 @@ async function startPipeline(db: ReturnType<typeof getDatabase>, pipelineId: num
   // Get template names for snapshot
   const templateIds = steps.map(s => s.template_id)
   const templates = db.prepare(
-    `SELECT id, name, model, task_prompt, timeout_seconds FROM workflow_templates WHERE id IN (${templateIds.map(() => '?').join(',')})`
-  ).all(...templateIds) as Array<{ id: number; name: string; model: string; task_prompt: string; timeout_seconds: number }>
+    `SELECT id, name, model, task_prompt, timeout_seconds FROM workflow_templates WHERE id IN (${templateIds.map(() => '?').join(',')}) AND workspace_id = ?`
+  ).all(...templateIds, workspaceId) as Array<{ id: number; name: string; model: string; task_prompt: string; timeout_seconds: number }>
   const templateMap = new Map(templates.map(t => [t.id, t]))
 
   // Build step snapshot
@@ -200,6 +206,7 @@ async function startPipeline(db: ReturnType<typeof getDatabase>, pipelineId: num
   db_helpers.logActivity('pipeline_started', 'pipeline', pipelineId, triggeredBy, `Started pipeline: ${pipeline.name}`, { run_id: runId }, workspaceId)
 
   eventBus.broadcast('activity.created', {
+    workspace_id: workspaceId,
     type: 'pipeline_started',
     entity_type: 'pipeline',
     entity_id: pipelineId,
@@ -254,6 +261,7 @@ async function advanceRun(db: ReturnType<typeof getDatabase>, runId: number, suc
       .run(finalStatus, currentIdx, JSON.stringify(steps), now, runId, workspaceId)
 
     eventBus.broadcast('activity.created', {
+      workspace_id: workspaceId,
       type: 'pipeline_completed',
       entity_type: 'pipeline',
       entity_id: run.pipeline_id,
@@ -267,8 +275,8 @@ async function advanceRun(db: ReturnType<typeof getDatabase>, runId: number, suc
   steps[nextIdx].status = 'running'
   steps[nextIdx].started_at = now
 
-  const template = db.prepare('SELECT id, name, model, task_prompt, timeout_seconds FROM workflow_templates WHERE id = ?')
-    .get(steps[nextIdx].template_id) as any
+  const template = db.prepare('SELECT id, name, model, task_prompt, timeout_seconds FROM workflow_templates WHERE id = ? AND workspace_id = ?')
+    .get(steps[nextIdx].template_id, workspaceId) as any
 
   let spawnResult: any = null
   if (template) {

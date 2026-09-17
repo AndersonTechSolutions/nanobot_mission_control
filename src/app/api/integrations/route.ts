@@ -12,6 +12,7 @@ import { mutationLimiter } from '@/lib/rate-limit'
 import { detectProviderSubscriptions } from '@/lib/provider-subscriptions'
 import { getPluginIntegrations, getPluginCategories } from '@/lib/plugins'
 import type { PluginIntegrationDef } from '@/lib/plugins'
+import { denyUnscopedResourceForStrictWorkspace } from '@/lib/workspace-isolation'
 
 // ---------------------------------------------------------------------------
 // Integration registry
@@ -42,15 +43,16 @@ const INTEGRATION_PROBE_TTL_MS = 5000
 
 const INTEGRATIONS: IntegrationDef[] = [
   // AI Providers
-  { id: 'anthropic', name: 'Anthropic', category: 'ai', envVars: ['ANTHROPIC_API_KEY'], vaultItem: 'nanobot-anthropic-api-key', testable: true },
-  { id: 'openai', name: 'OpenAI', category: 'ai', envVars: ['OPENAI_API_KEY'], vaultItem: 'nanobot-openai-api-key', testable: true },
-  { id: 'openrouter', name: 'OpenRouter', category: 'ai', envVars: ['OPENROUTER_API_KEY'], vaultItem: 'nanobot-openrouter-api-key', testable: true },
-  { id: 'nvidia', name: 'NVIDIA', category: 'ai', envVars: ['NVIDIA_API_KEY'], vaultItem: 'nanobot-nvidia-api-key' },
-  { id: 'moonshot', name: 'Moonshot / Kimi', category: 'ai', envVars: ['MOONSHOT_API_KEY'], vaultItem: 'nanobot-moonshot-api-key' },
-  { id: 'ollama', name: 'Ollama (Local)', category: 'ai', envVars: ['OLLAMA_API_KEY'], vaultItem: 'nanobot-ollama-api-key' },
+  { id: 'anthropic', name: 'Anthropic', category: 'ai', envVars: ['ANTHROPIC_API_KEY'], vaultItem: 'openclaw-anthropic-api-key', testable: true },
+  { id: 'openai', name: 'OpenAI', category: 'ai', envVars: ['OPENAI_API_KEY'], vaultItem: 'openclaw-openai-api-key', testable: true },
+  { id: 'openrouter', name: 'OpenRouter', category: 'ai', envVars: ['OPENROUTER_API_KEY'], vaultItem: 'openclaw-openrouter-api-key', testable: true },
+  { id: 'venice', name: 'Venice AI', category: 'ai', envVars: ['VENICE_API_KEY'], vaultItem: 'openclaw-venice-api-key', testable: true },
+  { id: 'nvidia', name: 'NVIDIA', category: 'ai', envVars: ['NVIDIA_API_KEY'], vaultItem: 'openclaw-nvidia-api-key' },
+  { id: 'moonshot', name: 'Moonshot / Kimi', category: 'ai', envVars: ['MOONSHOT_API_KEY'], vaultItem: 'openclaw-moonshot-api-key' },
+  { id: 'ollama', name: 'Ollama (Local)', category: 'ai', envVars: ['OLLAMA_API_KEY'], vaultItem: 'openclaw-ollama-api-key' },
 
   // Search
-  { id: 'brave', name: 'Brave Search', category: 'search', envVars: ['BRAVE_API_KEY'], vaultItem: 'nanobot-brave-api-key' },
+  { id: 'brave', name: 'Brave Search', category: 'search', envVars: ['BRAVE_API_KEY'], vaultItem: 'openclaw-brave-api-key' },
 
   // Social
   {
@@ -62,11 +64,11 @@ const INTEGRATIONS: IntegrationDef[] = [
   },
   { id: 'linkedin', name: 'LinkedIn', category: 'social', envVars: ['LINKEDIN_ACCESS_TOKEN'] },
 
-  // Messaging
-  { id: 'telegram', name: 'Telegram', category: 'messaging', envVars: ['TELEGRAM_BOT_TOKEN'], vaultItem: 'nanobot-telegram-bot-token', testable: true },
+  // Messaging — add entries here for each Telegram bot you run
+  { id: 'telegram', name: 'Telegram', category: 'messaging', envVars: ['TELEGRAM_BOT_TOKEN'], vaultItem: 'openclaw-telegram-bot-token', testable: true },
 
   // Dev Tools
-  { id: 'github', name: 'GitHub', category: 'devtools', envVars: ['GITHUB_TOKEN'], vaultItem: 'nanobot-github-token', testable: true },
+  { id: 'github', name: 'GitHub', category: 'devtools', envVars: ['GITHUB_TOKEN'], vaultItem: 'openclaw-github-token', testable: true },
 
   // Productivity
   {
@@ -82,7 +84,7 @@ const INTEGRATIONS: IntegrationDef[] = [
   { id: 'onepassword', name: '1Password', category: 'security', envVars: ['OP_SERVICE_ACCOUNT_TOKEN'] },
 
   // Infrastructure
-  { id: 'gateway', name: 'Gateway Auth', category: 'infra', envVars: ['NANOBOT_GATEWAY_TOKEN'], vaultItem: 'nanobot-gateway-token' },
+  { id: 'gateway', name: 'Gateway Auth', category: 'infra', envVars: ['OPENCLAW_GATEWAY_TOKEN'], vaultItem: 'openclaw-openclaw-gateway-token' },
 
   // Browser Automation
   { id: 'hyperbrowser', name: 'Hyperbrowser', category: 'browser', envVars: ['HYPERBROWSER_API_KEY'], testable: true, recommendation: 'Cloud browser automation for AI agents. Get a key at hyperbrowser.ai' },
@@ -108,7 +110,7 @@ const BLOCKED_VARS = new Set([
 const BLOCKED_PREFIXES = ['LD_', 'DYLD_']
 
 // ---------------------------------------------------------------------------
-// .env parser  -- preserves comments, blanks, and ordering
+// .env parser  — preserves comments, blanks, and ordering
 // ---------------------------------------------------------------------------
 
 interface EnvLine {
@@ -148,8 +150,8 @@ function serializeEnv(lines: EnvLine[]): string {
 }
 
 function getEnvPath(): string | null {
-  if (!config.nanobotStateDir) return null
-  return join(config.nanobotStateDir, '.env')
+  if (!config.openclawStateDir) return null
+  return join(config.openclawStateDir, '.env')
 }
 
 async function readEnvFile(): Promise<{ lines: EnvLine[]; raw: string } | null> {
@@ -158,8 +160,8 @@ async function readEnvFile(): Promise<{ lines: EnvLine[]; raw: string } | null> 
   try {
     const raw = await readFile(envPath, 'utf-8')
     return { lines: parseEnv(raw), raw }
-  } catch (err: unknown) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { lines: [], raw: '' }
+  } catch (err: any) {
+    if (err.code === 'ENOENT') return { lines: [], raw: '' }
     throw err
   }
 }
@@ -283,14 +285,14 @@ function checkOpAvailable(): boolean {
 
 /**
  * Build env for op CLI. The OP_SERVICE_ACCOUNT_TOKEN may live in the
- * nanobot .env (not the MC .env that systemd loads). Read it at
+ * OpenClaw .env (not the MC .env that systemd loads). Read it at
  * runtime so the op CLI can authenticate.
  */
 async function getOpEnv(): Promise<NodeJS.ProcessEnv> {
   const base: NodeJS.ProcessEnv = { ...process.env }
   // Already in process env? Use it.
   if (base.OP_SERVICE_ACCOUNT_TOKEN) return base
-  // Try reading from the nanobot .env
+  // Try reading from the OpenClaw .env
   const envData = await readEnvFile()
   if (envData) {
     for (const line of envData.lines) {
@@ -304,16 +306,18 @@ async function getOpEnv(): Promise<NodeJS.ProcessEnv> {
 }
 
 // ---------------------------------------------------------------------------
-// GET /api/integrations -- list all integrations with status + redacted values
+// GET /api/integrations — list all integrations with status + redacted values
 // ---------------------------------------------------------------------------
 
 export async function GET(request: NextRequest) {
   const auth = requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDeny = denyUnscopedResourceForStrictWorkspace(auth.user, 'runtime_configuration', new URL(request.url).pathname)
+  if (isolationDeny) return isolationDeny
 
   const envData = await readEnvFile()
   if (!envData) {
-    return NextResponse.json({ error: 'NANOBOT_STATE_DIR not configured' }, { status: 404 })
+    return NextResponse.json({ error: 'OPENCLAW_STATE_DIR not configured' }, { status: 404 })
   }
 
   const envMap = new Map<string, string>()
@@ -461,13 +465,15 @@ export async function GET(request: NextRequest) {
 }
 
 // ---------------------------------------------------------------------------
-// PUT /api/integrations -- update/add env vars
+// PUT /api/integrations — update/add env vars
 // Body: { vars: { KEY: "value", ... } }
 // ---------------------------------------------------------------------------
 
 export async function PUT(request: NextRequest) {
   const auth = requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDeny = denyUnscopedResourceForStrictWorkspace(auth.user, 'runtime_configuration', new URL(request.url).pathname)
+  if (isolationDeny) return isolationDeny
 
   const body = await request.json().catch(() => null)
   if (!body?.vars || typeof body.vars !== 'object') {
@@ -485,7 +491,7 @@ export async function PUT(request: NextRequest) {
 
   const envData = await readEnvFile()
   if (!envData) {
-    return NextResponse.json({ error: 'NANOBOT_STATE_DIR not configured' }, { status: 404 })
+    return NextResponse.json({ error: 'OPENCLAW_STATE_DIR not configured' }, { status: 404 })
   }
 
   const { lines } = envData
@@ -521,16 +527,18 @@ export async function PUT(request: NextRequest) {
 }
 
 // ---------------------------------------------------------------------------
-// DELETE /api/integrations?keys=KEY1,KEY2 -- remove env vars
+// DELETE /api/integrations?keys=KEY1,KEY2 — remove env vars
 // ---------------------------------------------------------------------------
 
 export async function DELETE(request: NextRequest) {
   const auth = requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDeny = denyUnscopedResourceForStrictWorkspace(auth.user, 'runtime_configuration', new URL(request.url).pathname)
+  if (isolationDeny) return isolationDeny
 
-  let body: Record<string, unknown>
+  let body: any
   try { body = await request.json() } catch { return NextResponse.json({ error: 'Request body required' }, { status: 400 }) }
-  const keysParam = Array.isArray(body.keys) ? body.keys.join(',') : body.keys as string
+  const keysParam = Array.isArray(body.keys) ? body.keys.join(',') : body.keys
   if (!keysParam) {
     return NextResponse.json({ error: 'keys parameter required (comma-separated string or array)' }, { status: 400 })
   }
@@ -548,7 +556,7 @@ export async function DELETE(request: NextRequest) {
 
   const envData = await readEnvFile()
   if (!envData) {
-    return NextResponse.json({ error: 'NANOBOT_STATE_DIR not configured' }, { status: 404 })
+    return NextResponse.json({ error: 'OPENCLAW_STATE_DIR not configured' }, { status: 404 })
   }
 
   const removed: string[] = []
@@ -577,13 +585,15 @@ export async function DELETE(request: NextRequest) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /api/integrations -- action dispatcher (test, pull)
+// POST /api/integrations — action dispatcher (test, pull)
 // Body: { action: "test"|"pull", integrationId: "..." }
 // ---------------------------------------------------------------------------
 
 export async function POST(request: NextRequest) {
   const auth = requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDeny = denyUnscopedResourceForStrictWorkspace(auth.user, 'runtime_configuration', new URL(request.url).pathname)
+  if (isolationDeny) return isolationDeny
 
   const rateCheck = mutationLimiter(request)
   if (rateCheck) return rateCheck
@@ -592,7 +602,7 @@ export async function POST(request: NextRequest) {
   if ('error' in result) return result.error
   const body = result.data
 
-  // pull-all is a batch action -- no integrationId needed
+  // pull-all is a batch action — no integrationId needed
   if (body.action === 'pull-all') {
     return handlePullAll(request, auth.user, body.category)
   }
@@ -647,7 +657,7 @@ async function handleTest(
 
   const envData = await readEnvFile()
   if (!envData) {
-    return NextResponse.json({ error: 'NANOBOT_STATE_DIR not configured' }, { status: 404 })
+    return NextResponse.json({ error: 'OPENCLAW_STATE_DIR not configured' }, { status: 404 })
   }
 
   const envMap = new Map<string, string>()
@@ -735,6 +745,19 @@ async function handleTest(
         break
       }
 
+      case 'venice': {
+        const key = getEffectiveEnvValue(envMap, 'VENICE_API_KEY')
+        if (!key) return NextResponse.json({ ok: false, detail: 'API key not set' })
+        const res = await fetch('https://api.venice.ai/api/v1/models', {
+          headers: { Authorization: `Bearer ${key}` },
+          signal: AbortSignal.timeout(5000),
+        })
+        result = res.ok
+          ? { ok: true, detail: 'API key valid' }
+          : { ok: false, detail: `HTTP ${res.status}` }
+        break
+      }
+
       case 'hyperbrowser': {
         const key = getEffectiveEnvValue(envMap, 'HYPERBROWSER_API_KEY')
         if (!key) return NextResponse.json({ ok: false, detail: 'API key not set' })
@@ -811,14 +834,13 @@ async function handleTest(
     })
 
     return NextResponse.json(result)
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Connection failed'
-    return NextResponse.json({ ok: false, detail: message })
+  } catch (err: any) {
+    return NextResponse.json({ ok: false, detail: err.message || 'Connection failed' })
   }
 }
 
 // ---------------------------------------------------------------------------
-// Pull value from 1Password vault -- uses execFileSync (no shell) for safety
+// Pull value from 1Password vault — uses execFileSync (no shell) for safety
 // ---------------------------------------------------------------------------
 
 async function handlePull(
@@ -840,7 +862,7 @@ async function handlePull(
       return NextResponse.json({ error: 'OP_SERVICE_ACCOUNT_TOKEN not found in environment or .env' }, { status: 400 })
     }
 
-    // execFileSync passes args as array -- no shell interpolation possible
+    // execFileSync passes args as array — no shell interpolation possible
     const secret = execFileSync('op', [
       'item', 'get', integration.vaultItem,
       '--vault', process.env.OP_VAULT_NAME || 'default',
@@ -863,7 +885,7 @@ async function handlePull(
     // Write to .env
     const envData = await readEnvFile()
     if (!envData) {
-      return NextResponse.json({ error: 'NANOBOT_STATE_DIR not configured' }, { status: 404 })
+      return NextResponse.json({ error: 'OPENCLAW_STATE_DIR not configured' }, { status: 404 })
     }
 
     const { lines } = envData
@@ -895,10 +917,9 @@ async function handlePull(
       detail: `Pulled ${envVar} from 1Password`,
       redacted: redactValue(value),
     })
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err)
+  } catch (err: any) {
     return NextResponse.json({
-      error: `1Password pull failed: ${message}`,
+      error: `1Password pull failed: ${err.message}`,
     }, { status: 500 })
   }
 }
@@ -933,7 +954,7 @@ async function handlePullAll(
 
   const envData = await readEnvFile()
   if (!envData) {
-    return NextResponse.json({ error: 'NANOBOT_STATE_DIR not configured' }, { status: 404 })
+    return NextResponse.json({ error: 'OPENCLAW_STATE_DIR not configured' }, { status: 404 })
   }
 
   const { lines } = envData
@@ -974,9 +995,8 @@ async function handlePullAll(
       }
 
       results.push({ id: integration.id, envVar, ok: true, detail: `Pulled ${envVar}` })
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Failed'
-      results.push({ id: integration.id, envVar, ok: false, detail: message })
+    } catch (err: any) {
+      results.push({ id: integration.id, envVar, ok: false, detail: err.message || 'Failed' })
     }
   }
 

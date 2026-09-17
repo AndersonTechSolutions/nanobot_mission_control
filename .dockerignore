@@ -5,5 +5,11 @@ node_modules
 .env
 *.md
 .github
-ops
-scripts
+ops/*
+!ops/templates/
+ops/templates/*
+!ops/templates/openclaw-gateway@.service
+scripts/*
+!scripts/check-node-version.mjs
+!scripts/prepare-standalone-artifact.mjs
+!scripts/load-env.sh

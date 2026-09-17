@@ -3,6 +3,7 @@ import { getDatabase } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
 import { agentTaskLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
+import { requireWorkspaceId } from '@/lib/enforcement/workspace-scope'
 
 type QueueReason = 'continue_current' | 'assigned' | 'at_capacity' | 'no_tasks_available'
 
@@ -51,7 +52,9 @@ export async function GET(request: NextRequest) {
 
   try {
     const db = getDatabase()
-    const workspaceId = auth.user.workspace_id
+    const wsResult = requireWorkspaceId(auth.user)
+    if (!('workspaceId' in wsResult)) return wsResult.response
+    const { workspaceId } = wsResult
     const { searchParams } = new URL(request.url)
 
     const agent =
@@ -60,6 +63,11 @@ export async function GET(request: NextRequest) {
 
     if (!agent) {
       return NextResponse.json({ error: 'Missing agent. Provide ?agent=... or x-agent-name header.' }, { status: 400 })
+    }
+
+    // Agent keys (non-admin) may only queue for themselves
+    if (auth.user.agent_name && auth.user.role !== 'admin' && agent !== auth.user.agent_name) {
+      return NextResponse.json({ error: 'Access denied: agent key may only queue tasks for itself.' }, { status: 403 })
     }
 
     const maxCapacityRaw = searchParams.get('max_capacity') || '1'
@@ -105,37 +113,28 @@ export async function GET(request: NextRequest) {
       })
     }
 
-    // Best-effort atomic pickup loop for race safety.
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      const candidate = db.prepare(`
-        SELECT *
-        FROM tasks
+    // Atomic claim: single UPDATE with subquery to eliminate SELECT-UPDATE race condition.
+    const claimed = db.prepare(`
+      UPDATE tasks
+      SET status = 'in_progress', assigned_to = ?, updated_at = ?
+      WHERE id = (
+        SELECT id FROM tasks
         WHERE workspace_id = ?
           AND status IN ('assigned', 'inbox')
           AND (assigned_to IS NULL OR assigned_to = ?)
         ORDER BY ${priorityRankSql()} ASC, due_date ASC NULLS LAST, created_at ASC
         LIMIT 1
-      `).get(workspaceId, agent) as any | undefined
+      )
+      RETURNING *
+    `).get(agent, now, workspaceId, agent) as any | undefined
 
-      if (!candidate) break
-
-      const claimed = db.prepare(`
-        UPDATE tasks
-        SET status = 'in_progress', assigned_to = ?, updated_at = ?
-        WHERE id = ? AND workspace_id = ?
-          AND status IN ('assigned', 'inbox')
-          AND (assigned_to IS NULL OR assigned_to = ?)
-      `).run(agent, now, candidate.id, workspaceId, agent)
-
-      if (claimed.changes > 0) {
-        const task = db.prepare('SELECT * FROM tasks WHERE id = ? AND workspace_id = ?').get(candidate.id, workspaceId) as any
-        return NextResponse.json({
-          task: mapTaskRow(task),
-          reason: 'assigned' as QueueReason,
-          agent,
-          timestamp: now,
-        })
-      }
+    if (claimed) {
+      return NextResponse.json({
+        task: mapTaskRow(claimed),
+        reason: 'assigned' as QueueReason,
+        agent,
+        timestamp: now,
+      })
     }
 
     return NextResponse.json({

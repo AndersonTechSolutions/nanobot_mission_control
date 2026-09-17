@@ -1,7 +1,10 @@
 'use client'
 
 import { useEffect, useState } from 'react'
+import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
+import { useMissionControl } from '@/store'
+import { apiFetch, ApiError } from '@/lib/api-client'
 
 interface OpenClawDoctorStatus {
   level: 'healthy' | 'warning' | 'error'
@@ -21,9 +24,12 @@ interface OpenClawDoctorFixProgress {
 type BannerState = 'idle' | 'fixing' | 'success' | 'error'
 
 export function OpenClawDoctorBanner() {
+  const t = useTranslations('doctorBanner')
+  const tc = useTranslations('common')
   const [doctor, setDoctor] = useState<OpenClawDoctorStatus | null>(null)
   const [loading, setLoading] = useState(true)
-  const [dismissed, setDismissed] = useState(false)
+  const doctorDismissedAt = useMissionControl(s => s.doctorDismissedAt)
+  const dismissDoctor = useMissionControl(s => s.dismissDoctor)
   const [state, setState] = useState<BannerState>('idle')
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const [showDetails, setShowDetails] = useState(false)
@@ -31,14 +37,16 @@ export function OpenClawDoctorBanner() {
 
   async function loadDoctorStatus() {
     try {
-      const res = await fetch('/api/openclaw/doctor', { cache: 'no-store' })
+      const res = await apiFetch<Response>('/api/openclaw/doctor', {
+        cache: 'no-store',
+        raw: true,
+      })
       if (!res.ok) {
         setDoctor(null)
         return
       }
       const data = await res.json()
       setDoctor(data)
-      setDismissed(false)
     } catch {
       setDoctor(null)
     } finally {
@@ -53,13 +61,13 @@ export function OpenClawDoctorBanner() {
   async function handleFix() {
     setState('fixing')
     setErrorMsg(null)
-    setFixProgress('Running OpenClaw doctor fixes…')
+    setFixProgress(t('runningFixes'))
 
     const progressMessages = [
-      'Running OpenClaw doctor fixes…',
-      'Cleaning session stores…',
-      'Archiving orphan transcripts…',
-      'Rechecking current instance health…',
+      t('runningFixes'),
+      t('cleaningSessionStores'),
+      t('archivingOrphanTranscripts'),
+      t('recheckingHealth'),
     ]
     let progressIndex = 0
     const progressTimer = window.setInterval(() => {
@@ -68,16 +76,17 @@ export function OpenClawDoctorBanner() {
     }, 1400)
 
     try {
-      const res = await fetch('/api/openclaw/doctor', { method: 'POST' })
+      const res = await apiFetch<Response>('/api/openclaw/doctor', {
+        method: 'POST',
+        body: JSON.stringify({ confirmation: 'fix_openclaw' }),
+        raw: true,
+      })
       const data = await res.json()
       window.clearInterval(progressTimer)
 
       if (!res.ok) {
         setState('error')
-        setErrorMsg(data.detail || data.error || 'OpenClaw doctor fix failed')
-        if (data.status) {
-          setDoctor(data.status)
-        }
+        setErrorMsg(data.error || t('fixFailed'))
         setFixProgress('')
         return
       }
@@ -87,13 +96,20 @@ export function OpenClawDoctorBanner() {
       setFixProgress(progress.map(item => item.detail).filter(Boolean).join(' '))
       setState(data.status?.healthy ? 'success' : 'idle')
       setShowDetails(false)
-    } catch {
+    } catch (error) {
       window.clearInterval(progressTimer)
       setState('error')
-      setErrorMsg('Network error — could not reach the server.')
+      if (error instanceof ApiError && error.code !== 'NETWORK_ERROR') {
+        setErrorMsg(error.message || t('fixFailed'))
+      } else {
+        setErrorMsg(t('networkError'))
+      }
       setFixProgress('')
     }
   }
+
+  const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000
+  const dismissed = doctorDismissedAt != null && (Date.now() - doctorDismissedAt) < TWENTY_FOUR_HOURS
 
   if (loading || dismissed || !doctor || doctor.healthy) return null
 
@@ -119,14 +135,14 @@ export function OpenClawDoctorBanner() {
   const busy = state === 'fixing'
   const headline =
     state === 'success'
-      ? 'OpenClaw doctor fix completed'
+      ? t('fixCompleted')
       : doctor.category === 'config'
-        ? 'OpenClaw config drift detected'
+        ? t('configDrift')
         : doctor.category === 'state'
-          ? 'OpenClaw state integrity warning'
+          ? t('stateIntegrity')
           : doctor.category === 'security'
-            ? 'OpenClaw security warning'
-            : 'OpenClaw doctor warnings'
+            ? t('securityWarning')
+            : t('doctorWarnings')
 
   return (
     <div className="mx-4 mt-3 mb-0">
@@ -146,7 +162,7 @@ export function OpenClawDoctorBanner() {
                 </p>
               ))}
               {extraCount > 0 && (
-                <p className="text-2xs opacity-75">+ {extraCount} more issue{extraCount === 1 ? '' : 's'}</p>
+                <p className="text-2xs opacity-75">{tc('moreIssues', { count: extraCount })}</p>
               )}
             </div>
           )}
@@ -164,21 +180,21 @@ export function OpenClawDoctorBanner() {
               disabled={busy}
               className={`shrink-0 rounded px-2.5 py-1 text-2xs font-medium transition-colors ${tone.button}`}
             >
-              {busy ? 'Running Fix…' : 'Run Doctor Fix'}
+              {busy ? t('runningFix') : t('runDoctorFix')}
             </button>
           )}
           <button
             onClick={() => setShowDetails(value => !value)}
             className={`shrink-0 rounded border px-2 py-1 text-2xs font-medium transition-colors ${tone.secondary}`}
           >
-            {showDetails ? 'Hide Details' : 'Show Details'}
+            {showDetails ? tc('hideDetails') : tc('showDetails')}
           </button>
           <Button
             variant="ghost"
             size="icon-xs"
-            onClick={() => setDismissed(true)}
+            onClick={dismissDoctor}
             className="shrink-0 hover:bg-transparent"
-            title="Dismiss"
+            title={tc('dismiss')}
           >
             <svg className="h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
               <path d="M4 4l8 8M12 4l-8 8" />

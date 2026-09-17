@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { readFile, writeFile, access } from 'fs/promises'
+import { readFile } from 'fs/promises'
+import { randomUUID } from 'node:crypto'
 import { dirname } from 'path'
+import { z } from 'zod'
 import { config, ensureDirExists } from '@/lib/config'
 import { requireRole } from '@/lib/auth'
 import { getAllGatewaySessions } from '@/lib/sessions'
@@ -9,8 +11,26 @@ import { getDatabase } from '@/lib/db'
 import { calculateTokenCost } from '@/lib/token-pricing'
 import { getProviderSubscriptionFlags } from '@/lib/provider-subscriptions'
 import { buildTaskCostReport, type TaskCostMetadata } from '@/lib/task-costs'
+import { getWorkspaceIsolation } from '@/lib/workspace-isolation'
+import { atomicReplaceFileSync } from '@/lib/atomic-file'
 
 const DATA_PATH = config.tokensPath
+const MAX_TOKEN_COUNT = Number.MAX_SAFE_INTEGER
+const tokenUsagePostSchema = z.object({
+  model: z.string().trim().min(1).max(200),
+  sessionId: z.string().trim().min(1).max(512),
+  inputTokens: z.number().finite().int().nonnegative().max(MAX_TOKEN_COUNT),
+  outputTokens: z.number().finite().int().nonnegative().max(MAX_TOKEN_COUNT),
+  operation: z.string().trim().min(1).max(100).default('chat_completion'),
+  duration: z.number().finite().nonnegative().max(7 * 24 * 60 * 60 * 1000).optional(),
+  taskId: z.union([
+    z.number().finite(),
+    z.string().trim().max(32),
+  ]).nullish(),
+}).refine(
+  ({ inputTokens, outputTokens }) => inputTokens + outputTokens <= MAX_TOKEN_COUNT,
+  { message: 'Combined token count exceeds the supported range' },
+)
 
 interface TokenUsageRecord {
   id: string
@@ -128,14 +148,24 @@ function dedupeTokenRecords(records: TokenUsageRecord[]): TokenUsageRecord[] {
   const deduped: TokenUsageRecord[] = []
 
   for (const record of records) {
+    // A single POST persists the same usage to BOTH the JSON file and the
+    // token_usage table, so the dedup key must match across those two
+    // representations of one event. Two fields legitimately differ between them
+    // and are therefore EXCLUDED from the key:
+    //   - timestamp: JSON keeps full-precision ms (Date.now()); the DB stores
+    //     created_at in seconds and reads it back as created_at*1000. Normalize
+    //     to whole seconds so both collide.
+    //   - operation: the token_usage table has no operation column, so the DB
+    //     loader hardcodes 'heartbeat' while the JSON record keeps the real
+    //     value (e.g. 'chat_completion'). Excluded entirely.
+    // Without these adjustments every posted record was double-counted.
     const key = [
       record.sessionId,
       record.model,
-      record.timestamp,
+      Math.floor(Number(record.timestamp) / 1000),
       record.inputTokens,
       record.outputTokens,
       record.totalTokens,
-      record.operation,
       record.taskId ?? '',
       record.workspaceId ?? 1,
       record.duration ?? '',
@@ -151,7 +181,6 @@ function dedupeTokenRecords(records: TokenUsageRecord[]): TokenUsageRecord[] {
 async function loadTokenDataFromFile(workspaceId: number, providerSubscriptions: Record<string, boolean>): Promise<TokenUsageRecord[]> {
   try {
     ensureDirExists(dirname(DATA_PATH))
-    await access(DATA_PATH)
     const data = await readFile(DATA_PATH, 'utf-8')
     const parsed = JSON.parse(data)
     if (!Array.isArray(parsed)) return []
@@ -173,11 +202,11 @@ async function loadTokenDataFromFile(workspaceId: number, providerSubscriptions:
  * Load token data from all sources: DB, file, and gateway session stores.
  * All sources are merged and deduplicated so session-derived data is always included.
  */
-async function loadTokenData(workspaceId: number): Promise<TokenUsageRecord[]> {
+async function loadTokenData(workspaceId: number, includeGlobalRuntime: boolean): Promise<TokenUsageRecord[]> {
   const providerSubscriptions = getProviderSubscriptionFlags()
   const dbRecords = loadTokenDataFromDb(workspaceId, providerSubscriptions)
-  const fileRecords = await loadTokenDataFromFile(workspaceId, providerSubscriptions)
-  const sessionRecords = deriveFromSessions(workspaceId, providerSubscriptions)
+  const fileRecords = includeGlobalRuntime ? await loadTokenDataFromFile(workspaceId, providerSubscriptions) : []
+  const sessionRecords = includeGlobalRuntime ? deriveFromSessions(workspaceId, providerSubscriptions) : []
   return dedupeTokenRecords([...dbRecords, ...fileRecords, ...sessionRecords])
     .sort((a, b) => b.timestamp - a.timestamp)
 }
@@ -219,7 +248,7 @@ function deriveFromSessions(workspaceId: number, providerSubscriptions: Record<s
 
 async function saveTokenData(data: TokenUsageRecord[]): Promise<void> {
   ensureDirExists(dirname(DATA_PATH))
-  await writeFile(DATA_PATH, JSON.stringify(data, null, 2))
+  atomicReplaceFileSync(DATA_PATH, JSON.stringify(data, null, 2))
 }
 
 function calculateStats(records: TokenUsageRecord[]): TokenStats {
@@ -312,7 +341,11 @@ export async function GET(request: NextRequest) {
     const format = searchParams.get('format') || 'json'
 
     const workspaceId = auth.user.workspace_id ?? 1
-    const tokenData = await loadTokenData(workspaceId)
+    const isolation = getWorkspaceIsolation(auth.user)
+    if (!isolation) {
+      return NextResponse.json({ error: 'Workspace isolation context is unavailable' }, { status: 403 })
+    }
+    const tokenData = await loadTokenData(workspaceId, isolation === 'shared')
     const filteredData = filterByTimeframe(tokenData, timeframe)
 
     if (action === 'list') {
@@ -559,11 +592,16 @@ export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
     const workspaceId = auth.user.workspace_id ?? 1
-    const { model, sessionId, inputTokens, outputTokens, operation = 'chat_completion', duration, taskId } = body
-
-    if (!model || !sessionId || typeof inputTokens !== 'number' || typeof outputTokens !== 'number') {
-      return NextResponse.json({ error: 'Missing required fields' }, { status: 400 })
+    const isolation = getWorkspaceIsolation(auth.user)
+    if (!isolation) {
+      return NextResponse.json({ error: 'Workspace isolation context is unavailable' }, { status: 403 })
     }
+    const isStrictWorkspace = isolation === 'strict'
+    const parsedBody = tokenUsagePostSchema.safeParse(body)
+    if (!parsedBody.success) {
+      return NextResponse.json({ error: 'Invalid token usage record' }, { status: 400 })
+    }
+    const { model, sessionId, inputTokens, outputTokens, operation, duration, taskId } = parsedBody.data
 
     const totalTokens = inputTokens + outputTokens
     const providerSubscriptions = getProviderSubscriptionFlags()
@@ -583,7 +621,7 @@ export async function POST(request: NextRequest) {
     }
 
     const record: TokenUsageRecord = {
-      id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      id: randomUUID(),
       model,
       sessionId,
       agentName: extractAgentName(sessionId),
@@ -599,14 +637,44 @@ export async function POST(request: NextRequest) {
     }
 
     // Persist only manually posted usage records in the JSON file.
-    const existingData = await loadTokenDataFromFile(workspaceId, providerSubscriptions)
-    existingData.unshift(record)
+    if (!isStrictWorkspace) {
+      const existingData = await loadTokenDataFromFile(workspaceId, providerSubscriptions)
+      existingData.unshift(record)
 
-    if (existingData.length > 10000) {
-      existingData.splice(10000)
+      if (existingData.length > 10000) {
+        existingData.splice(10000)
+      }
+
+      await saveTokenData(existingData)
     }
 
-    await saveTokenData(existingData)
+    // Also INSERT into the token_usage SQLite table so by-agent / DB-based
+    // aggregations (which read from token_usage, not from the JSON file)
+    // include externally-posted records. Without this, worker-reported
+    // tokens land only in the JSON file and the by-agent dashboard widget
+    // stays empty even when usage exists. Failures are non-fatal so the
+    // JSON write remains the canonical record.
+    try {
+      const db = getDatabase()
+      const createdAtSec = Math.floor(Date.now() / 1000)
+      db.prepare(`
+        INSERT INTO token_usage (model, session_id, input_tokens, output_tokens, created_at, workspace_id, task_id, cost_usd, agent_name)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        model,
+        sessionId,
+        inputTokens,
+        outputTokens,
+        createdAtSec,
+        workspaceId,
+        validatedTaskId,
+        cost,
+        record.agentName,
+      )
+    } catch (err) {
+      if (isStrictWorkspace) throw err
+      logger.warn({ err }, 'token_usage DB insert failed (JSON record persisted)')
+    }
 
     return NextResponse.json({ success: true, record })
   } catch (error) {

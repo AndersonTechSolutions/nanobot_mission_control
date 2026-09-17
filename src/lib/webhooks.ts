@@ -1,5 +1,7 @@
 import { createHmac, timingSafeEqual } from 'crypto'
-import { eventBus, type ServerEvent } from './event-bus'
+import { lookup } from 'node:dns/promises'
+import { isIP } from 'node:net'
+import { eventBelongsToWorkspace, eventBus, type ServerEvent } from './event-bus'
 import { logger } from './logger'
 
 interface Webhook {
@@ -32,6 +34,47 @@ interface DeliveryResult {
 const BACKOFF_SECONDS = [30, 300, 1800, 7200, 28800]
 
 const MAX_RETRIES = parseInt(process.env.MC_WEBHOOK_MAX_RETRIES || '5', 10) || 5
+
+const WEBHOOK_BLOCKED_HOSTNAMES = new Set([
+  'localhost', '0.0.0.0', 'metadata.google.internal', 'metadata.internal', 'instance-data',
+])
+
+function isPrivateAddress(address: string): boolean {
+  const normalized = address.toLowerCase().split('%')[0]
+  if (normalized === '::1' || normalized === '::') return true
+  if (normalized.startsWith('fc') || normalized.startsWith('fd') || normalized.startsWith('fe8') || normalized.startsWith('fe9') || normalized.startsWith('fea') || normalized.startsWith('feb')) return true
+  if (normalized.startsWith('::ffff:')) return isPrivateAddress(normalized.slice(7))
+  if (isIP(normalized) !== 4) return false
+
+  const [a, b] = normalized.split('.').map(Number)
+  return a === 0 || a === 10 || a === 127 || a >= 224
+    || (a === 100 && b >= 64 && b <= 127)
+    || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31)
+    || (a === 192 && b === 168)
+    || (a === 198 && (b === 18 || b === 19))
+}
+
+export function isBlockedWebhookUrl(urlStr: string): boolean {
+  try {
+    const url = new URL(urlStr)
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return true
+    const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '')
+    if (!hostname || WEBHOOK_BLOCKED_HOSTNAMES.has(hostname) || hostname.endsWith('.local')) return true
+    return isIP(hostname) !== 0 && isPrivateAddress(hostname)
+  } catch {
+    return true
+  }
+}
+
+async function assertSafeWebhookDestination(urlStr: string): Promise<void> {
+  if (isBlockedWebhookUrl(urlStr)) throw new Error('Webhook URL resolves to a blocked destination')
+  const hostname = new URL(urlStr).hostname.replace(/^\[|\]$/g, '')
+  const addresses = await lookup(hostname, { all: true, verbatim: true })
+  if (addresses.length === 0 || addresses.some(({ address }) => isPrivateAddress(address))) {
+    throw new Error('Webhook URL resolves to a private or internal address')
+  }
+}
 
 // Map event bus events to webhook event types
 const EVENT_MAP: Record<string, string> = {
@@ -104,7 +147,11 @@ export function initWebhookListener() {
 
     // Also fire agent.error for error status specifically
     const isAgentError = event.type === 'agent.status_changed' && event.data?.status === 'error'
-    const workspaceId = typeof event.data?.workspace_id === 'number' ? event.data.workspace_id : 1
+    const workspaceId = event.data?.workspace_id
+    if (typeof workspaceId !== 'number' || !eventBelongsToWorkspace(event, workspaceId)) {
+      logger.warn({ eventType: event.type }, 'Skipping webhook delivery for event without workspace ownership')
+      return
+    }
 
     fireWebhooksAsync(webhookEventType, event.data, workspaceId).catch((err) => {
       logger.error({ err }, 'Webhook dispatch error')
@@ -203,6 +250,7 @@ async function deliverWebhook(
   let error: string | null = null
 
   try {
+    await assertSafeWebhookDestination(webhook.url)
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 10000)
 
@@ -211,6 +259,7 @@ async function deliverWebhook(
       headers,
       body,
       signal: controller.signal,
+      redirect: 'error',
     })
 
     clearTimeout(timeout)
@@ -231,6 +280,20 @@ async function deliverWebhook(
   try {
     const { getDatabase } = await import('./db')
     const db = getDatabase()
+    const workspaceId =
+      typeof webhook.workspace_id === 'number' &&
+      Number.isFinite(webhook.workspace_id) &&
+      webhook.workspace_id > 0
+        ? webhook.workspace_id
+        : null
+
+    if (workspaceId === null) {
+      logger.error(
+        { webhookId: webhook.id, name: webhook.name },
+        'Webhook delivery bookkeeping skipped: workspace context required',
+      )
+      return { success, status_code: statusCode, response_body: responseBody, error, duration_ms: durationMs, delivery_id: deliveryId }
+    }
 
     const insertResult = db.prepare(`
       INSERT INTO webhook_deliveries (webhook_id, event_type, payload, status_code, response_body, error, duration_ms, attempt, is_retry, parent_delivery_id, workspace_id)
@@ -246,7 +309,7 @@ async function deliverWebhook(
       attempt,
       attempt > 0 ? 1 : 0,
       parentDeliveryId,
-      webhook.workspace_id ?? 1
+      workspaceId
     )
     deliveryId = Number(insertResult.lastInsertRowid)
 
@@ -254,27 +317,28 @@ async function deliverWebhook(
     db.prepare(`
       UPDATE webhooks SET last_fired_at = unixepoch(), last_status = ?, updated_at = unixepoch()
       WHERE id = ? AND workspace_id = ?
-    `).run(statusCode ?? -1, webhook.id, webhook.workspace_id ?? 1)
+    `).run(statusCode ?? -1, webhook.id, workspaceId)
 
     // Circuit breaker + retry scheduling (skip for test deliveries)
     if (allowRetry) {
       if (success) {
         // Reset consecutive failures on success
-        db.prepare(`UPDATE webhooks SET consecutive_failures = 0 WHERE id = ? AND workspace_id = ?`).run(webhook.id, webhook.workspace_id ?? 1)
+        db.prepare(`UPDATE webhooks SET consecutive_failures = 0 WHERE id = ? AND workspace_id = ?`).run(webhook.id, workspaceId)
       } else {
         // Increment consecutive failures
-        db.prepare(`UPDATE webhooks SET consecutive_failures = consecutive_failures + 1 WHERE id = ? AND workspace_id = ?`).run(webhook.id, webhook.workspace_id ?? 1)
+        db.prepare(`UPDATE webhooks SET consecutive_failures = consecutive_failures + 1 WHERE id = ? AND workspace_id = ?`).run(webhook.id, workspaceId)
 
         if (attempt < MAX_RETRIES - 1) {
           // Schedule retry
           const delaySec = nextRetryDelay(attempt)
           const nextRetryAt = Math.floor(Date.now() / 1000) + delaySec
-          db.prepare(`UPDATE webhook_deliveries SET next_retry_at = ? WHERE id = ?`).run(nextRetryAt, deliveryId)
+          db.prepare(`UPDATE webhook_deliveries SET next_retry_at = ? WHERE id = ? AND workspace_id = ?`)
+            .run(nextRetryAt, deliveryId, workspaceId)
         } else {
           // Exhausted retries — trip circuit breaker
-          const wh = db.prepare(`SELECT consecutive_failures FROM webhooks WHERE id = ? AND workspace_id = ?`).get(webhook.id, webhook.workspace_id ?? 1) as { consecutive_failures: number } | undefined
+          const wh = db.prepare(`SELECT consecutive_failures FROM webhooks WHERE id = ? AND workspace_id = ?`).get(webhook.id, workspaceId) as { consecutive_failures: number } | undefined
           if (wh && wh.consecutive_failures >= MAX_RETRIES) {
-            db.prepare(`UPDATE webhooks SET enabled = 0, updated_at = unixepoch() WHERE id = ? AND workspace_id = ?`).run(webhook.id, webhook.workspace_id ?? 1)
+            db.prepare(`UPDATE webhooks SET enabled = 0, updated_at = unixepoch() WHERE id = ? AND workspace_id = ?`).run(webhook.id, workspaceId)
             logger.warn({ webhookId: webhook.id, name: webhook.name }, 'Webhook circuit breaker tripped — disabled after exhausting retries')
           }
         }
@@ -287,7 +351,7 @@ async function deliverWebhook(
       WHERE webhook_id = ? AND workspace_id = ? AND id NOT IN (
         SELECT id FROM webhook_deliveries WHERE webhook_id = ? AND workspace_id = ? ORDER BY created_at DESC LIMIT 200
       )
-    `).run(webhook.id, webhook.workspace_id ?? 1, webhook.id, webhook.workspace_id ?? 1)
+    `).run(webhook.id, workspaceId, webhook.id, workspaceId)
   } catch (logErr) {
     logger.error({ err: logErr, webhookId: webhook.id }, 'Webhook delivery logging/pruning failed')
   }

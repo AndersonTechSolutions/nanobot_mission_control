@@ -2,7 +2,11 @@
 
 import { useCallback, useEffect, useRef, useState, FormEvent } from 'react'
 import Image from 'next/image'
+import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
+import { LanguageSwitcherSelect } from '@/components/ui/language-switcher'
+import { apiFetch } from '@/lib/api-client'
+import { STORAGE_GATEWAY_URL } from '@/lib/device-identity'
 
 interface GoogleCredentialResponse {
   credential?: string
@@ -29,6 +33,7 @@ type LoginRequestBody =
 type LoginErrorPayload = {
   code?: string
   error?: string
+  hint?: string
 }
 
 function readLoginErrorPayload(value: unknown): LoginErrorPayload {
@@ -37,6 +42,7 @@ function readLoginErrorPayload(value: unknown): LoginErrorPayload {
   return {
     code: typeof record.code === 'string' ? record.code : undefined,
     error: typeof record.error === 'string' ? record.error : undefined,
+    hint: typeof record.hint === 'string' ? record.hint : undefined,
   }
 }
 
@@ -57,18 +63,132 @@ function GoogleIcon({ className }: { className?: string }) {
   )
 }
 
+const GATEWAY_URL_PRESETS = [
+  'ws://127.0.0.1:18789',
+  'wss://127.0.0.1:18789',
+  'ws://localhost:18789',
+  'wss://localhost:18789',
+  'wss://gateway:18789',
+]
+
+const GATEWAY_CONNECTION_TIMEOUT_MS = 5000
+
+type ConnectionStatus = 'idle' | 'testing' | 'success' | 'failed'
+
 export default function LoginPage() {
+  const t = useTranslations('auth')
+  const tc = useTranslations('common')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [pendingApproval, setPendingApproval] = useState(false)
+  const [needsSetup, setNeedsSetup] = useState(false)
   const [loading, setLoading] = useState(false)
   const [googleLoading, setGoogleLoading] = useState(false)
   const [googleReady, setGoogleReady] = useState(false)
   const googleCallbackRef = useRef<((response: GoogleCredentialResponse) => void) | null>(null)
-  const googleButtonContainerRef = useRef<HTMLDivElement>(null)
+
+  // Advanced settings state
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [gatewayPreset, setGatewayPreset] = useState<string>(() => {
+    // Auto-select wss:// preset when the page is served over HTTPS (reverse proxy)
+    if (typeof window !== 'undefined' && window.location.protocol === 'https:') {
+      return 'wss://127.0.0.1:18789'
+    }
+    return 'ws://127.0.0.1:18789'
+  })
+  const [gatewayCustom, setGatewayCustom] = useState('')
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('idle')
+  const [connectionError, setConnectionError] = useState('')
+
+  // Initialize gateway URL from localStorage on mount
+  useEffect(() => {
+    const saved = localStorage.getItem(STORAGE_GATEWAY_URL)
+    if (saved) {
+      if (GATEWAY_URL_PRESETS.includes(saved)) {
+        setGatewayPreset(saved)
+      } else {
+        setGatewayPreset('custom')
+        setGatewayCustom(saved)
+      }
+    }
+  }, [])
+
+  const getEffectiveGatewayUrl = (): string => {
+    return gatewayPreset === 'custom' ? gatewayCustom.trim() : gatewayPreset
+  }
+
+  const handleGatewayUrlChange = (value: string) => {
+    setGatewayPreset(value)
+    if (value !== 'custom') {
+      localStorage.setItem(STORAGE_GATEWAY_URL, value)
+      setConnectionStatus('idle')
+    }
+  }
+
+  const handleGatewayCustomChange = (value: string) => {
+    setGatewayCustom(value)
+    const trimmed = value.trim()
+    if (trimmed) {
+      localStorage.setItem(STORAGE_GATEWAY_URL, trimmed)
+      setConnectionStatus('idle')
+    }
+  }
+
+  const handleTestConnection = () => {
+    const url = getEffectiveGatewayUrl()
+    if (!url) return
+    setConnectionStatus('testing')
+    setConnectionError('')
+
+    return new Promise<void>((resolve) => {
+      try {
+        const ws = new WebSocket(url)
+        const timeout = setTimeout(() => {
+          ws.close()
+          setConnectionStatus('failed')
+          setConnectionError('Connection timed out')
+          resolve()
+        }, GATEWAY_CONNECTION_TIMEOUT_MS)
+
+        ws.onopen = () => {
+          clearTimeout(timeout)
+          ws.close()
+          setConnectionStatus('success')
+          resolve()
+        }
+
+        ws.onerror = () => {
+          clearTimeout(timeout)
+          ws.close()
+          setConnectionStatus('failed')
+          setConnectionError('Could not connect')
+          resolve()
+        }
+      } catch {
+        setConnectionStatus('failed')
+        setConnectionError('Invalid URL')
+        resolve()
+      }
+    })
+  }
 
   const googleClientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || ''
+
+  // Check if first-time setup is needed on page load — auto-redirect to /setup
+  useEffect(() => {
+    apiFetch<{ needsSetup?: boolean }>('/api/setup', {
+      redirectOnUnauthenticated: false,
+    })
+      .then((data) => {
+        if (data.needsSetup) {
+          window.location.href = '/setup'
+        }
+      })
+      .catch(() => {
+        // Ignore — setup check is best-effort
+      })
+  }, [])
 
   const completeLogin = useCallback(async (path: string, body: LoginRequestBody) => {
     const res = await fetch(path, {
@@ -81,13 +201,22 @@ export default function LoginPage() {
       const data = readLoginErrorPayload(await res.json().catch(() => null))
       if (data.code === 'PENDING_APPROVAL') {
         setPendingApproval(true)
+        setNeedsSetup(false)
         setError('')
         setLoading(false)
         setGoogleLoading(false)
         return false
       }
-      setError(data.error || 'Login failed')
+      if (data.code === 'NO_USERS') {
+        setNeedsSetup(true)
+        setError('')
+        setLoading(false)
+        setGoogleLoading(false)
+        return false
+      }
+      setError(data.error || t('loginFailed'))
       setPendingApproval(false)
+      setNeedsSetup(false)
       setLoading(false)
       setGoogleLoading(false)
       return false
@@ -97,7 +226,7 @@ export default function LoginPage() {
     // router.push() + refresh() can race and use stale RSC payloads.
     window.location.href = '/'
     return true
-  }, [])
+  }, [t])
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault()
@@ -112,7 +241,7 @@ export default function LoginPage() {
     try {
       await completeLogin('/api/auth/login', { username: formUsername, password: formPassword })
     } catch {
-      setError('Network error')
+      setError(t('networkError'))
       setLoading(false)
     }
   }
@@ -130,7 +259,7 @@ export default function LoginPage() {
           const ok = await completeLogin('/api/auth/google', { credential: response?.credential })
           if (!ok) return
         } catch {
-          setError('Google sign-in failed')
+          setError(t('googleSignInFailed'))
           setGoogleLoading(false)
         }
       }
@@ -138,14 +267,6 @@ export default function LoginPage() {
         client_id: googleClientId,
         callback: (response: GoogleCredentialResponse) => googleCallbackRef.current?.(response),
       })
-      // Render Google's own button into a hidden container so we get
-      // the full OAuth popup flow instead of the unreliable One Tap prompt.
-      if (googleButtonContainerRef.current) {
-        (window.google.accounts.id as any).renderButton(
-          googleButtonContainerRef.current,
-          { type: 'standard', theme: 'outline', size: 'large', width: 320 },
-        )
-      }
       setGoogleReady(true)
     }
 
@@ -161,24 +282,20 @@ export default function LoginPage() {
     script.defer = true
     script.setAttribute('data-google-gsi', '1')
     script.onload = onScriptLoad
-    script.onerror = () => setError('Failed to load Google Sign-In')
+    script.onerror = () => setError(t('googleSignInFailed'))
     document.head.appendChild(script)
-  }, [googleClientId, completeLogin])
+  }, [googleClientId, completeLogin, t])
 
   const handleGoogleSignIn = () => {
     if (!window.google || !googleReady) return
-    // Click the hidden Google-rendered button to trigger the full OAuth popup.
-    // Falls back to prompt() if the button isn't available.
-    const btn = googleButtonContainerRef.current?.querySelector('[role="button"]') as HTMLElement | null
-    if (btn) {
-      btn.click()
-    } else {
-      window.google.accounts.id.prompt()
-    }
+    window.google.accounts.id.prompt()
   }
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-background p-4">
+      <div className="absolute top-4 right-4">
+        <LanguageSwitcherSelect />
+      </div>
       <div className="w-full max-w-sm">
         <div className="flex flex-col items-center mb-8">
           <div className="w-12 h-12 rounded-lg overflow-hidden bg-background border border-border/50 flex items-center justify-center mb-3">
@@ -191,8 +308,8 @@ export default function LoginPage() {
               priority
             />
           </div>
-          <h1 className="text-xl font-semibold text-foreground">Mission Control</h1>
-          <p className="text-sm text-muted-foreground mt-1">Sign in to continue</p>
+          <h1 className="text-xl font-semibold text-foreground">{t('missionControl')}</h1>
+          <p className="text-sm text-muted-foreground mt-1">{t('signInToContinue')}</p>
         </div>
 
         {pendingApproval && (
@@ -203,9 +320,9 @@ export default function LoginPage() {
                 <polyline points="12,6 12,12 16,14" />
               </svg>
             </div>
-            <div className="text-sm font-medium text-amber-200">Access Request Submitted</div>
+            <div className="text-sm font-medium text-amber-200">{t('accessRequestSubmitted')}</div>
             <p className="text-xs text-muted-foreground mt-1">
-              Your request has been sent to an administrator for review. You&apos;ll be able to sign in once approved.
+              {t('accessRequestDescription')}
             </p>
             <Button
               onClick={() => { setPendingApproval(false); setError(''); setGoogleLoading(false) }}
@@ -213,7 +330,30 @@ export default function LoginPage() {
               size="sm"
               className="mt-3 text-xs"
             >
-              Try again
+              {t('tryAgain')}
+            </Button>
+          </div>
+        )}
+
+        {needsSetup && (
+          <div className="mb-4 p-4 rounded-lg bg-blue-500/10 border border-blue-500/20 text-center">
+            <div className="flex justify-center mb-2">
+              <svg className="w-8 h-8 text-blue-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="10" />
+                <line x1="12" y1="8" x2="12" y2="12" />
+                <line x1="12" y1="16" x2="12.01" y2="16" />
+              </svg>
+            </div>
+            <div className="text-sm font-medium text-blue-200">{t('noAdminAccount')}</div>
+            <p className="text-xs text-muted-foreground mt-1">
+              {t('noAdminDescription')}
+            </p>
+            <Button
+              onClick={() => { window.location.href = '/setup' }}
+              size="sm"
+              className="mt-3"
+            >
+              {t('createAdminAccount')}
             </Button>
           </div>
         )}
@@ -224,6 +364,100 @@ export default function LoginPage() {
           </div>
         )}
 
+        {/* Advanced Settings — WebSocket gateway URL configuration */}
+        <div className="mb-4 rounded-lg border border-border overflow-hidden">
+          <button
+            type="button"
+            onClick={() => setAdvancedOpen(o => !o)}
+            className="w-full px-3 py-2 flex items-center justify-between text-sm text-muted-foreground hover:text-foreground hover:bg-secondary/50 transition-colors"
+          >
+            <span>{t('advancedSettings')}</span>
+            <svg
+              className={`w-4 h-4 transition-transform ${advancedOpen ? 'rotate-180' : ''}`}
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M4 6l4 4 4-4" />
+            </svg>
+          </button>
+
+          {advancedOpen && (
+            <div className="px-3 pb-3 pt-1 space-y-3 border-t border-border">
+              <div>
+                <label htmlFor="gateway-url" className="block text-sm font-medium text-foreground mb-1.5">
+                  {t('gatewayUrl')}
+                </label>
+                <div className="flex gap-2">
+                  <select
+                    id="gateway-url"
+                    value={gatewayPreset}
+                    onChange={e => handleGatewayUrlChange(e.target.value)}
+                    className="flex-1 h-10 px-3 rounded-lg bg-secondary border border-border text-foreground text-sm placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-primary/50 focus:border-primary transition-smooth appearance-none cursor-pointer"
+                  >
+                    {GATEWAY_URL_PRESETS.map(url => (
+                      <option key={url} value={url}>{url}</option>
+                    ))}
+                    <option value="custom">Custom</option>
+                  </select>
+                </div>
+                {gatewayPreset === 'custom' && (
+                  <input
+                    type="text"
+                    value={gatewayCustom}
+                    onChange={e => handleGatewayCustomChange(e.target.value)}
+                    placeholder={t('gatewayUrlPlaceholder')}
+                    className="mt-2 w-full h-10 px-3 rounded-lg bg-secondary border border-border text-foreground text-sm placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-primary/50 focus:border-primary transition-smooth"
+                  />
+                )}
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleTestConnection}
+                  disabled={connectionStatus === 'testing' || !getEffectiveGatewayUrl()}
+                  className="h-9 px-3 rounded-lg bg-secondary border border-border text-foreground text-sm hover:bg-muted-foreground/10 focus:outline-hidden focus:ring-2 focus:ring-primary/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
+                >
+                  {connectionStatus === 'testing' ? (
+                    <>
+                      <div className="w-3.5 h-3.5 border-2 border-muted-foreground/40 border-t-muted-foreground rounded-full animate-spin" />
+                      {t('testConnection')}...
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M13.5 2.5L2.5 13.5M13.5 2.5l-4 4m4-4l-4-4m4 4l-4 4" />
+                      </svg>
+                      {t('testConnection')}
+                    </>
+                  )}
+                </button>
+
+                {connectionStatus === 'success' && (
+                  <span className="text-xs text-green-500 flex items-center gap-1">
+                    <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M13 3L6 10l-3-3" />
+                    </svg>
+                    {t('connectionSuccess')}
+                  </span>
+                )}
+                {connectionStatus === 'failed' && (
+                  <span className="text-xs text-destructive flex items-center gap-1">
+                    <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M12 4L4 12M4 4l8 8" />
+                    </svg>
+                    {t('connectionFailed')}{connectionError ? `: ${connectionError}` : ''}
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
         {/* Google Sign-In button — shown only when client ID is configured */}
         {googleClientId && (
           <div className={pendingApproval ? 'opacity-50 pointer-events-none' : ''}>
@@ -231,30 +465,28 @@ export default function LoginPage() {
               type="button"
               onClick={handleGoogleSignIn}
               disabled={!googleReady || googleLoading || loading}
-              className="w-full h-10 flex items-center justify-center gap-3 rounded-lg border border-border bg-white text-[#3c4043] text-sm font-medium hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-primary/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              className="w-full h-10 flex items-center justify-center gap-3 rounded-lg border border-border bg-white text-[#3c4043] text-sm font-medium hover:bg-gray-50 focus:outline-hidden focus:ring-2 focus:ring-primary/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {googleLoading ? (
                 <>
                   <div className="w-4 h-4 border-2 border-gray-300 border-t-gray-600 rounded-full animate-spin" />
-                  Signing in...
+                  {t('signingIn')}
                 </>
               ) : (
                 <>
                   <GoogleIcon className="w-[18px] h-[18px]" />
-                  Sign in with Google
+                  {t('signInWithGoogle')}
                 </>
               )}
             </button>
-            {/* Hidden Google-rendered button — our custom button delegates clicks here */}
-            <div ref={googleButtonContainerRef} className="hidden" aria-hidden="true" />
             {!googleReady && (
-              <p className="text-center text-xs text-muted-foreground mt-2">Loading Google Sign-In...</p>
+              <p className="text-center text-xs text-muted-foreground mt-2">{t('loadingGoogleSignIn')}</p>
             )}
 
             {/* Divider */}
             <div className="my-4 flex items-center gap-2">
               <div className="h-px flex-1 bg-border" />
-              <span className="text-xs text-muted-foreground">or</span>
+              <span className="text-xs text-muted-foreground">{tc('or')}</span>
               <div className="h-px flex-1 bg-border" />
             </div>
           </div>
@@ -262,14 +494,14 @@ export default function LoginPage() {
 
         <form onSubmit={handleSubmit} className={`space-y-4 ${pendingApproval ? 'opacity-50 pointer-events-none' : ''}`}>
           <div>
-            <label htmlFor="username" className="block text-sm font-medium text-foreground mb-1.5">Username</label>
+            <label htmlFor="username" className="block text-sm font-medium text-foreground mb-1.5">{t('username')}</label>
             <input
               id="username"
               type="text"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-foreground text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-smooth"
-              placeholder="Enter username"
+              className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-foreground text-sm placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-primary/50 focus:border-primary transition-smooth"
+              placeholder={t('enterUsername')}
               autoComplete="username"
               autoFocus
               required
@@ -278,14 +510,14 @@ export default function LoginPage() {
           </div>
 
           <div>
-            <label htmlFor="password" className="block text-sm font-medium text-foreground mb-1.5">Password</label>
+            <label htmlFor="password" className="block text-sm font-medium text-foreground mb-1.5">{t('password')}</label>
             <input
               id="password"
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-foreground text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-smooth"
-              placeholder="Enter password"
+              className="w-full h-10 px-3 rounded-lg bg-secondary border border-border text-foreground text-sm placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-primary/50 focus:border-primary transition-smooth"
+              placeholder={t('enterPassword')}
               autoComplete="current-password"
               required
               aria-required="true"
@@ -301,15 +533,15 @@ export default function LoginPage() {
             {loading ? (
               <>
                 <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
-                Signing in...
+                {t('signingIn')}
               </>
             ) : (
-              'Sign in'
+              t('signIn')
             )}
           </Button>
         </form>
 
-        <p className="text-center text-xs text-muted-foreground mt-6">Nanobot Mission Control</p>
+        <p className="text-center text-xs text-muted-foreground mt-6">{t('orchestrationTagline')}</p>
       </div>
     </div>
   )

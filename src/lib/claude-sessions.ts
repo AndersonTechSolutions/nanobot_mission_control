@@ -12,24 +12,43 @@
  * - Activity status (active if last message < 5 minutes ago)
  */
 
-import { readdirSync, readFileSync, statSync } from 'fs'
+import { createReadStream, readdirSync, statSync } from 'fs'
+import { createInterface } from 'readline'
 import { join } from 'path'
 import { config } from './config'
 import { getDatabase } from './db'
 import { logger } from './logger'
 
+// Skip JSONL files larger than this to avoid excessive I/O
+const DEFAULT_MAX_SESSION_FILE_BYTES = 50 * 1024 * 1024 // 50 MB
+
+function getEnvPositiveInt(key: string, defaultValue: number): number {
+  const raw = process.env[key]
+  if (!raw) return defaultValue
+
+  const value = Number.parseInt(raw, 10)
+  return Number.isFinite(value) && value > 0 ? value : defaultValue
+}
+
+const MAX_SESSION_FILE_BYTES = getEnvPositiveInt('MC_MAX_SESSION_FILE_BYTES', DEFAULT_MAX_SESSION_FILE_BYTES)
+
 // Rough per-token pricing (USD) for cost estimation
+// Per-token prices (USD / token). Source: official Anthropic pricing docs,
+// verified 2026-05. Opus 4.5/4.6 = $5/$25, Sonnet 4.6 = $3/$15,
+// Haiku 4.5 = $1/$5 per MTok.
 const MODEL_PRICING: Record<string, { input: number; output: number }> = {
-  'claude-opus-4-6': { input: 15 / 1_000_000, output: 75 / 1_000_000 },
+  'claude-opus-4-6': { input: 5 / 1_000_000, output: 25 / 1_000_000 },
   'claude-sonnet-4-6': { input: 3 / 1_000_000, output: 15 / 1_000_000 },
-  'claude-haiku-4-5': { input: 0.8 / 1_000_000, output: 4 / 1_000_000 },
+  'claude-haiku-4-5': { input: 1 / 1_000_000, output: 5 / 1_000_000 },
 }
 
 const DEFAULT_PRICING = { input: 3 / 1_000_000, output: 15 / 1_000_000 }
 
-// Session is "active" if last activity was within this window.
-// Local CLI sessions can remain interactive without emitting frequent logs.
-const ACTIVE_THRESHOLD_MS = 90 * 60 * 1000
+// "Active" window. Upstream default was 90 minutes which surfaced too many
+// stale jsonls; 2 minutes was too tight (any pause >2 min in an active host
+// CLI dropped the session out of "active"). 15 minutes covers normal think
+// time between user prompts in a live `claude` session.
+const ACTIVE_THRESHOLD_MS = 15 * 60 * 1000
 const FUTURE_TOLERANCE_MS = 60 * 1000
 
 interface SessionStats {
@@ -43,8 +62,6 @@ interface SessionStats {
   toolUses: number
   inputTokens: number
   outputTokens: number
-  cacheReadTokens: number
-  cacheCreationTokens: number
   estimatedCost: number
   firstMessageAt: string | null
   lastMessageAt: string | null
@@ -80,12 +97,23 @@ function clampTimestamp(ms: number): number {
   return ms
 }
 
-function parseSessionFile(filePath: string, projectSlug: string, fileMtimeMs: number): SessionStats | null {
-  try {
-    const content = readFileSync(filePath, 'utf-8')
-    const lines = content.split('\n').filter(Boolean)
+// Track which oversized files we've already warned about to avoid log spam.
+// scanClaudeSessions() runs every 30s; without this each big jsonl prints a
+// WARN every cycle. Reset on process restart.
+const warnedOversized = new Set<string>()
 
-    if (lines.length === 0) return null
+async function parseSessionFile(filePath: string, projectSlug: string, fileMtimeMs: number, fileSizeBytes: number): Promise<SessionStats | null> {
+  try {
+    if (fileSizeBytes > MAX_SESSION_FILE_BYTES) {
+      if (!warnedOversized.has(filePath)) {
+        warnedOversized.add(filePath)
+        logger.info(
+          { filePath, fileSizeBytes },
+          'Skipping oversized Claude session file (logged once per process)',
+        )
+      }
+      return null
+    }
 
     let sessionId: string | null = null
     let model: string | null = null
@@ -101,77 +129,80 @@ function parseSessionFile(filePath: string, projectSlug: string, fileMtimeMs: nu
     let firstMessageAt: string | null = null
     let lastMessageAt: string | null = null
     let lastUserPrompt: string | null = null
+    let hasLines = false
 
-    for (const line of lines) {
-      let entry: JSONLEntry
-      try {
-        entry = JSON.parse(line)
-      } catch {
-        continue
-      }
+    const rl = createInterface({
+      input: createReadStream(filePath, { encoding: 'utf-8' }),
+      crlfDelay: Infinity,
+    })
 
-      // Extract session ID from first entry that has one
-      if (!sessionId && entry.sessionId) {
-        sessionId = entry.sessionId
-      }
+    try {
+      for await (const line of rl) {
+        if (!line) continue
+        hasLines = true
 
-      // Extract git branch
-      if (!gitBranch && entry.gitBranch) {
-        gitBranch = entry.gitBranch
-      }
-
-      // Extract project working directory
-      if (!projectPath && entry.cwd) {
-        projectPath = entry.cwd
-      }
-
-      // Track timestamps
-      if (entry.timestamp) {
-        if (!firstMessageAt) firstMessageAt = entry.timestamp
-        lastMessageAt = entry.timestamp
-      }
-
-      // Skip sidechain messages (subagent work) for counts
-      if (entry.isSidechain) continue
-
-      if (entry.type === 'user' && entry.message) {
-        userMessages++
-        // Extract last user prompt text
-        const msg = entry.message
-        if (typeof msg.content === 'string' && msg.content.length > 0) {
-          lastUserPrompt = msg.content.slice(0, 500)
-        }
-      }
-
-      if (entry.type === 'assistant' && entry.message) {
-        assistantMessages++
-
-        // Extract model
-        if (entry.message.model) {
-          model = entry.message.model
+        let entry: JSONLEntry
+        try {
+          entry = JSON.parse(line)
+        } catch {
+          continue
         }
 
-        // Extract token usage
-        const usage = entry.message.usage
-        if (usage) {
-          inputTokens += (usage.input_tokens || 0)
-          cacheReadTokens += (usage.cache_read_input_tokens || 0)
-          cacheCreationTokens += (usage.cache_creation_input_tokens || 0)
-          outputTokens += (usage.output_tokens || 0)
+        if (!sessionId && entry.sessionId) {
+          sessionId = entry.sessionId
         }
 
-        // Count tool uses in assistant content
-        if (Array.isArray(entry.message.content)) {
-          for (const block of entry.message.content) {
-            if (block.type === 'tool_use') toolUses++
+        if (!gitBranch && entry.gitBranch) {
+          gitBranch = entry.gitBranch
+        }
+
+        if (!projectPath && entry.cwd) {
+          projectPath = entry.cwd
+        }
+
+        if (entry.timestamp) {
+          if (!firstMessageAt) firstMessageAt = entry.timestamp
+          lastMessageAt = entry.timestamp
+        }
+
+        if (entry.isSidechain) continue
+
+        if (entry.type === 'user' && entry.message) {
+          userMessages++
+          const msg = entry.message
+          if (typeof msg.content === 'string' && msg.content.length > 0) {
+            lastUserPrompt = msg.content.slice(0, 500)
+          }
+        }
+
+        if (entry.type === 'assistant' && entry.message) {
+          assistantMessages++
+
+          if (entry.message.model) {
+            model = entry.message.model
+          }
+
+          const usage = entry.message.usage
+          if (usage) {
+            inputTokens += (usage.input_tokens || 0)
+            cacheReadTokens += (usage.cache_read_input_tokens || 0)
+            cacheCreationTokens += (usage.cache_creation_input_tokens || 0)
+            outputTokens += (usage.output_tokens || 0)
+          }
+
+          if (Array.isArray(entry.message.content)) {
+            for (const block of entry.message.content) {
+              if (block.type === 'tool_use') toolUses++
+            }
           }
         }
       }
+    } finally {
+      rl.close()
     }
 
-    if (!sessionId) return null
+    if (!hasLines || !sessionId || (userMessages === 0 && assistantMessages === 0)) return null
 
-    // Estimate cost (cache reads = 10% of input, cache creation = 125% of input)
     const pricing = (model && MODEL_PRICING[model]) || DEFAULT_PRICING
     const estimatedCost =
       inputTokens * pricing.input +
@@ -186,6 +217,8 @@ function parseSessionFile(filePath: string, projectSlug: string, fileMtimeMs: nu
     const effectiveFirstMs = parsedFirstMs || mtimeMs
     const isActive = effectiveLastMs > 0 && (Date.now() - effectiveLastMs) < ACTIVE_THRESHOLD_MS
 
+    const totalInputTokens = inputTokens + cacheReadTokens + cacheCreationTokens
+
     return {
       sessionId,
       projectSlug,
@@ -195,10 +228,8 @@ function parseSessionFile(filePath: string, projectSlug: string, fileMtimeMs: nu
       userMessages,
       assistantMessages,
       toolUses,
-      inputTokens,           // Pure non-cache input tokens
+      inputTokens: totalInputTokens,
       outputTokens,
-      cacheReadTokens,
-      cacheCreationTokens,
       estimatedCost: Math.round(estimatedCost * 10000) / 10000,
       firstMessageAt: effectiveFirstMs ? new Date(effectiveFirstMs).toISOString() : null,
       lastMessageAt: effectiveLastMs ? new Date(effectiveLastMs).toISOString() : null,
@@ -212,7 +243,7 @@ function parseSessionFile(filePath: string, projectSlug: string, fileMtimeMs: nu
 }
 
 /** Scan all Claude Code projects and discover sessions */
-export function scanClaudeSessions(): SessionStats[] {
+export async function scanClaudeSessions(): Promise<SessionStats[]> {
   const claudeHome = config.claudeHome
   if (!claudeHome) return []
 
@@ -237,7 +268,6 @@ export function scanClaudeSessions(): SessionStats[] {
     }
     if (!stat.isDirectory()) continue
 
-    // Find JSONL files in this project
     let files: string[]
     try {
       files = readdirSync(projectDir).filter(f => f.endsWith('.jsonl'))
@@ -247,7 +277,13 @@ export function scanClaudeSessions(): SessionStats[] {
 
     for (const file of files) {
       const filePath = join(projectDir, file)
-      const parsed = parseSessionFile(filePath, projectSlug, statSync(filePath).mtimeMs)
+      let fileStat
+      try {
+        fileStat = statSync(filePath)
+      } catch {
+        continue // file disappeared between readdir and stat
+      }
+      const parsed = await parseSessionFile(filePath, projectSlug, fileStat.mtimeMs, fileStat.size)
       if (parsed) sessions.push(parsed)
     }
   }
@@ -262,28 +298,29 @@ const SYNC_THROTTLE_MS = 30_000
 
 /** Scan and upsert sessions into the database (throttled to avoid repeated disk scans) */
 export async function syncClaudeSessions(force = false): Promise<{ ok: boolean; message: string }> {
-  const now = Date.now()
-  if (!force && lastSyncAt > 0 && (now - lastSyncAt) < SYNC_THROTTLE_MS) {
+  const nowMs = Date.now()
+  if (!force && lastSyncAt > 0 && (nowMs - lastSyncAt) < SYNC_THROTTLE_MS) {
     return lastSyncResult
   }
   try {
-    const sessions = scanClaudeSessions()
+    const sessions = await scanClaudeSessions()
     if (sessions.length === 0) {
-      return { ok: true, message: 'No Claude sessions found' }
+      lastSyncAt = Date.now()
+      lastSyncResult = { ok: true, message: 'No Claude sessions found' }
+      return lastSyncResult
     }
 
     const db = getDatabase()
-    const now = Math.floor(Date.now() / 1000)
+    const nowSec = Math.floor(Date.now() / 1000)
 
     const upsert = db.prepare(`
       INSERT INTO claude_sessions (
         session_id, project_slug, project_path, model, git_branch,
         user_messages, assistant_messages, tool_uses,
-        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-        estimated_cost,
+        input_tokens, output_tokens, estimated_cost,
         first_message_at, last_message_at, last_user_prompt,
         is_active, scanned_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(session_id) DO UPDATE SET
         model = excluded.model,
         git_branch = excluded.git_branch,
@@ -292,8 +329,6 @@ export async function syncClaudeSessions(force = false): Promise<{ ok: boolean; 
         tool_uses = excluded.tool_uses,
         input_tokens = excluded.input_tokens,
         output_tokens = excluded.output_tokens,
-        cache_read_tokens = excluded.cache_read_tokens,
-        cache_creation_tokens = excluded.cache_creation_tokens,
         estimated_cost = excluded.estimated_cost,
         last_message_at = excluded.last_message_at,
         last_user_prompt = excluded.last_user_prompt,
@@ -303,6 +338,7 @@ export async function syncClaudeSessions(force = false): Promise<{ ok: boolean; 
     `)
 
     let upserted = 0
+    let removed = 0
     db.transaction(() => {
       // Mark all sessions inactive before scanning
       db.prepare('UPDATE claude_sessions SET is_active = 0').run()
@@ -311,18 +347,34 @@ export async function syncClaudeSessions(force = false): Promise<{ ok: boolean; 
         upsert.run(
           s.sessionId, s.projectSlug, s.projectPath, s.model, s.gitBranch,
           s.userMessages, s.assistantMessages, s.toolUses,
-          s.inputTokens, s.outputTokens, s.cacheReadTokens, s.cacheCreationTokens,
-          s.estimatedCost,
+          s.inputTokens, s.outputTokens, s.estimatedCost,
           s.firstMessageAt, s.lastMessageAt, s.lastUserPrompt,
-          s.isActive ? 1 : 0, now, now,
+          s.isActive ? 1 : 0, nowSec, nowSec,
         )
         upserted++
+      }
+
+      // Delete rows whose jsonl no longer exists on disk. Without this, removed
+      // session files (manual cleanup, project rename, claude --resume that
+      // creates a new id) leave phantom rows that the API still surfaces as
+      // "Active" via the derivedActive mtime fallback.
+      const liveIds = new Set(sessions.map(s => s.sessionId))
+      const allRows = db.prepare('SELECT session_id FROM claude_sessions').all() as Array<{ session_id: string }>
+      const del = db.prepare('DELETE FROM claude_sessions WHERE session_id = ?')
+      for (const row of allRows) {
+        if (!liveIds.has(row.session_id)) {
+          del.run(row.session_id)
+          removed++
+        }
       }
     })()
 
     const active = sessions.filter(s => s.isActive).length
     lastSyncAt = Date.now()
-    lastSyncResult = { ok: true, message: `Scanned ${upserted} session(s), ${active} active` }
+    lastSyncResult = {
+      ok: true,
+      message: `Scanned ${upserted} session(s), ${active} active${removed ? `, removed ${removed} orphan(s)` : ''}`,
+    }
     return lastSyncResult
   } catch (err: any) {
     logger.error({ err }, 'Claude session sync failed')
@@ -330,72 +382,4 @@ export async function syncClaudeSessions(force = false): Promise<{ ok: boolean; 
     lastSyncResult = { ok: false, message: `Scan failed: ${err.message}` }
     return lastSyncResult
   }
-}
-
-export interface LatestToolUse {
-  agentName: string  // matches resolveAgentName conventions; falls back to projectSlug
-  toolName: string
-  subject?: string  // file path / command / URL when available
-  createdAt: number  // unix seconds
-}
-
-const TOOL_RECENT_WINDOW_SEC = 60
-
-/**
- * Scans active session JSONL files and returns the latest tool_use per agent
- * (within the last 60s). Used as a fallback signal for local Claude Code
- * sessions that don't log to `mcp_call_log`.
- */
-export function getRecentToolUsesByAgent(claudeHome?: string): LatestToolUse[] {
-  const home = claudeHome || config.claudeHome
-  const projectsDir = `${home}/projects`
-  const out = new Map<string, LatestToolUse>()
-  const sinceSec = Math.floor(Date.now() / 1000) - TOOL_RECENT_WINDOW_SEC
-
-  let projectDirs: string[] = []
-  try { projectDirs = readdirSync(projectsDir) } catch { return [] }
-
-  for (const proj of projectDirs) {
-    let files: string[] = []
-    try { files = readdirSync(`${projectsDir}/${proj}`).filter(f => f.endsWith('.jsonl')) } catch { continue }
-    for (const file of files) {
-      const path = `${projectsDir}/${proj}/${file}`
-      let stat
-      try { stat = statSync(path) } catch { continue }
-      if (stat.mtimeMs / 1000 < sinceSec) continue
-
-      let content: string
-      try { content = readFileSync(path, 'utf8') } catch { continue }
-      const lines = content.trim().split('\n').slice(-50)
-
-      for (let i = lines.length - 1; i >= 0; i--) {
-        const line = lines[i]
-        if (!line) continue
-        try {
-          const entry = JSON.parse(line)
-          const ts = entry?.timestamp ? Math.floor(new Date(entry.timestamp).getTime() / 1000) : 0
-          if (!ts || ts < sinceSec) continue
-          const entryContent = entry?.message?.content
-          if (!Array.isArray(entryContent)) continue
-          for (const part of entryContent) {
-            if (part?.type === 'tool_use' && typeof part?.name === 'string') {
-              const subject =
-                typeof part?.input?.file_path === 'string' ? part.input.file_path
-                : typeof part?.input?.command === 'string' ? part.input.command
-                : typeof part?.input?.url === 'string' ? part.input.url
-                : typeof part?.input?.query === 'string' ? part.input.query
-                : undefined
-              const agentName = proj  // best effort — caller can re-map via resolveAgentName
-              const existing = out.get(agentName)
-              if (!existing || existing.createdAt < ts) {
-                out.set(agentName, { agentName, toolName: part.name, subject, createdAt: ts })
-              }
-              break  // latest tool found in this entry
-            }
-          }
-        } catch { /* skip bad lines */ }
-      }
-    }
-  }
-  return Array.from(out.values())
 }

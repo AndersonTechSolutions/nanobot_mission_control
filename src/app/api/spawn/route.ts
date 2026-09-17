@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { runClawdbot } from '@/lib/command'
 import { requireRole } from '@/lib/auth'
+import { callOpenClawGateway, isUnknownMethodError } from '@/lib/openclaw-gateway'
 import { config } from '@/lib/config'
 import { readdir, readFile, stat } from 'fs/promises'
 import { join } from 'path'
@@ -9,19 +9,17 @@ import { logger } from '@/lib/logger'
 import { validateBody, spawnAgentSchema } from '@/lib/validation'
 import { scanForInjection } from '@/lib/injection-guard'
 import { logAuditEvent } from '@/lib/db'
+import { denyUnscopedResourceForStrictWorkspace } from '@/lib/workspace-isolation'
 
 function getPreferredToolsProfile(): string {
-  return String(process.env.NANOBOT_TOOLS_PROFILE || 'coding').trim() || 'coding'
-}
-
-async function runSpawnWithCompatibility(spawnPayload: Record<string, unknown>) {
-  const commandArg = `sessions_spawn(${JSON.stringify(spawnPayload)})`
-  return runClawdbot(['-c', commandArg], { timeoutMs: 10000 })
+  return String(process.env.OPENCLAW_TOOLS_PROFILE || 'coding').trim() || 'coding'
 }
 
 export async function POST(request: NextRequest) {
   const auth = requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDeny = denyUnscopedResourceForStrictWorkspace(auth.user, 'runtime_tasks', new URL(request.url).pathname)
+  if (isolationDeny) return isolationDeny
 
   const rateCheck = heavyLimiter(request)
   if (rateCheck) return rateCheck
@@ -55,56 +53,64 @@ export async function POST(request: NextRequest) {
     // Generate spawn ID
     const spawnId = `spawn-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
 
-    // Construct the spawn command
-    // Using nanobot's sessions_spawn function via clawdbot CLI
+    // Construct the legacy spawn payload (sessions_spawn).
     const spawnPayload = {
       task,
-      model,
       label,
+      ...(model ? { model } : {}),
       runTimeoutSeconds: timeout,
       tools: {
         profile: getPreferredToolsProfile(),
       },
     }
 
+    // Modern equivalent for gateways that removed sessions_spawn (OpenClaw
+    // 2026.5.x only exposes the `agent` method). Mirrors the task-dispatch
+    // invocation: `gateway call agent` with a `message` param (issue #645).
+    const agentPayload: Record<string, unknown> = {
+      message: task,
+      ...(label ? { label } : {}),
+      ...(model ? { model } : {}),
+      idempotencyKey: `${spawnId}`,
+      deliver: false,
+    }
+
     try {
-      // Execute the spawn command (nanobot 2026.3.2+ defaults tools.profile to messaging).
-      let stdout = ''
-      let stderr = ''
+      let result: any
       let compatibilityFallbackUsed = false
-      try {
-        const result = await runSpawnWithCompatibility(spawnPayload)
-        stdout = result.stdout
-        stderr = result.stderr
-      } catch (firstError: any) {
-        const rawErr = String(firstError?.stderr || firstError?.message || '').toLowerCase()
-        // Only retry without tools.profile when the error specifically indicates the
-        // gateway doesn't recognize the tools/profile fields. Other errors (auth,
-        // network, model not found, etc.) should propagate immediately.
-        const isToolsSchemaError =
-          (rawErr.includes('unknown field') || rawErr.includes('unknown key') || rawErr.includes('invalid argument')) &&
-          (rawErr.includes('tools') || rawErr.includes('profile'))
-        if (!isToolsSchemaError) throw firstError
+      let invocationMethod: 'sessions_spawn' | 'agent' = 'sessions_spawn'
 
-        const fallbackPayload = { ...spawnPayload }
-        delete (fallbackPayload as any).tools
-        const fallback = await runSpawnWithCompatibility(fallbackPayload)
-        stdout = fallback.stdout
-        stderr = fallback.stderr
-        compatibilityFallbackUsed = true
-      }
-
-      // Parse the response to extract session info
-      let sessionInfo = null
       try {
-        // Look for session information in stdout
-        const sessionMatch = stdout.match(/Session created: (.+)/)
-        if (sessionMatch) {
-          sessionInfo = sessionMatch[1]
+        // Try with tools.profile first; drop it for gateways that reject the field.
+        try {
+          result = await callOpenClawGateway('sessions_spawn', spawnPayload, 15_000)
+        } catch (toolsError: any) {
+          const rawErr = String(toolsError?.message || '').toLowerCase()
+          const isToolsSchemaError =
+            (rawErr.includes('unknown field') || rawErr.includes('unknown key') || rawErr.includes('invalid argument')) &&
+            (rawErr.includes('tools') || rawErr.includes('profile'))
+          if (!isToolsSchemaError) throw toolsError
+          const fallbackPayload = { ...spawnPayload }
+          delete (fallbackPayload as any).tools
+          result = await callOpenClawGateway('sessions_spawn', fallbackPayload, 15_000)
+          compatibilityFallbackUsed = true
         }
-      } catch (parseError) {
-        logger.error({ err: parseError }, 'Failed to parse session info')
+      } catch (spawnError: any) {
+        // Newer gateways removed sessions_spawn entirely → use the modern
+        // `agent` method instead of surfacing "unknown method: sessions_spawn".
+        if (!isUnknownMethodError(spawnError)) throw spawnError
+        logger.info('sessions_spawn unavailable on gateway; falling back to modern agent invocation')
+        result = await callOpenClawGateway('agent', agentPayload, 15_000)
+        compatibilityFallbackUsed = true
+        invocationMethod = 'agent'
       }
+
+      const sessionInfo =
+        result?.sessionId ||
+        result?.session_id ||
+        result?.meta?.agentMeta?.sessionId ||
+        result?.result?.meta?.agentMeta?.sessionId ||
+        null
 
       const ipAddress = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown'
       logAuditEvent({
@@ -113,11 +119,12 @@ export async function POST(request: NextRequest) {
         actor_id: auth.user.id,
         detail: {
           spawnId,
-          model,
+          model: model ?? null,
           label,
           task_summary: task.length > 120 ? task.slice(0, 120) + '...' : task,
           toolsProfile: getPreferredToolsProfile(),
           compatibilityFallbackUsed,
+          invocationMethod,
         },
         ip_address: ipAddress,
       })
@@ -127,27 +134,27 @@ export async function POST(request: NextRequest) {
         spawnId,
         sessionInfo,
         task,
-        model,
+        model: model ?? null,
         label,
         timeoutSeconds: timeout,
         createdAt: Date.now(),
-        stdout: stdout.trim(),
-        stderr: stderr.trim(),
+        result,
         compatibility: {
           toolsProfile: getPreferredToolsProfile(),
           fallbackUsed: compatibilityFallbackUsed,
+          invocationMethod,
         },
       })
 
     } catch (execError: any) {
       logger.error({ err: execError }, 'Spawn execution error')
-      
+
       return NextResponse.json({
         success: false,
         spawnId,
         error: execError.message || 'Failed to spawn agent',
         task,
-        model,
+        model: model ?? null,
         label,
         timeoutSeconds: timeout,
         createdAt: Date.now()
@@ -167,6 +174,8 @@ export async function POST(request: NextRequest) {
 export async function GET(request: NextRequest) {
   const auth = requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDeny = denyUnscopedResourceForStrictWorkspace(auth.user, 'host_administration', new URL(request.url).pathname)
+  if (isolationDeny) return isolationDeny
 
   const rateCheck = heavyLimiter(request)
   if (rateCheck) return rateCheck

@@ -1,12 +1,11 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { discoverAgents } from './agent-discovery'
-import { parseMetadataKey } from '@/types/nanobot-session'
+import { config } from './config'
 
 export interface GatewaySession {
-  /** Session store key, e.g. "telegram:6432548537" */
+  /** Session store key, e.g. "agent:<agent>:main" */
   key: string
-  /** Agent name, e.g. "stefany" */
+  /** Agent directory name, e.g. "<agent>" */
   agent: string
   sessionId: string
   updatedAt: number
@@ -20,114 +19,95 @@ export interface GatewaySession {
   active: boolean
 }
 
-interface AgentSessionDir {
-  agentName: string
-  sessionsDir: string
-  model: string
-}
+function getGatewaySessionStoreFiles(): string[] {
+  const openclawStateDir = config.openclawStateDir
+  if (!openclawStateDir) return []
 
-/**
- * Discover all agent session directories using the agent discovery system.
- * Returns the sessions dir path, agent name, and model for each agent.
- */
-function getAgentSessionDirs(): AgentSessionDir[] {
-  const agents = discoverAgents()
-  const results: AgentSessionDir[] = []
+  const agentsDir = path.join(openclawStateDir, 'agents')
+  if (!fs.existsSync(agentsDir)) return []
 
-  for (const agent of agents) {
-    const sessionsDir = path.join(agent.workspacePath, 'sessions')
-    if (!fs.existsSync(sessionsDir)) continue
-
-    results.push({
-      agentName: agent.id,
-      sessionsDir,
-      model: agent.model || 'unknown',
-    })
-  }
-
-  return results
-}
-
-/**
- * Parse the metadata (first line) of a JSONL session file.
- * Returns null if the file is empty or the first line isn't valid metadata.
- */
-function parseJsonlMetadata(filePath: string): {
-  key: string
-  updatedAt: number
-  sessionId: string
-  channel: string
-  chatType: string
-} | null {
+  let agentDirs: string[]
   try {
-    // Read only the first line for metadata
-    const content = fs.readFileSync(filePath, 'utf-8')
-    const newlineIdx = content.indexOf('\n')
-    const firstLine = newlineIdx >= 0 ? content.slice(0, newlineIdx) : content
-    if (!firstLine.trim()) return null
-
-    const meta = JSON.parse(firstLine)
-    if (meta._type !== 'metadata' || !meta.key) return null
-
-    const updatedAtStr = meta.updated_at || meta.updatedAt || ''
-    const updatedAt = updatedAtStr ? new Date(updatedAtStr).getTime() : 0
-
-    const parsed = parseMetadataKey(meta.key)
-
-    return {
-      key: meta.key,
-      updatedAt: Number.isFinite(updatedAt) ? updatedAt : 0,
-      sessionId: meta.metadata?.sdk_session_id || meta.sessionId || '',
-      channel: parsed.channel,
-      chatType: parsed.channel || 'unknown',
-    }
+    agentDirs = fs.readdirSync(agentsDir)
   } catch {
-    return null
+    return []
   }
+
+  const files: string[] = []
+  for (const agentName of agentDirs) {
+    const sessionsFile = path.join(agentsDir, agentName, 'sessions', 'sessions.json')
+    try {
+      if (fs.statSync(sessionsFile).isFile()) files.push(sessionsFile)
+    } catch {
+      // Skip missing or unreadable session stores.
+    }
+  }
+  return files
+}
+
+// TTL cache to avoid re-reading session files multiple times per scheduler tick.
+// Stores sessions without the `active` flag so the cache is independent of activeWithinMs.
+type RawSession = Omit<GatewaySession, 'active'>
+let _sessionCache: { data: RawSession[]; ts: number } | null = null
+const SESSION_CACHE_TTL_MS = 30_000
+
+/** Invalidate the session cache (e.g. after pruning). */
+export function invalidateSessionCache(): void {
+  _sessionCache = null
 }
 
 /**
- * Read all sessions from nanobot agent JSONL session files on disk.
+ * Read all sessions from OpenClaw agent session stores on disk.
  *
- * Uses discoverAgents() to find agent workspace directories, then scans
- * each agent's sessions/ folder for .jsonl files with metadata headers.
+ * OpenClaw stores sessions per-agent at:
+ *   {OPENCLAW_STATE_DIR}/agents/{agentName}/sessions/sessions.json
+ *
+ * Each file is a JSON object keyed by session key (e.g. "agent:<agent>:main")
+ * with session metadata as values.
  */
-export function getAllGatewaySessions(activeWithinMs = 60 * 60 * 1000): GatewaySession[] {
-  const sessions: GatewaySession[] = []
+export function getAllGatewaySessions(activeWithinMs = 60 * 60 * 1000, force = false): GatewaySession[] {
   const now = Date.now()
 
-  for (const { agentName, sessionsDir, model } of getAgentSessionDirs()) {
-    let files: string[]
-    try {
-      files = fs.readdirSync(sessionsDir).filter(f => f.endsWith('.jsonl'))
-    } catch {
-      continue
+  let raw: RawSession[]
+  if (!force && _sessionCache && (now - _sessionCache.ts) < SESSION_CACHE_TTL_MS) {
+    raw = _sessionCache.data
+  } else {
+    const sessions: RawSession[] = []
+    for (const sessionsFile of getGatewaySessionStoreFiles()) {
+      const agentName = path.basename(path.dirname(path.dirname(sessionsFile)))
+      try {
+        const fileContent = fs.readFileSync(sessionsFile, 'utf-8')
+        const data = JSON.parse(fileContent)
+
+        for (const [key, entry] of Object.entries(data)) {
+          const s = entry as Record<string, any>
+          const updatedAt = s.updatedAt || 0
+          sessions.push({
+            key,
+            agent: agentName,
+            sessionId: s.sessionId || '',
+            updatedAt,
+            chatType: s.chatType || 'unknown',
+            channel: s.deliveryContext?.channel || s.lastChannel || s.channel || '',
+            model: typeof s.model === 'object' && s.model?.primary ? String(s.model.primary) : String(s.model || ''),
+            totalTokens: s.totalTokens || 0,
+            inputTokens: s.inputTokens || 0,
+            outputTokens: s.outputTokens || 0,
+            contextTokens: s.contextTokens || 0,
+          })
+        }
+      } catch {
+        // Skip agents without valid session files
+      }
     }
 
-    for (const filename of files) {
-      const filePath = path.join(sessionsDir, filename)
-      const meta = parseJsonlMetadata(filePath)
-      if (!meta) continue
-
-      sessions.push({
-        key: meta.key,
-        agent: agentName,
-        sessionId: meta.sessionId,
-        updatedAt: meta.updatedAt,
-        chatType: meta.chatType,
-        channel: meta.channel,
-        model,
-        totalTokens: 0,
-        inputTokens: 0,
-        outputTokens: 0,
-        contextTokens: 0,
-        active: meta.updatedAt > 0 && (now - meta.updatedAt) < activeWithinMs,
-      })
-    }
+    sessions.sort((a, b) => b.updatedAt - a.updatedAt)
+    _sessionCache = { data: sessions, ts: Date.now() }
+    raw = sessions
   }
 
-  sessions.sort((a, b) => b.updatedAt - a.updatedAt)
-  return sessions
+  // Compute `active` at read time so it's always fresh regardless of cache age
+  return raw.map(s => ({ ...s, active: (now - s.updatedAt) < activeWithinMs }))
 }
 
 export function countStaleGatewaySessions(retentionDays: number): number {
@@ -135,17 +115,16 @@ export function countStaleGatewaySessions(retentionDays: number): number {
   const cutoff = Date.now() - retentionDays * 86400000
   let stale = 0
 
-  for (const { sessionsDir } of getAgentSessionDirs()) {
-    let files: string[]
+  for (const sessionsFile of getGatewaySessionStoreFiles()) {
     try {
-      files = fs.readdirSync(sessionsDir).filter(f => f.endsWith('.jsonl'))
+      const raw = fs.readFileSync(sessionsFile, 'utf-8')
+      const data = JSON.parse(raw) as Record<string, any>
+      for (const entry of Object.values(data)) {
+        const updatedAt = Number((entry as any)?.updatedAt || 0)
+        if (updatedAt > 0 && updatedAt < cutoff) stale += 1
+      }
     } catch {
-      continue
-    }
-
-    for (const filename of files) {
-      const meta = parseJsonlMetadata(path.join(sessionsDir, filename))
-      if (meta && meta.updatedAt > 0 && meta.updatedAt < cutoff) stale += 1
+      // Ignore malformed session stores.
     }
   }
 
@@ -158,29 +137,35 @@ export function pruneGatewaySessionsOlderThan(retentionDays: number): { deleted:
   let deleted = 0
   let filesTouched = 0
 
-  for (const { sessionsDir } of getAgentSessionDirs()) {
-    let files: string[]
+  for (const sessionsFile of getGatewaySessionStoreFiles()) {
     try {
-      files = fs.readdirSync(sessionsDir).filter(f => f.endsWith('.jsonl'))
-    } catch {
-      continue
-    }
+      const raw = fs.readFileSync(sessionsFile, 'utf-8')
+      const data = JSON.parse(raw) as Record<string, any>
+      const nextEntries: Record<string, any> = {}
+      let fileDeleted = 0
 
-    for (const filename of files) {
-      const filePath = path.join(sessionsDir, filename)
-      const meta = parseJsonlMetadata(filePath)
-      if (meta && meta.updatedAt > 0 && meta.updatedAt < cutoff) {
-        try {
-          fs.unlinkSync(filePath)
-          deleted += 1
-          filesTouched += 1
-        } catch {
-          // Ignore unremovable files
+      for (const [key, entry] of Object.entries(data)) {
+        const updatedAt = Number((entry as any)?.updatedAt || 0)
+        if (updatedAt > 0 && updatedAt < cutoff) {
+          fileDeleted += 1
+          continue
         }
+        nextEntries[key] = entry
       }
+
+      if (fileDeleted > 0) {
+        const tempPath = `${sessionsFile}.tmp`
+        fs.writeFileSync(tempPath, `${JSON.stringify(nextEntries, null, 2)}\n`, 'utf-8')
+        fs.renameSync(tempPath, sessionsFile)
+        deleted += fileDeleted
+        filesTouched += 1
+      }
+    } catch {
+      // Ignore malformed/unwritable session stores.
     }
   }
 
+  if (filesTouched > 0) invalidateSessionCache()
   return { deleted, filesTouched }
 }
 

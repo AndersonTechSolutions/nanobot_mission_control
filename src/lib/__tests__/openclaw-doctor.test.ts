@@ -89,6 +89,28 @@ Run "openclaw doctor --fix" to apply changes.
     expect(result.raw).not.toContain('Multiple state directories detected')
   })
 
+  it('parses state integrity blocks when lines are prefixed by box-drawing gutters', () => {
+    const result = parseOpenClawDoctorOutput(`
+┌  OpenClaw doctor
+│
+◇  State integrity
+│  - Multiple state directories detected. This can split session history.
+│    - $OPENCLAW_HOME/.openclaw
+│    - /home/nefes/.openclaw
+│    Active state dir: $OPENCLAW_HOME
+│  - Found 11 orphan transcript file(s) in $OPENCLAW_HOME/agents/jarv/sessions.
+Run "openclaw doctor --fix" to apply changes.
+`, 0, { stateDir: '/home/openclaw/.openclaw' })
+
+    expect(result.level).toBe('warning')
+    expect(result.category).toBe('state')
+    expect(result.issues).toEqual([
+      'Found 11 orphan transcript file(s) in $OPENCLAW_HOME/agents/jarv/sessions.',
+    ])
+    expect(result.raw).not.toContain('/home/nefes/.openclaw')
+    expect(result.raw).not.toContain('Multiple state directories detected')
+  })
+
   it('marks clean output as healthy', () => {
     const result = parseOpenClawDoctorOutput('OK: configuration valid', 0)
 
@@ -96,5 +118,32 @@ Run "openclaw doctor --fix" to apply changes.
     expect(result.level).toBe('healthy')
     expect(result.category).toBe('general')
     expect(result.canFix).toBe(false)
+  })
+
+  it('treats positive security lines as healthy, not warnings (#331)', () => {
+    const result = parseOpenClawDoctorOutput(`
+? Security
+- No channel security warnings detected.
+- Run: openclaw security audit --deep
+`, 0)
+
+    expect(result.healthy).toBe(true)
+    expect(result.level).toBe('healthy')
+    expect(result.issues).toEqual([])
+  })
+
+  it('still detects real security warnings alongside positive lines', () => {
+    const result = parseOpenClawDoctorOutput(`
+? Security
+- Channel "public" has no auth configured.
+- No channel security warnings detected.
+- Run: openclaw security audit --deep
+`, 0)
+
+    expect(result.healthy).toBe(false)
+    expect(result.level).toBe('warning')
+    expect(result.issues).toEqual([
+      'Channel "public" has no auth configured.',
+    ])
   })
 })

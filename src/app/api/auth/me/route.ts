@@ -2,7 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getUserFromRequest, updateUser, requireRole, destroyAllUserSessions, createSession } from '@/lib/auth'
 import { logAuditEvent } from '@/lib/db'
 import { verifyPassword } from '@/lib/password'
-import { getMcSessionCookieOptions } from '@/lib/session-cookie'
+import { getMcSessionCookieName, getMcSessionCookieOptions, isRequestSecure } from '@/lib/session-cookie'
+import { passwordChangeLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
 
 export async function GET(request: Request) {
@@ -52,12 +53,16 @@ export async function PATCH(request: NextRequest) {
 
     // Handle password change
     if (new_password) {
+      // Rate-limit password change attempts per user (5/min, separate from login)
+      const rateCheck = passwordChangeLimiter(String(user.id))
+      if (rateCheck) return rateCheck
+
       if (!current_password) {
         return NextResponse.json({ error: 'Current password is required' }, { status: 400 })
       }
 
-      if (new_password.length < 8) {
-        return NextResponse.json({ error: 'New password must be at least 8 characters' }, { status: 400 })
+      if (new_password.length < 12) {
+        return NextResponse.json({ error: 'New password must be at least 12 characters' }, { status: 400 })
       }
 
       // Verify current password by fetching stored hash
@@ -117,9 +122,9 @@ export async function PATCH(request: NextRequest) {
     // Issue a fresh session cookie after password change (old ones were just revoked)
     if (updates.password) {
       const { token, expiresAt } = createSession(user.id, ipAddress, userAgent, user.workspace_id ?? 1)
-      const isSecureRequest = request.headers.get('x-forwarded-proto') === 'https'
-        || new URL(request.url).protocol === 'https:'
-      response.cookies.set('mc-session', token, {
+      const isSecureRequest = isRequestSecure(request)
+      const cookieName = getMcSessionCookieName(isSecureRequest)
+      response.cookies.set(cookieName, token, {
         ...getMcSessionCookieOptions({ maxAgeSeconds: expiresAt - Math.floor(Date.now() / 1000), isSecureRequest }),
       })
     }

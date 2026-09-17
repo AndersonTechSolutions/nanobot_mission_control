@@ -1,11 +1,33 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { config } from '@/lib/config'
+import { existsSync } from 'fs'
+import { join } from 'path'
 import { requireRole } from '@/lib/auth'
 import { readLimiter } from '@/lib/rate-limit'
-import { generateContextPayload } from '@/lib/memory-utils'
+import { generateContextPayload, ContextPayload } from '@/lib/memory-utils'
 import { logger } from '@/lib/logger'
+import { MEMORY_ALLOWED_PREFIXES } from '@/lib/memory-path'
+import { resolveWorkspaceMemoryAccess } from '@/lib/workspace-isolation'
 
-const MEMORY_PATH = config.memoryDir
+function mergeContextPayloads(payloads: ContextPayload[]): ContextPayload {
+  return {
+    fileTree: payloads.flatMap((p) => p.fileTree),
+    recentFiles: payloads
+      .flatMap((p) => p.recentFiles)
+      .sort((a, b) => b.modified - a.modified)
+      .slice(0, 10),
+    healthSummary: {
+      overall: payloads.some((p) => p.healthSummary.overall === 'critical')
+        ? 'critical'
+        : payloads.some((p) => p.healthSummary.overall === 'warning')
+          ? 'warning'
+          : 'healthy',
+      score: payloads.length > 0
+        ? Math.round(payloads.reduce((s, p) => s + p.healthSummary.score, 0) / payloads.length)
+        : 100,
+    },
+    maintenanceSignals: payloads.flatMap((p) => p.maintenanceSignals),
+  }
+}
 
 /**
  * Context injection endpoint — generates a payload for agent session start.
@@ -18,12 +40,28 @@ export async function GET(request: NextRequest) {
   const limited = readLimiter(request)
   if (limited) return limited
 
-  if (!MEMORY_PATH) {
+  const memoryAccess = resolveWorkspaceMemoryAccess(auth.user)
+  if (!memoryAccess) {
     return NextResponse.json({ error: 'Memory directory not configured' }, { status: 500 })
   }
 
   try {
-    const payload = await generateContextPayload(MEMORY_PATH)
+    if (MEMORY_ALLOWED_PREFIXES.length) {
+      const payloads: ContextPayload[] = []
+      for (const prefix of MEMORY_ALLOWED_PREFIXES) {
+        const folder = prefix.replace(/\/$/, '')
+        const fullPath = join(memoryAccess.root, folder)
+        if (!existsSync(fullPath)) continue
+        payloads.push(await generateContextPayload(fullPath))
+      }
+      return NextResponse.json(
+        payloads.length > 0
+          ? mergeContextPayloads(payloads)
+          : await generateContextPayload(memoryAccess.root)
+      )
+    }
+
+    const payload = await generateContextPayload(memoryAccess.root)
     return NextResponse.json(payload)
   } catch (err) {
     logger.error({ err }, 'Memory context API error')

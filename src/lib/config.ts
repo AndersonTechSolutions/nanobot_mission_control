@@ -19,7 +19,10 @@ const buildScratchRoot =
   process.env.MISSION_CONTROL_BUILD_DATA_DIR ||
   path.join(os.tmpdir(), 'mission-control-build')
 const resolvedDataDir = isBuildPhase
-  ? path.join(buildScratchRoot, `worker-${process.pid}`)
+  ? (() => {
+      fs.mkdirSync(buildScratchRoot, { recursive: true, mode: 0o700 })
+      return fs.mkdtempSync(path.join(buildScratchRoot, 'worker-'))
+    })()
   : configuredDataDir
 const resolvedDbPath = isBuildPhase
   ? (process.env.MISSION_CONTROL_BUILD_DB_PATH ||
@@ -31,28 +34,71 @@ const resolvedTokensPath = isBuildPhase
       path.join(resolvedDataDir, 'mission-control-tokens.json'))
   : (process.env.MISSION_CONTROL_TOKENS_PATH ||
       path.join(resolvedDataDir, 'mission-control-tokens.json'))
-const defaultNanobotStateDir = path.join(os.homedir(), '.nanobot')
-const nanobotStateDir =
-  process.env.NANOBOT_STATE_DIR ||
+const defaultOpenClawStateDir = path.join(os.homedir(), '.nanobot')
+const explicitOpenClawConfigPath =
+  process.env.OPENCLAW_CONFIG_PATH ||
+  process.env.MISSION_CONTROL_OPENCLAW_CONFIG_PATH ||
+  process.env.NANOBOT_CONFIG_PATH ||
+  ''
+const legacyOpenClawHome =
+  process.env.OPENCLAW_HOME ||
   process.env.NANOBOT_HOME ||
-  defaultNanobotStateDir
-const nanobotWorkspaceDir =
+  process.env.CLAWDBOT_HOME ||
+  process.env.MISSION_CONTROL_OPENCLAW_HOME ||
+  ''
+const openclawStateDir =
+  process.env.OPENCLAW_STATE_DIR ||
+  process.env.NANOBOT_STATE_DIR ||
+  process.env.CLAWDBOT_STATE_DIR ||
+  legacyOpenClawHome ||
+  (explicitOpenClawConfigPath ? path.dirname(explicitOpenClawConfigPath) : defaultOpenClawStateDir)
+const openclawConfigPath =
+  explicitOpenClawConfigPath ||
+  (fs.existsSync(path.join(openclawStateDir, 'nanobot.json'))
+    ? path.join(openclawStateDir, 'nanobot.json')
+    : path.join(openclawStateDir, 'openclaw.json'))
+const openclawWorkspaceDir =
+  process.env.OPENCLAW_WORKSPACE_DIR ||
   process.env.NANOBOT_WORKSPACE_DIR ||
   process.env.MISSION_CONTROL_WORKSPACE_DIR ||
-  (nanobotStateDir ? path.join(nanobotStateDir, 'workspace') : '')
+  (openclawStateDir ? path.join(openclawStateDir, 'workspace') : '')
 const defaultMemoryDir = (() => {
-  if (process.env.NANOBOT_MEMORY_DIR) return process.env.NANOBOT_MEMORY_DIR
+  if (process.env.OPENCLAW_MEMORY_DIR || process.env.NANOBOT_MEMORY_DIR) {
+    return process.env.OPENCLAW_MEMORY_DIR || process.env.NANOBOT_MEMORY_DIR || ''
+  }
   // Prefer workspace memory context (daily notes + knowledge-base)
   // when available; fallback to legacy sqlite memory path.
   if (
-    nanobotWorkspaceDir &&
-    (fs.existsSync(path.join(nanobotWorkspaceDir, 'memory')) ||
-      fs.existsSync(path.join(nanobotWorkspaceDir, 'knowledge-base')))
+    openclawWorkspaceDir &&
+    (fs.existsSync(path.join(openclawWorkspaceDir, 'memory')) ||
+      fs.existsSync(path.join(openclawWorkspaceDir, 'knowledge-base')))
   ) {
-    return nanobotWorkspaceDir
+    return openclawWorkspaceDir
   }
-  return (nanobotStateDir ? path.join(nanobotStateDir, 'memory') : '') || path.join(defaultDataDir, 'memory')
+  return (openclawStateDir ? path.join(openclawStateDir, 'memory') : '') || path.join(defaultDataDir, 'memory')
 })()
+
+const resolvedGnapRepoPath =
+  process.env.GNAP_REPO_PATH || path.join(configuredDataDir, '.gnap')
+
+function resolveDefaultCliBin(command: string): string {
+  if (process.platform !== 'win32') return command
+
+  const appData = process.env.APPDATA || ''
+  if (!appData) return command
+
+  const npmRoot = path.join(appData, 'npm')
+  const npmModuleEntrypoint = path.join(npmRoot, 'node_modules', command, `${command}.mjs`)
+  if (fs.existsSync(npmModuleEntrypoint)) return npmModuleEntrypoint
+
+  const npmCmdShim = path.join(npmRoot, `${command}.cmd`)
+  return fs.existsSync(npmCmdShim) ? npmCmdShim : command
+}
+
+const resolvedCliBin =
+  process.env.OPENCLAW_BIN ||
+  process.env.NANOBOT_BIN ||
+  resolveDefaultCliBin('nanobot')
 
 export const config = {
   claudeHome:
@@ -61,30 +107,53 @@ export const config = {
   dataDir: resolvedDataDir,
   dbPath: resolvedDbPath,
   tokensPath: resolvedTokensPath,
-  nanobotHome: nanobotStateDir,
-  nanobotStateDir,
+  // Keep openclawHome as a legacy alias for existing code paths.
+  openclawHome: openclawStateDir,
+  openclawStateDir,
+  openclawConfigPath,
+  openclawBin: resolvedCliBin,
+  clawdbotBin: process.env.CLAWDBOT_BIN || process.env.NANOBOT_BIN || resolveDefaultCliBin('nanobot'),
+  gatewayHost: process.env.OPENCLAW_GATEWAY_HOST || process.env.NANOBOT_GATEWAY_HOST || '127.0.0.1',
+  gatewayPort: clampInt(Number(process.env.OPENCLAW_GATEWAY_PORT || process.env.NANOBOT_GATEWAY_PORT || process.env.GATEWAY_PORT || '18789'), 1, 65535, 18789),
   logsDir:
+    process.env.OPENCLAW_LOG_DIR ||
     process.env.NANOBOT_LOG_DIR ||
-    (nanobotStateDir ? path.join(nanobotStateDir, 'logs') : ''),
-  tempLogsDir: process.env.NANOBOT_TMP_LOG_DIR || '',
+    (openclawStateDir ? path.join(openclawStateDir, 'logs') : ''),
+  tempLogsDir: process.env.CLAWDBOT_TMP_LOG_DIR || process.env.NANOBOT_TMP_LOG_DIR || '',
   memoryDir: defaultMemoryDir,
   memoryAllowedPrefixes:
-    defaultMemoryDir === nanobotWorkspaceDir
+    defaultMemoryDir === openclawWorkspaceDir
       ? ['memory/', 'knowledge-base/']
       : [],
   soulTemplatesDir:
+    process.env.OPENCLAW_SOUL_TEMPLATES_DIR ||
     process.env.NANOBOT_SOUL_TEMPLATES_DIR ||
-    (nanobotStateDir ? path.join(nanobotStateDir, 'templates', 'souls') : ''),
+    (openclawStateDir ? path.join(openclawStateDir, 'templates', 'souls') : ''),
   homeDir: os.homedir(),
-
-  nanobotBin: process.env.NANOBOT_BIN || 'nanobot',
-  clawdbotBin: process.env.NANOBOT_BIN || 'nanobot',
-  nanobotConfigPath: process.env.NANOBOT_CONFIG_PATH || '',
-  nanobotGatewayHost: process.env.NANOBOT_GATEWAY_HOST || '127.0.0.1',
-  nanobotGatewayPort: clampInt(Number(process.env.NANOBOT_GATEWAY_PORT || process.env.GATEWAY_PORT || '0'), 0, 65535, 0),
-  gatewayHost: process.env.NANOBOT_GATEWAY_HOST || '127.0.0.1',
-  gatewayPort: clampInt(Number(process.env.NANOBOT_GATEWAY_PORT || process.env.GATEWAY_PORT || '18789'), 1, 65535, 18789),
-
+  // Fork aliases used by nanobot office / session panels.
+  nanobotHome: openclawStateDir,
+  nanobotStateDir: openclawStateDir,
+  nanobotBin: resolvedCliBin,
+  nanobotConfigPath: openclawConfigPath,
+  nanobotGatewayHost: process.env.NANOBOT_GATEWAY_HOST || process.env.OPENCLAW_GATEWAY_HOST || '127.0.0.1',
+  nanobotGatewayPort: clampInt(Number(process.env.NANOBOT_GATEWAY_PORT || process.env.GATEWAY_PORT || process.env.OPENCLAW_GATEWAY_PORT || '0'), 0, 65535, 0),
+  // Optional coordinator agent for auto-routing unassigned tasks (issue #663).
+  // Opt-in: empty string means the feature is OFF (tasks created without an
+  // assignee stay unassigned). When set, new tasks with no assigned_to are
+  // routed to this agent name.
+  coordinatorAgent: (process.env.MC_COORDINATOR_AGENT || '').trim(),
+  // Workspace root for host-CLI dispatch cwd scoping (issue #720). Opt-in:
+  // empty string means the per-agent/per-task `dispatchCwd` feature is OFF
+  // and CLI dispatch always inherits the server's own cwd. When set, a
+  // requested cwd must resolve (symlinks included) to a directory inside
+  // this root or it is rejected.
+  workspaceRoot: (process.env.MC_WORKSPACE_ROOT || '').trim(),
+  gnap: {
+    enabled: process.env.GNAP_ENABLED === 'true',
+    repoPath: resolvedGnapRepoPath,
+    autoSync: process.env.GNAP_AUTO_SYNC !== 'false',
+    remoteUrl: process.env.GNAP_REMOTE_URL || '',
+  },
   // Data retention (days). 0 = keep forever. Negative values are clamped to 0.
   retention: {
     activities: clampInt(Number(process.env.MC_RETAIN_ACTIVITIES_DAYS || '90'), 0, 3650, 90),
@@ -95,12 +164,6 @@ export const config = {
     tokenUsage: clampInt(Number(process.env.MC_RETAIN_TOKEN_USAGE_DAYS || '90'), 0, 3650, 90),
     gatewaySessions: clampInt(Number(process.env.MC_RETAIN_GATEWAY_SESSIONS_DAYS || '90'), 0, 3650, 90),
   },
-
-  // Backward-compat aliases for upstream openclaw property names
-  get openclawStateDir() { return this.nanobotStateDir },
-  get openclawHome() { return this.nanobotHome },
-  get openclawConfigPath() { return this.nanobotConfigPath },
-  get openclawBin() { return this.nanobotBin },
 }
 
 export function ensureDirExists(dirPath: string) {

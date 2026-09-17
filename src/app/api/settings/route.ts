@@ -24,6 +24,13 @@ const settingDefinitions: Record<string, { category: string; description: string
   'retention.pipeline_runs_days': { category: 'retention', description: 'Days to keep pipeline run history', default: String(config.retention.pipelineRuns) },
   'retention.token_usage_days': { category: 'retention', description: 'Days to keep token usage data', default: String(config.retention.tokenUsage) },
 
+  // Chat
+  'chat.coordinator_target_agent': {
+    category: 'chat',
+    description: 'Optional coordinator routing target (agent name or openclawId). When set, coordinator inbox messages are forwarded to this agent before default/main-session fallback.',
+    default: '',
+  },
+
   // General
   'general.site_name': { category: 'general', description: 'Mission Control display name', default: 'Mission Control' },
   'general.auto_cleanup': { category: 'general', description: 'Enable automatic data cleanup', default: 'false' },

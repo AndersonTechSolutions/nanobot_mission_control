@@ -1,3 +1,4 @@
+import { createHash } from 'crypto'
 import { readFileSync } from 'fs'
 import { join } from 'path'
 import type Database from 'better-sqlite3'
@@ -5,6 +6,7 @@ import type Database from 'better-sqlite3'
 export type Migration = {
   id: string
   up: (db: Database.Database) => void
+  foreignKeysOff?: boolean
 }
 
 // Plugin hook: extensions can register additional migrations without modifying this file.
@@ -289,7 +291,7 @@ const migrations: Migration[] = [
           linux_user TEXT NOT NULL UNIQUE,
           plan_tier TEXT NOT NULL DEFAULT 'standard',
           status TEXT NOT NULL DEFAULT 'pending',
-          openclaw_home TEXT NOT NULL, -- legacy column name, aliased as nanobotHome in application layer
+          openclaw_home TEXT NOT NULL,
           workspace_root TEXT NOT NULL,
           gateway_port INTEGER,
           dashboard_port INTEGER,
@@ -1247,43 +1249,305 @@ const migrations: Migration[] = [
     }
   },
   {
-    id: '041_nanobot_sessions',
-    up: (db) => {
+    id: '041_gateway_health_logs',
+    up(db: Database.Database) {
       db.exec(`
-        CREATE TABLE IF NOT EXISTS nanobot_sessions (
+        CREATE TABLE IF NOT EXISTS gateway_health_logs (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
+          gateway_id INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          latency INTEGER,
+          probed_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          error TEXT
+        )
+      `)
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_gateway_health_logs_gateway_id ON gateway_health_logs(gateway_id)`)
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_gateway_health_logs_probed_at ON gateway_health_logs(probed_at)`)
+    }
+  },
+  {
+    id: '042_agent_hidden',
+    up(db: Database.Database) {
+      db.exec(`ALTER TABLE agents ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0`)
+    }
+  },
+  {
+    id: '043_hash_session_tokens',
+    up(db: Database.Database) {
+      // Migrate existing plaintext session tokens to SHA-256 hashes.
+      // After this migration, session tokens are stored as hashes — raw tokens
+      // are only returned to the client on creation. Existing sessions will be
+      // invalidated (users need to re-login).
+      const rows = db.prepare('SELECT id, token FROM user_sessions').all() as Array<{ id: number; token: string }>
+      const update = db.prepare('UPDATE user_sessions SET token = ? WHERE id = ?')
+      for (const row of rows) {
+        const hashed = createHash('sha256').update(row.token).digest('hex')
+        update.run(hashed, row.id)
+      }
+    }
+  },
+  {
+    id: '044_spawn_history',
+    up(db: Database.Database) {
+      db.exec([
+        `CREATE TABLE IF NOT EXISTS spawn_history (`,
+        `  id INTEGER PRIMARY KEY AUTOINCREMENT,`,
+        `  agent_id INTEGER,`,
+        `  agent_name TEXT NOT NULL,`,
+        `  spawn_type TEXT NOT NULL DEFAULT 'claude-code',`,
+        `  session_id TEXT,`,
+        `  trigger TEXT,`,
+        `  status TEXT NOT NULL DEFAULT 'started',`,
+        `  exit_code INTEGER,`,
+        `  error TEXT,`,
+        `  duration_ms INTEGER,`,
+        `  workspace_id INTEGER NOT NULL DEFAULT 1,`,
+        `  created_at INTEGER NOT NULL DEFAULT (unixepoch()),`,
+        `  finished_at INTEGER,`,
+        `  FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE SET NULL`,
+        `)`,
+      ].join('\n'))
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_spawn_history_agent ON spawn_history(agent_name)`)
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_spawn_history_created ON spawn_history(created_at)`)
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_spawn_history_status ON spawn_history(status)`)
+    }
+  },
+  {
+    id: '045_task_dispatch_attempts',
+    up(db: Database.Database) {
+      const cols = db.prepare(`PRAGMA table_info(tasks)`).all() as Array<{ name: string }>
+      if (!cols.some(c => c.name === 'dispatch_attempts')) {
+        db.exec(`ALTER TABLE tasks ADD COLUMN dispatch_attempts INTEGER NOT NULL DEFAULT 0`)
+      }
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_stale_inprogress ON tasks(status, updated_at) WHERE status = 'in_progress'`)
+    }
+  },
+  {
+    id: '046_agent_runs',
+    up(db: Database.Database) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS runs (
+          id TEXT PRIMARY KEY,
           agent_id TEXT NOT NULL,
-          filename TEXT NOT NULL,
-          session_key TEXT NOT NULL,
-          channel_type TEXT NOT NULL,
-          channel_identifier TEXT NOT NULL,
-          message_count INTEGER NOT NULL DEFAULT 0,
-          first_message_at TEXT,
-          last_message_at TEXT,
-          last_user_message TEXT,
-          file_size_bytes INTEGER NOT NULL DEFAULT 0,
-          scanned_at INTEGER NOT NULL,
-          created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-          updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
-          UNIQUE(agent_id, filename)
-        );
-        CREATE INDEX IF NOT EXISTS idx_nanobot_sessions_agent ON nanobot_sessions(agent_id);
-        CREATE INDEX IF NOT EXISTS idx_nanobot_sessions_channel ON nanobot_sessions(channel_type);
-        CREATE INDEX IF NOT EXISTS idx_nanobot_sessions_last_message ON nanobot_sessions(last_message_at);
+          agent_name TEXT,
+          model TEXT,
+          provider TEXT,
+          runtime TEXT DEFAULT 'mission-control',
+          runtime_version TEXT,
+          trigger_type TEXT,
+          parent_run_id TEXT,
+          task_id TEXT,
+          status TEXT NOT NULL DEFAULT 'pending',
+          outcome TEXT,
+          started_at TEXT NOT NULL,
+          ended_at TEXT,
+          duration_ms INTEGER,
+          steps TEXT DEFAULT '[]',
+          tools_available TEXT DEFAULT '[]',
+          cost_input_tokens INTEGER DEFAULT 0,
+          cost_output_tokens INTEGER DEFAULT 0,
+          cost_cache_read_tokens INTEGER,
+          cost_cache_write_tokens INTEGER,
+          cost_usd REAL,
+          cost_model TEXT,
+          run_hash TEXT,
+          parent_run_hash TEXT,
+          lineage TEXT DEFAULT '[]',
+          model_version TEXT,
+          config_hash TEXT,
+          provenance_runtime TEXT,
+          signed_by TEXT,
+          signature TEXT,
+          provenance_created_at TEXT,
+          eval_task_type TEXT,
+          eval_layer TEXT,
+          eval_pass INTEGER,
+          eval_score REAL,
+          eval_detail TEXT,
+          eval_metrics TEXT,
+          eval_benchmark_id TEXT,
+          error TEXT,
+          git_branch TEXT,
+          git_commit TEXT,
+          workspace_id INTEGER DEFAULT 1,
+          tags TEXT DEFAULT '[]',
+          metadata TEXT DEFAULT '{}',
+          spawn_history_id INTEGER,
+          created_at INTEGER DEFAULT (unixepoch())
+        )
+      `)
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_runs_agent_id ON runs(agent_id)`)
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status)`)
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at)`)
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_runs_workspace ON runs(workspace_id)`)
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_runs_run_hash ON runs(run_hash)`)
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_runs_task_id ON runs(task_id)`)
+    }
+  },
+  {
+    id: '047_agent_working_memory',
+    up(db: Database.Database) {
+      const cols = db.prepare(`PRAGMA table_info(agents)`).all() as Array<{ name: string }>
+      if (!cols.some(c => c.name === 'working_memory')) {
+        db.exec(`ALTER TABLE agents ADD COLUMN working_memory TEXT DEFAULT ''`)
+      }
+    }
+  },
+  {
+    id: '048_memory_fts',
+    up(db: Database.Database) {
+      db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+          path,
+          title,
+          content,
+          tokenize='porter unicode61'
+        )
+      `)
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_fts_meta (
+          key TEXT PRIMARY KEY,
+          value TEXT
+        )
       `)
     }
   },
   {
-    id: '042_claude_sessions_cache_tokens',
-    up: (db) => {
-      const cols = db.prepare('PRAGMA table_info(claude_sessions)').all() as Array<{ name: string }>
-      const hasCol = (name: string) => cols.some((c) => c.name === name)
-
-      if (!hasCol('cache_read_tokens')) {
-        db.exec('ALTER TABLE claude_sessions ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0')
+    id: '049_agent_runtime_type',
+    up(db: Database.Database) {
+      db.exec(`ALTER TABLE agents ADD COLUMN runtime_type TEXT DEFAULT NULL`)
+    }
+  },
+  {
+    id: '050_mcp_call_receipt_signing',
+    up(db: Database.Database) {
+      // Add Ed25519 receipt signing columns to the MCP audit log.
+      // payload_hash: SHA-256 of the canonical JSON payload at write time
+      // signature: Ed25519 signature (hex) over the canonical payload
+      // public_key: base64-encoded Ed25519 public key for offline verification
+      db.exec(`ALTER TABLE mcp_call_log ADD COLUMN payload_hash TEXT DEFAULT NULL`)
+      db.exec(`ALTER TABLE mcp_call_log ADD COLUMN signature TEXT DEFAULT NULL`)
+      db.exec(`ALTER TABLE mcp_call_log ADD COLUMN public_key TEXT DEFAULT NULL`)
+    }
+  },
+  {
+    id: '051_hash_global_api_key',
+    up(db: Database.Database) {
+      // Migrate the plaintext global API key (settings 'security.api_key') to a
+      // SHA-256 hash stored under 'security.api_key_hash'. After this migration
+      // the plaintext key is never at rest — it is only returned once at rotation,
+      // so a DB read (file copy, backup dump) no longer yields a live credential.
+      const row = db.prepare(
+        "SELECT value, updated_by, updated_at FROM settings WHERE key = 'security.api_key'"
+      ).get() as { value: string; updated_by: string | null; updated_at: number } | undefined
+      if (row?.value) {
+        const hashed = createHash('sha256').update(row.value).digest('hex')
+        db.prepare(`
+          INSERT INTO settings (key, value, description, category, updated_by, updated_at)
+          VALUES ('security.api_key_hash', ?, 'SHA-256 hash of the active API key (overrides API_KEY env var)', 'security', ?, ?)
+          ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_by = excluded.updated_by,
+            updated_at = excluded.updated_at
+        `).run(hashed, row.updated_by, row.updated_at)
       }
-      if (!hasCol('cache_creation_tokens')) {
-        db.exec('ALTER TABLE claude_sessions ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0')
+      db.prepare("DELETE FROM settings WHERE key = 'security.api_key'").run()
+    }
+  },
+  {
+    id: '052_workspace_brand_isolation',
+    up(db: Database.Database) {
+      // Issue #677 slice 1: native `brand` and `isolation` fields on workspaces.
+      // - brand: free-text tag for cross-tenant logical grouping (nullable).
+      // - isolation: 'shared' | 'strict' — whether cross-workspace memory access
+      //   from agents is allowed. SQLite's ALTER TABLE cannot add CHECK
+      //   constraints, so the allowed values are enforced in the validation
+      //   layer (see workspace schemas in src/lib/validation.ts).
+      const cols = db.prepare(`PRAGMA table_info(workspaces)`).all() as Array<{ name: string }>
+      if (!cols.some((c) => c.name === 'brand')) {
+        db.exec(`ALTER TABLE workspaces ADD COLUMN brand TEXT DEFAULT NULL`)
+      }
+      if (!cols.some((c) => c.name === 'isolation')) {
+        db.exec(`ALTER TABLE workspaces ADD COLUMN isolation TEXT NOT NULL DEFAULT 'shared'`)
+      }
+    }
+  },
+  {
+    id: '053_audit_log_workspace',
+    up(db: Database.Database) {
+      const cols = db.prepare(`PRAGMA table_info(audit_log)`).all() as Array<{ name: string }>
+      if (!cols.some((column) => column.name === 'workspace_id')) {
+        // Legacy rows predate workspace attribution. Keep them visible only in
+        // the default workspace rather than guessing ownership.
+        db.exec(`ALTER TABLE audit_log ADD COLUMN workspace_id INTEGER NOT NULL DEFAULT 1`)
+      }
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_audit_log_workspace_created ON audit_log(workspace_id, created_at DESC)`)
+    }
+  },
+  {
+    id: '054_agent_name_workspace_unique',
+    foreignKeysOff: true,
+    up(db: Database.Database) {
+      // The original schema made agent names globally unique even after agents
+      // gained workspace ownership. Rebuild the table so names are unique only
+      // within a workspace. Session keys remain globally unique because they
+      // address an external runtime session, not an application-local identity.
+      db.exec(`
+        CREATE TABLE agents_workspace_unique (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          role TEXT NOT NULL,
+          session_key TEXT UNIQUE,
+          soul_content TEXT,
+          status TEXT NOT NULL DEFAULT 'offline',
+          last_seen INTEGER,
+          last_activity TEXT,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          config TEXT,
+          workspace_id INTEGER NOT NULL DEFAULT 1,
+          source TEXT DEFAULT 'manual',
+          content_hash TEXT,
+          workspace_path TEXT,
+          hidden INTEGER NOT NULL DEFAULT 0,
+          working_memory TEXT DEFAULT '',
+          runtime_type TEXT DEFAULT NULL,
+          UNIQUE(name, workspace_id)
+        );
+
+        INSERT INTO agents_workspace_unique (
+          id, name, role, session_key, soul_content, status, last_seen,
+          last_activity, created_at, updated_at, config, workspace_id, source,
+          content_hash, workspace_path, hidden, working_memory, runtime_type
+        )
+        SELECT
+          id, name, role, session_key, soul_content, status, last_seen,
+          last_activity, created_at, updated_at, config, workspace_id, source,
+          content_hash, workspace_path, hidden, working_memory, runtime_type
+        FROM agents;
+
+        DROP TABLE agents;
+        ALTER TABLE agents_workspace_unique RENAME TO agents;
+
+        CREATE INDEX idx_agents_session_key ON agents(session_key);
+        CREATE INDEX idx_agents_status ON agents(status);
+        CREATE INDEX idx_agents_workspace_id ON agents(workspace_id);
+        CREATE INDEX idx_agents_source ON agents(source);
+      `)
+    }
+  },
+  {
+    // #602: per-agent Claude Code base sessions. The base id is a server-generated
+    // UUID owned by exactly one agent; created_at doubles as the created-on-disk
+    // marker (NULL = base session not yet materialized by a first dispatch).
+    id: '055_agent_claude_base_session',
+    up: (db) => {
+      const cols = db.prepare(`PRAGMA table_info(agents)`).all() as Array<{ name: string }>
+      if (!cols.some(c => c.name === 'claude_base_session_id')) {
+        db.exec(`ALTER TABLE agents ADD COLUMN claude_base_session_id TEXT DEFAULT NULL`)
+      }
+      if (!cols.some(c => c.name === 'claude_base_session_created_at')) {
+        db.exec(`ALTER TABLE agents ADD COLUMN claude_base_session_created_at TEXT DEFAULT NULL`)
       }
     }
   }
@@ -1303,9 +1567,22 @@ export function runMigrations(db: Database.Database) {
 
   for (const migration of [...migrations, ...extraMigrations]) {
     if (applied.has(migration.id)) continue
-    db.transaction(() => {
-      migration.up(db)
-      db.prepare('INSERT OR IGNORE INTO schema_migrations (id) VALUES (?)').run(migration.id)
-    })()
+    const restoreForeignKeys = migration.foreignKeysOff
+      && db.pragma('foreign_keys', { simple: true }) === 1
+    if (restoreForeignKeys) db.pragma('foreign_keys = OFF')
+    try {
+      db.transaction(() => {
+        migration.up(db)
+        if (migration.foreignKeysOff) {
+          const violations = db.pragma('foreign_key_check') as unknown[]
+          if (violations.length > 0) {
+            throw new Error(`Migration ${migration.id} left ${violations.length} foreign-key violation(s)`)
+          }
+        }
+        db.prepare('INSERT OR IGNORE INTO schema_migrations (id) VALUES (?)').run(migration.id)
+      })()
+    } finally {
+      if (restoreForeignKeys) db.pragma('foreign_keys = ON')
+    }
   }
 }

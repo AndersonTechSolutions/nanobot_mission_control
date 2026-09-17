@@ -3,6 +3,8 @@ import { requireRole } from '@/lib/auth'
 import { getDatabase, logAuditEvent } from '@/lib/db'
 import { config } from '@/lib/config'
 import { heavyLimiter } from '@/lib/rate-limit'
+import { countStaleGatewaySessions, pruneGatewaySessionsOlderThan } from '@/lib/sessions'
+import { denyUnscopedResourceForStrictWorkspace } from '@/lib/workspace-isolation'
 
 interface CleanupResult {
   table: string
@@ -17,6 +19,8 @@ interface CleanupResult {
 export async function GET(request: NextRequest) {
   const auth = requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDeny = denyUnscopedResourceForStrictWorkspace(auth.user, 'host_administration', new URL(request.url).pathname)
+  if (isolationDeny) return isolationDeny
 
   const db = getDatabase()
   const workspaceId = auth.user.workspace_id ?? 1
@@ -62,6 +66,17 @@ export async function GET(request: NextRequest) {
     preview.push({ table: 'Token Usage (file)', retention_days: ret.tokenUsage, stale_count: 0, note: 'No token data file' })
   }
 
+  if (ret.gatewaySessions > 0) {
+    preview.push({
+      table: 'Gateway Session Store',
+      retention_days: ret.gatewaySessions,
+      stale_count: countStaleGatewaySessions(ret.gatewaySessions),
+      note: 'Stored under ~/.openclaw/agents/*/sessions/sessions.json',
+    })
+  } else {
+    preview.push({ table: 'Gateway Session Store', retention_days: 0, stale_count: 0, note: 'Retention disabled (keep forever)' })
+  }
+
   return NextResponse.json({ retention: config.retention, preview })
 }
 
@@ -72,6 +87,8 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   const auth = requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDeny = denyUnscopedResourceForStrictWorkspace(auth.user, 'host_administration', new URL(request.url).pathname)
+  if (isolationDeny) return isolationDeny
 
   const rateCheck = heavyLimiter(request)
   if (rateCheck) return rateCheck
@@ -143,6 +160,19 @@ export async function POST(request: NextRequest) {
     }
   }
 
+  if (ret.gatewaySessions > 0) {
+    const sessionPrune = dryRun
+      ? { deleted: countStaleGatewaySessions(ret.gatewaySessions), filesTouched: 0 }
+      : pruneGatewaySessionsOlderThan(ret.gatewaySessions)
+    results.push({
+      table: 'Gateway Session Store',
+      deleted: sessionPrune.deleted,
+      cutoff_date: new Date(Date.now() - ret.gatewaySessions * 86400000).toISOString().split('T')[0],
+      retention_days: ret.gatewaySessions,
+    })
+    totalDeleted += sessionPrune.deleted
+  }
+
   if (!dryRun && totalDeleted > 0) {
     const ipAddress = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown'
     logAuditEvent({
@@ -165,7 +195,7 @@ function getRetentionTargets() {
   const ret = config.retention
   return [
     { table: 'activities', column: 'created_at', days: ret.activities, label: 'Activities', scoped: true },
-    { table: 'audit_log', column: 'created_at', days: ret.auditLog, label: 'Audit Log', scoped: false }, // instance-global, admin-only
+    { table: 'audit_log', column: 'created_at', days: ret.auditLog, label: 'Audit Log', scoped: true },
     { table: 'notifications', column: 'created_at', days: ret.notifications, label: 'Notifications', scoped: true },
     { table: 'pipeline_runs', column: 'created_at', days: ret.pipelineRuns, label: 'Pipeline Runs', scoped: true },
   ]

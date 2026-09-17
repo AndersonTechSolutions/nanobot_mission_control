@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireRole } from '@/lib/auth'
 import { getSchedulerStatus, triggerTask } from '@/lib/scheduler'
+import { denyUnscopedResourceForStrictWorkspace } from '@/lib/workspace-isolation'
 
 /**
  * GET /api/scheduler - Get scheduler status
@@ -8,6 +9,8 @@ import { getSchedulerStatus, triggerTask } from '@/lib/scheduler'
 export async function GET(request: NextRequest) {
   const auth = requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDeny = denyUnscopedResourceForStrictWorkspace(auth.user, 'host_administration', new URL(request.url).pathname)
+  if (isolationDeny) return isolationDeny
 
   return NextResponse.json({ tasks: getSchedulerStatus() })
 }
@@ -19,6 +22,8 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   const auth = requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDeny = denyUnscopedResourceForStrictWorkspace(auth.user, 'host_administration', new URL(request.url).pathname)
+  if (isolationDeny) return isolationDeny
 
   const body = await request.json().catch(() => ({}))
   const taskId = typeof body?.task_id === 'string' ? body.task_id : ''
@@ -30,6 +35,6 @@ export async function POST(request: NextRequest) {
     }, { status: 400 })
   }
 
-  const result = await triggerTask(taskId)
+  const result = await triggerTask(taskId, auth.user.workspace_id)
   return NextResponse.json(result, { status: result.ok ? 200 : 500 })
 }

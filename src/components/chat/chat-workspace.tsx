@@ -1,7 +1,8 @@
 'use client'
 
 import { useEffect, useCallback, useState, useRef } from 'react'
-import { useMissionControl, type Conversation, type ChatAttachment } from '@/store'
+import { useMissionControl, type Conversation, type ChatAttachment, type Agent, type ChatMessage } from '@/store'
+import { apiFetch, ApiError } from '@/lib/api-client'
 import { useSmartPoll } from '@/lib/use-smart-poll'
 import { createClientLogger } from '@/lib/client-logger'
 import { ConversationList } from './conversation-list'
@@ -10,6 +11,8 @@ import { ChatInput } from './chat-input'
 import { Button } from '@/components/ui/button'
 import { SessionMessage, shouldShowTimestamp, type SessionTranscriptMessage } from './session-message'
 import { getSessionKindLabel, SessionKindAvatar } from './session-kind-brand'
+import { TerminalView } from '@/components/terminal/terminal-view'
+import { SplitPaneLayout, type SplitPane } from '@/components/terminal/split-pane-layout'
 
 const log = createClientLogger('ChatWorkspace')
 
@@ -37,16 +40,15 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
     conversations,
     setAgents,
     notifications,
-    discoveredAgents,
-    dashboardMode,
+    splitPanes,
+    addSplitPane,
+    removeSplitPane,
+    clearSplitPanes,
   } = useMissionControl()
 
   const pendingIdRef = useRef(-1)
 
   const [showConversations, setShowConversations] = useState(true)
-  const [conversationListWide, setConversationListWide] = useState(() => {
-    try { return localStorage.getItem('mc-chat-list-wide') === '1' } catch { return false }
-  })
   const [isMobile, setIsMobile] = useState(false)
   const [focusMode, setFocusMode] = useState(false)
   const [isGenerating, setIsGenerating] = useState(false)
@@ -78,11 +80,12 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
   useEffect(() => {
     async function loadAgents() {
       try {
-        const res = await fetch('/api/agents')
-        if (!res.ok) return
-        const data = await res.json()
+        const data = await apiFetch<{ agents?: Agent[] }>('/api/agents')
         if (data.agents) setAgents(data.agents)
       } catch (err) {
+        // Graceful degradation: apiFetch throws on non-2xx (where the
+        // original `if (!res.ok) return` returned silently). Swallow here so
+        // the agents list simply stays empty instead of crashing the panel.
         log.error('Failed to load agents:', err)
       }
     }
@@ -99,11 +102,14 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
     }
 
     try {
-      const res = await fetch(`/api/chat/messages?conversation_id=${encodeURIComponent(activeConversation)}&limit=100`)
-      if (!res.ok) return
-      const data = await res.json()
+      const data = await apiFetch<{ messages?: ChatMessage[] }>(
+        `/api/chat/messages?conversation_id=${encodeURIComponent(activeConversation)}&limit=100`
+      )
       if (data.messages) setChatMessages(data.messages)
     } catch (err) {
+      // Graceful degradation: apiFetch throws on non-2xx (where the original
+      // `if (!res.ok) return` returned silently). Swallow so the polling loader
+      // keeps the current messages instead of throwing into the poller.
       log.error('Failed to load messages:', err)
     }
   }, [activeConversation, setChatMessages])
@@ -112,9 +118,18 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
     loadMessages()
   }, [loadMessages])
 
-  // Poll for new messages (visibility-aware)
-  useSmartPoll(loadMessages, 15000, {
-    enabled: !!activeConversation && !activeConversation.startsWith('session:'),
+  // Poll for new messages (visibility-aware). Also active for `session:`
+  // conversations as a fallback when SSE drops — pauseWhenSseConnected makes
+  // polling step aside whenever the live stream is healthy, so the only cost
+  // when SSE works is a no-op tick. Without this, dropped SSE leaves the
+  // /chat panel frozen until the user hits F5.
+  //
+  // Tunable via NEXT_PUBLIC_CHAT_POLL_INTERVAL_MS at build time. Default 1500.
+  const chatPollIntervalMs = Number(
+    process.env.NEXT_PUBLIC_CHAT_POLL_INTERVAL_MS,
+  ) || 1500
+  useSmartPoll(loadMessages, chatPollIntervalMs, {
+    enabled: !!activeConversation,
     pauseWhenSseConnected: true,
   })
 
@@ -163,9 +178,8 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
     setIsGenerating(true)
 
     try {
-      const res = await fetch('/api/chat/messages', {
+      const data = await apiFetch<{ message?: ChatMessage }>('/api/chat/messages', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           from: 'human',
           to,
@@ -177,15 +191,13 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
         }),
       })
 
-      if (res.ok) {
-        const data = await res.json()
-        if (data.message) {
-          replacePendingMessage(tempId, data.message)
-        }
-      } else {
-        updatePendingMessage(tempId, { pendingStatus: 'failed' })
+      if (data.message) {
+        replacePendingMessage(tempId, data.message)
       }
     } catch (err) {
+      // apiFetch throws on non-2xx; the original code handled both the
+      // non-ok branch and the network catch identically by marking the
+      // optimistic message failed. Preserve that single failure path here.
       log.error('Failed to send message:', err)
       updatePendingMessage(tempId, { pendingStatus: 'failed' })
     } finally {
@@ -228,50 +240,44 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
     !!activeConversation &&
     !activeConversation.startsWith('session:')
 
-  // Stable transcript fetch callback for both initial load and polling
-  const fetchSessionTranscript = useCallback(async () => {
-    const sessionMeta = selectedSession
-    if (!sessionMeta) return
-
-    const url = sessionMeta.sessionKind === 'gateway'
-      ? `/api/sessions/transcript/gateway?key=${encodeURIComponent(sessionMeta.sessionKey || sessionMeta.sessionId)}&limit=50`
-      : `/api/sessions/transcript?kind=${encodeURIComponent(sessionMeta.sessionKind)}&id=${encodeURIComponent(sessionMeta.sessionId)}&limit=40`
-
-    const res = await fetch(url)
-    if (!res.ok) {
-      const payload = await res.json().catch(() => ({}))
-      throw new Error(payload?.error || 'Failed to load transcript')
-    }
-    const data = await res.json()
-    setSessionTranscript(Array.isArray(data?.messages) ? data.messages : [])
-    setSessionTranscriptError(null)
-  }, [selectedSession])
-
-  // Initial load when session changes or manual refresh
   useEffect(() => {
-    if (!selectedSession) {
+    const sessionMeta = selectedSession
+    if (!sessionMeta) {
       setSessionTranscript([])
       setSessionTranscriptError(null)
       return
     }
 
+    let cancelled = false
     setSessionTranscriptLoading(true)
     setSessionTranscriptError(null)
 
-    fetchSessionTranscript()
+    // Gateway sessions use the gateway transcript API
+    const url = sessionMeta.sessionKind === 'gateway'
+      ? `/api/sessions/transcript/gateway?key=${encodeURIComponent(sessionMeta.sessionKey || sessionMeta.sessionId)}&limit=50`
+      : `/api/sessions/transcript?kind=${encodeURIComponent(sessionMeta.sessionKind)}&id=${encodeURIComponent(sessionMeta.sessionId)}&limit=40`
+
+    apiFetch<{ messages?: SessionTranscriptMessage[] }>(url)
+      .then((data) => {
+        if (cancelled) return
+        setSessionTranscript(Array.isArray(data?.messages) ? data.messages : [])
+      })
       .catch((err) => {
+        if (cancelled) return
         setSessionTranscript([])
-        setSessionTranscriptError(err instanceof Error ? err.message : 'Failed to load transcript')
+        // apiFetch throws ApiError on non-2xx (the original parsed the error
+        // body and surfaced `payload.error`). Recover that server message from
+        // ApiError.payload when present, otherwise keep the original fallback.
+        setSessionTranscriptError(extractApiErrorMessage(err, 'Failed to load transcript'))
       })
       .finally(() => {
-        setSessionTranscriptLoading(false)
+        if (!cancelled) setSessionTranscriptLoading(false)
       })
-  }, [selectedSession, sessionReloadNonce, fetchSessionTranscript])
 
-  // Poll transcript for updates every 10s when a session is selected
-  useSmartPoll(fetchSessionTranscript, 10000, {
-    enabled: !!selectedSession,
-  })
+    return () => {
+      cancelled = true
+    }
+  }, [selectedSession, sessionReloadNonce])
 
   const refreshSessionTranscript = useCallback(() => {
     setSessionReloadNonce((v) => v + 1)
@@ -288,14 +294,17 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
       color: payload.colorTag || null,
     }
 
-    const res = await fetch('/api/chat/session-prefs', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    })
-    const data = await res.json().catch(() => ({}))
-    if (!res.ok) {
-      throw new Error(data?.error || 'Failed to save session preferences')
+    try {
+      await apiFetch('/api/chat/session-prefs', {
+        method: 'PATCH',
+        body: JSON.stringify(body),
+      })
+    } catch (err) {
+      // Preserve the original surfaced message: the pre-migration code parsed
+      // the error body and threw `data.error || 'Failed to save session
+      // preferences'`. Re-throw a plain Error so the caller's `err.message`
+      // handling is unchanged.
+      throw new Error(extractApiErrorMessage(err, 'Failed to save session preferences'))
     }
 
     if (!activeConversation) return
@@ -318,7 +327,7 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
   return (
     <div className={`flex h-full flex-col bg-card ${focusMode ? 'fixed inset-0 z-50' : ''}`}>
       {/* Header */}
-      <div className={`glass-strong flex h-12 flex-shrink-0 items-center justify-between border-b border-border px-4 ${focusMode ? 'h-10' : ''}`}>
+      <div className={`glass-strong flex h-12 shrink-0 items-center justify-between border-b border-border px-4 ${focusMode ? 'h-10' : ''}`}>
         <div className="flex items-center gap-3">
           {/* Back button on mobile when in chat view */}
           {isMobile && !showConversations && (
@@ -340,9 +349,7 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
             <span className="text-sm font-semibold text-foreground">Agent Chat</span>
           </div>
           <span className="hidden text-xs text-muted-foreground sm:inline">
-            {dashboardMode === 'local'
-              ? `${discoveredAgents.filter(a => a.health.overall !== 'red').length} online`
-              : `${agents.filter(a => a.status === 'busy' || a.status === 'idle').length} online`}
+            {agents.filter(a => a.status === 'busy' || a.status === 'idle').length} online
           </span>
         </div>
 
@@ -398,25 +405,8 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
       <div className="flex flex-1 overflow-hidden">
         {/* Conversations sidebar */}
         {showConversations && !focusMode && (
-          <div className={`${isMobile ? 'w-full' : conversationListWide ? 'w-96 border-r border-border' : 'w-56 border-r border-border'} flex-shrink-0 relative transition-[width] duration-200`}>
+          <div className={`${isMobile ? 'w-full' : 'w-56 border-r border-border'} shrink-0`}>
             <ConversationList onNewConversation={handleNewConversation} />
-            {!isMobile && (
-              <button
-                onClick={() => {
-                  const next = !conversationListWide
-                  setConversationListWide(next)
-                  try { localStorage.setItem('mc-chat-list-wide', next ? '1' : '0') } catch {}
-                }}
-                className="absolute top-2 right-1.5 z-10 w-5 h-5 rounded flex items-center justify-center text-muted-foreground/40 hover:text-foreground hover:bg-secondary transition-colors"
-                title={conversationListWide ? 'Narrow list' : 'Widen list'}
-              >
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" className="w-3 h-3">
-                  {conversationListWide
-                    ? <path d="M10 3l-4 5 4 5" />
-                    : <path d="M6 3l4 5-4 5" />}
-                </svg>
-              </button>
-            )}
           </div>
         )}
 
@@ -424,13 +414,13 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
         {(!isMobile || !showConversations) && (
           <div className="flex min-w-0 flex-1 flex-col">
             {/* Conversation header */}
-            {activeConversation && (
-              <div className="bg-surface-1 flex flex-shrink-0 items-center gap-2 border-b border-border/50 px-4 py-2">
+            {activeConversation && splitPanes.length === 0 && (
+              <div className="bg-surface-1 flex shrink-0 items-center gap-2 border-b border-border/50 px-4 py-2">
                 <AgentAvatar
                   name={(selectedConversation?.name || activeConversation).replace('agent_', '')}
                   size="sm"
                 />
-                <div className="min-w-0">
+                <div className="min-w-0 flex-1">
                   <div className="truncate text-sm font-medium text-foreground">
                     {(selectedConversation?.name || activeConversation).replace('agent_', '')}
                   </div>
@@ -438,29 +428,101 @@ export function ChatWorkspace({ mode = 'embedded', onClose }: ChatWorkspaceProps
                     {getConversationStatus(agents, activeConversation)}
                   </div>
                 </div>
+                {/* Split pane button for sessions */}
+                {selectedConversation?.source === 'session' && selectedConversation.session && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const s = selectedConversation.session!
+                      addSplitPane(s.sessionId, s.sessionKind, selectedConversation.name)
+                    }}
+                    className="text-[10px] px-2 py-1 rounded border border-border/50 text-muted-foreground hover:text-foreground hover:bg-secondary/50 transition-colors"
+                    title="Open in split view"
+                  >
+                    <svg className="w-3.5 h-3.5 inline-block mr-1" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1">
+                      <rect x="1" y="2" width="6" height="12" rx="1" />
+                      <rect x="9" y="2" width="6" height="12" rx="1" />
+                    </svg>
+                    Split
+                  </button>
+                )}
               </div>
             )}
 
-            {selectedConversation?.source === 'session' && selectedConversation.session ? (
-              <SessionConversationView
-                session={selectedConversation.session}
-                messages={sessionTranscript}
-                loading={sessionTranscriptLoading}
-                error={sessionTranscriptError}
-                onRefreshTranscript={refreshSessionTranscript}
-                onSavePreferences={handleSaveSessionPreferences}
-              />
-            ) : (
-              <>
-                <MessageList />
-                <ChatIndicators notifications={notifications} />
-                <ChatInput
-                  onSend={handleSend}
-                  onAbort={handleAbort}
-                  disabled={!canSendMessage}
-                  agents={agents.map(a => ({ name: a.name, role: a.role }))}
-                  isGenerating={isGenerating}
+            {/* Split pane mode */}
+            {splitPanes.length > 0 && (
+              <div className="flex-1 min-h-0 flex flex-col">
+                <div className="flex items-center justify-between px-3 py-1 border-b border-border/50 bg-surface-1 shrink-0">
+                  <span className="text-[10px] text-muted-foreground/60">{splitPanes.length} pane{splitPanes.length !== 1 ? 's' : ''}</span>
+                  <div className="flex items-center gap-1.5">
+                    {selectedConversation?.source === 'session' && selectedConversation.session && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const s = selectedConversation.session!
+                          addSplitPane(s.sessionId, s.sessionKind, selectedConversation.name)
+                        }}
+                        disabled={splitPanes.length >= 4}
+                        className="text-[10px] px-1.5 py-0.5 rounded text-muted-foreground hover:text-foreground disabled:opacity-30 transition-colors"
+                      >
+                        + Add
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={clearSplitPanes}
+                      className="text-[10px] px-1.5 py-0.5 rounded text-muted-foreground hover:text-red-400 transition-colors"
+                    >
+                      Close all
+                    </button>
+                  </div>
+                </div>
+                <SplitPaneLayout
+                  panes={splitPanes.map((p) => ({
+                    id: p.id,
+                    sessionId: p.sessionId,
+                    sessionKind: p.sessionKind as SplitPane['sessionKind'],
+                    sessionName: p.sessionName,
+                    isActive: conversations.find((c) => c.session?.sessionId === p.sessionId)?.session?.active,
+                  }))}
+                  onRemovePane={removeSplitPane}
+                  onSwitchToTranscript={(sessionId) => {
+                    const conv = conversations.find((c) => c.session?.sessionId === sessionId)
+                    if (conv) {
+                      setActiveConversation(conv.id)
+                      clearSplitPanes()
+                    }
+                  }}
                 />
+              </div>
+            )}
+
+            {/* Single session / chat view */}
+            {splitPanes.length === 0 && (
+              <>
+                {selectedConversation?.source === 'session' && selectedConversation.session ? (
+                  <SessionConversationView
+                    key={selectedConversation.session.sessionId}
+                    session={selectedConversation.session}
+                    messages={sessionTranscript}
+                    loading={sessionTranscriptLoading}
+                    error={sessionTranscriptError}
+                    onRefreshTranscript={refreshSessionTranscript}
+                    onSavePreferences={handleSaveSessionPreferences}
+                  />
+                ) : (
+                  <>
+                    <MessageList />
+                    <ChatIndicators notifications={notifications} />
+                    <ChatInput
+                      onSend={handleSend}
+                      onAbort={handleAbort}
+                      disabled={!canSendMessage}
+                      agents={agents.map(a => ({ name: a.name, role: a.role }))}
+                      isGenerating={isGenerating}
+                    />
+                  </>
+                )}
               </>
             )}
           </div>
@@ -486,11 +548,13 @@ function SessionConversationView({
   onSavePreferences: (payload: { prefKey: string; displayName?: string; colorTag?: string }) => Promise<void>
 }) {
   const isGatewaySession = session.sessionKind === 'gateway'
+  const isPtyCapableKind = session.sessionKind === 'claude-code' || session.sessionKind === 'codex-cli'
+  const [viewMode, setViewMode] = useState<'terminal' | 'transcript'>('transcript')
+  const prevSessionIdRef = useRef(session.sessionId)
   const transcriptScrollRef = useRef<HTMLDivElement | null>(null)
   const [continuePrompt, setContinuePrompt] = useState('')
   const [continueBusy, setContinueBusy] = useState(false)
   const [continueError, setContinueError] = useState<string | null>(null)
-  const [lastReply, setLastReply] = useState<string | null>(null)
   const [nameDraft, setNameDraft] = useState(session.displayName || '')
   const [colorDraft, setColorDraft] = useState(session.colorTag || '')
   const [prefBusy, setPrefBusy] = useState(false)
@@ -499,19 +563,26 @@ function SessionConversationView({
     nameDraft.trim() !== (session.displayName || '').trim() ||
     colorDraft !== (session.colorTag || '')
 
+  // Only reset view mode when switching to a different session
+  useEffect(() => {
+    if (prevSessionIdRef.current !== session.sessionId) {
+      prevSessionIdRef.current = session.sessionId
+      setViewMode('transcript')
+    }
+  }, [session.sessionId])
+
   useEffect(() => {
     setNameDraft(session.displayName || '')
     setColorDraft(session.colorTag || '')
     setPrefError(null)
     setContinueError(null)
-    setLastReply(null)
   }, [session.prefKey, session.displayName, session.colorTag])
 
   useEffect(() => {
     const container = transcriptScrollRef.current
     if (!container) return
     container.scrollTop = container.scrollHeight
-  }, [messages, loading, lastReply])
+  }, [messages, loading])
 
   const handleContinueSession = async () => {
     const prompt = continuePrompt.trim()
@@ -519,27 +590,31 @@ function SessionConversationView({
 
     setContinueBusy(true)
     setContinueError(null)
-    setLastReply(null)
     try {
       if (isGatewaySession) {
         // Gateway sessions: forward message to the agent via chat messages API
         const agentName = session.agent || session.sessionId.split(':')[1] || 'unknown'
-        const res = await fetch('/api/chat/messages', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            from: 'human',
-            to: agentName,
-            content: prompt,
-            conversation_id: `agent_${agentName}`,
-            message_type: 'text',
-            forward: true,
-            sessionKey: session.sessionKey || undefined,
-          }),
-        })
-        const data = await res.json().catch(() => ({}))
-        if (!res.ok) {
-          throw new Error(data?.error || 'Failed to send message')
+        let data: {
+          forward?: { attempted?: boolean; delivered?: boolean; reason?: string }
+          message?: { metadata?: { forwardInfo?: { attempted?: boolean; delivered?: boolean; reason?: string } } }
+        }
+        try {
+          data = await apiFetch('/api/chat/messages', {
+            method: 'POST',
+            body: JSON.stringify({
+              from: 'human',
+              to: agentName,
+              content: prompt,
+              conversation_id: `agent_${agentName}`,
+              message_type: 'text',
+              forward: true,
+              sessionKey: session.sessionKey || undefined,
+            }),
+          })
+        } catch (err) {
+          // apiFetch throws on non-2xx; surface the server's `error` body (or
+          // the original fallback) just like the pre-migration `throw`.
+          throw new Error(extractApiErrorMessage(err, 'Failed to send message'))
         }
         const fwd = data?.forward || data?.message?.metadata?.forwardInfo
         if (fwd?.attempted && !fwd?.delivered) {
@@ -549,23 +624,30 @@ function SessionConversationView({
         // Refresh transcript after a short delay to capture the response
         setTimeout(() => onRefreshTranscript(), 2000)
       } else {
-        const res = await fetch('/api/sessions/continue', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            kind: session.sessionKind,
-            id: session.sessionId,
-            prompt,
-          }),
-        })
-        const data = await res.json().catch(() => ({}))
-        if (!res.ok) {
-          throw new Error(data?.error || 'Failed to continue session')
+        // Debug logs retained (commented) for future troubleshooting of the
+        // /chat → MC → host claude session pipeline.
+        // console.log('[DEBUG chat] sending continue request', { kind: session.sessionKind, id: session.sessionId, promptLength: prompt.length })
+        let data: { reply?: unknown }
+        try {
+          data = await apiFetch('/api/sessions/continue', {
+            method: 'POST',
+            body: JSON.stringify({
+              kind: session.sessionKind,
+              id: session.sessionId,
+              prompt,
+            }),
+          })
+        } catch (err) {
+          // apiFetch throws on non-2xx; surface the server's `error` body (or
+          // the original fallback) just like the pre-migration `throw`.
+          throw new Error(extractApiErrorMessage(err, 'Failed to continue session'))
         }
+        void data
         setContinuePrompt('')
-        if (typeof data?.reply === 'string' && data.reply.trim()) {
-          setLastReply(data.reply.trim())
-        }
+        // The reply from `data.reply` is intentionally not surfaced inline here:
+        // claude has already written both the user prompt and the assistant
+        // reply to the host session jsonl, and onRefreshTranscript() pulls them
+        // into the transcript so the message stream stays in one place.
         onRefreshTranscript()
       }
     } catch (err) {
@@ -612,6 +694,30 @@ function SessionConversationView({
           {session.tokens && <span className="text-muted-foreground/60">{session.tokens}</span>}
           {session.workingDir && <span className="hidden truncate text-muted-foreground/50 sm:inline max-w-[200px]">{session.workingDir}</span>}
           {session.age && <span className="text-muted-foreground/40">{session.age} ago</span>}
+
+          {/* Terminal/Transcript toggle for PTY-capable sessions */}
+          {isPtyCapableKind && (
+            <div className="ml-auto flex rounded-md border border-border/50 overflow-hidden">
+              <button
+                type="button"
+                onClick={() => setViewMode('terminal')}
+                className={`px-2 py-0.5 text-[10px] font-medium transition-colors ${
+                  viewMode === 'terminal' ? 'bg-secondary text-foreground' : 'text-muted-foreground/60 hover:text-muted-foreground'
+                }`}
+              >
+                Terminal
+              </button>
+              <button
+                type="button"
+                onClick={() => setViewMode('transcript')}
+                className={`px-2 py-0.5 text-[10px] font-medium transition-colors border-l border-border/50 ${
+                  viewMode === 'transcript' ? 'bg-secondary text-foreground' : 'text-muted-foreground/60 hover:text-muted-foreground'
+                }`}
+              >
+                Transcript
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Collapsible settings */}
@@ -626,12 +732,12 @@ function SessionConversationView({
                 onChange={(e) => setNameDraft(e.target.value)}
                 placeholder="Rename session"
                 maxLength={80}
-                className="h-7 rounded border border-border/60 bg-surface-1 px-2 text-xs text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-primary/30"
+                className="h-7 rounded border border-border/60 bg-surface-1 px-2 text-xs text-foreground placeholder:text-muted-foreground/50 focus:outline-hidden focus:ring-1 focus:ring-primary/30"
               />
               <select
                 value={colorDraft}
                 onChange={(e) => setColorDraft(e.target.value)}
-                className="h-7 rounded border border-border/60 bg-surface-1 px-2 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-primary/30"
+                className="h-7 rounded border border-border/60 bg-surface-1 px-2 text-xs text-foreground focus:outline-hidden focus:ring-1 focus:ring-primary/30"
               >
                 <option value="">No color</option>
                 <option value="slate">Slate</option>
@@ -658,39 +764,56 @@ function SessionConversationView({
         )}
       </div>
 
-      {/* Transcript */}
-      <div ref={transcriptScrollRef} className="flex-1 overflow-y-auto font-mono-tight py-2">
-        {loading && (
-          <div className="space-y-2 px-4">
-            <div className="h-4 w-3/4 animate-pulse rounded bg-surface-1/60" />
-            <div className="h-4 w-1/2 animate-pulse rounded bg-surface-1/60" />
-            <div className="h-4 w-2/3 animate-pulse rounded bg-surface-1/60" />
-            <div className="text-xs text-muted-foreground/50">Loading transcript...</div>
-          </div>
-        )}
-        {!loading && error && (
-          <div className="px-4 text-xs text-red-400">{error}</div>
-        )}
-        {!loading && !error && messages.length === 0 && (
-          <div className="px-4 text-xs text-muted-foreground">
-            {isGatewaySession ? 'No messages loaded for this gateway session.' : 'No transcript snippets found for this session.'}
-          </div>
-        )}
-        {!loading && !error && messages.length > 0 && (
-          <div className="space-y-0">
-            {messages.map((msg, idx) => (
-              <SessionMessage
-                key={`${msg.timestamp || 'no-ts'}-${idx}`}
-                message={msg}
-                showTimestamp={shouldShowTimestamp(msg, messages[idx - 1])}
-              />
-            ))}
-          </div>
-        )}
-      </div>
+      {/* Terminal view (xterm.js PTY) */}
+      {isPtyCapableKind && viewMode === 'terminal' && (
+        <div className="flex-1 min-h-0">
+          <TerminalView
+            sessionId={session.sessionId}
+            sessionKind={session.sessionKind}
+            mode="readonly"
+            onError={() => setViewMode('transcript')}
+          />
+        </div>
+      )}
 
-      {/* Continue session input */}
+      {/* Transcript view */}
+      {(!isPtyCapableKind || viewMode === 'transcript') && (
+        <div ref={transcriptScrollRef} className="flex-1 overflow-y-auto font-mono-tight py-2">
+          {loading && (
+            <div className="space-y-2 px-4">
+              <div className="h-4 w-3/4 animate-pulse rounded bg-surface-1/60" />
+              <div className="h-4 w-1/2 animate-pulse rounded bg-surface-1/60" />
+              <div className="h-4 w-2/3 animate-pulse rounded bg-surface-1/60" />
+              <div className="text-xs text-muted-foreground/50">Loading transcript...</div>
+            </div>
+          )}
+          {!loading && error && (
+            <div className="px-4 text-xs text-red-400">{error}</div>
+          )}
+          {!loading && !error && messages.length === 0 && (
+            <div className="px-4 text-xs text-muted-foreground">
+              {isGatewaySession ? 'No messages loaded for this gateway session.' : 'No transcript snippets found for this session.'}
+            </div>
+          )}
+          {!loading && !error && messages.length > 0 && (
+            <div className="space-y-0">
+              {messages.map((msg, idx) => (
+                <SessionMessage
+                  key={`${msg.timestamp || 'no-ts'}-${idx}`}
+                  message={msg}
+                  showTimestamp={shouldShowTimestamp(msg, messages[idx - 1])}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Continue session input — reply is appended to the transcript above
+          via onRefreshTranscript(); only show transient errors here so the
+          input row stays anchored to the bottom regardless of reply size. */}
       <div className="border-t border-border/50 px-4 py-2">
+        {continueError && <div className="mb-1 text-xs text-red-400">{continueError}</div>}
         <div className="flex items-center gap-2">
           <span className={`font-mono-tight text-xs ${isGatewaySession ? 'text-cyan-400/60' : 'text-green-400/60'}`}>{isGatewaySession ? '>' : '$'}</span>
           <input
@@ -703,7 +826,7 @@ function SessionConversationView({
               }
             }}
             placeholder={isGatewaySession ? 'Send message to this agent session...' : 'Send prompt to this local session...'}
-            className="h-7 flex-1 rounded border border-border/40 bg-surface-1 px-2 font-mono-tight text-xs text-foreground placeholder:text-muted-foreground/40 focus:outline-none focus:ring-1 focus:ring-primary/30"
+            className="h-7 flex-1 rounded border border-border/40 bg-surface-1 px-2 font-mono-tight text-xs text-foreground placeholder:text-muted-foreground/40 focus:outline-hidden focus:ring-1 focus:ring-primary/30"
           />
           <Button
             onClick={handleContinueSession}
@@ -715,12 +838,6 @@ function SessionConversationView({
             {continueBusy ? '...' : 'Send'}
           </Button>
         </div>
-        {continueError && <div className="mt-1 text-xs text-red-400">{continueError}</div>}
-        {lastReply && (
-          <div className="mt-2 border-l-2 border-primary/30 pl-3">
-            <div className="font-mono-tight text-xs leading-relaxed text-foreground whitespace-pre-wrap">{lastReply}</div>
-          </div>
-        )}
       </div>
     </div>
   )
@@ -741,7 +858,7 @@ function ChatIndicators({ notifications }: { notifications: Array<{ id: number; 
   if (recentToasts.length === 0) return null
 
   return (
-    <div className="flex flex-col gap-1 px-4 py-1 flex-shrink-0">
+    <div className="flex flex-col gap-1 px-4 py-1 shrink-0">
       {recentToasts.map(toast => {
         const isCompaction = toast.title === 'Context Compaction'
         const isFallback = toast.title === 'Model Fallback'
@@ -765,6 +882,31 @@ function ChatIndicators({ notifications }: { notifications: Array<{ id: number; 
   )
 }
 
+/**
+ * Recover the server-provided error message from an apiFetch failure.
+ *
+ * The pre-migration code parsed the JSON error body and surfaced
+ * `payload.error` (falling back to a static message). apiFetch now throws an
+ * ApiError on non-2xx and stashes the parsed body in `payload` (for 403/5xx),
+ * so we reproduce the original `payload.error || fallback` precedence here.
+ */
+function extractApiErrorMessage(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) {
+    const payload = err.payload
+    if (
+      payload &&
+      typeof payload === 'object' &&
+      'error' in payload &&
+      typeof (payload as { error: unknown }).error === 'string' &&
+      (payload as { error: string }).error.trim()
+    ) {
+      return (payload as { error: string }).error
+    }
+    return fallback
+  }
+  return err instanceof Error ? err.message : fallback
+}
+
 function AgentAvatar({ name, size = 'md' }: { name: string; size?: 'sm' | 'md' }) {
   const colors: Record<string, string> = {
     coordinator: 'bg-purple-500/20 text-purple-400',
@@ -780,7 +922,7 @@ function AgentAvatar({ name, size = 'md' }: { name: string; size?: 'sm' | 'md' }
   const sizeClass = size === 'sm' ? 'w-6 h-6 text-[10px]' : 'w-8 h-8 text-xs'
 
   return (
-    <div className={`${sizeClass} ${colorClass} flex flex-shrink-0 items-center justify-center rounded-full font-bold`}>
+    <div className={`${sizeClass} ${colorClass} flex shrink-0 items-center justify-center rounded-full font-bold`}>
       {name.charAt(0).toUpperCase()}
     </div>
   )
@@ -790,6 +932,8 @@ function getConversationStatus(agents: Array<{ name: string; status: string }>, 
   if (conversationId.startsWith('session:')) {
     if (conversationId.includes('claude-code')) return 'Local Claude session'
     if (conversationId.includes('codex-cli')) return 'Local Codex session'
+    if (conversationId.includes('hermes')) return 'Local Hermes session'
+    if (conversationId.includes('opencode')) return 'Local OpenCode session'
     return 'Gateway session'
   }
   const name = conversationId.replace('agent_', '')

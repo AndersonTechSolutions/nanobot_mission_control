@@ -3,7 +3,7 @@ import net from 'node:net'
 import os from 'node:os'
 import { existsSync, statSync } from 'node:fs'
 import path from 'node:path'
-import { runCommand, runNanobot, runClawdbot } from '@/lib/command'
+import { runCommand, runOpenClaw, runClawdbot } from '@/lib/command'
 import { config } from '@/lib/config'
 import { getDatabase } from '@/lib/db'
 import { getAllGatewaySessions, getAgentLiveStatuses } from '@/lib/sessions'
@@ -12,23 +12,37 @@ import { MODEL_CATALOG } from '@/lib/models'
 import { logger } from '@/lib/logger'
 import { detectProviderSubscriptions, getPrimarySubscription } from '@/lib/provider-subscriptions'
 import { APP_VERSION } from '@/lib/version'
+import { isHermesInstalled, scanHermesSessions } from '@/lib/hermes-sessions'
 import { registerMcAsDashboard } from '@/lib/gateway-runtime'
+import { getWorkspaceIsolation } from '@/lib/workspace-isolation'
 
 export async function GET(request: NextRequest) {
+  // Docker/Kubernetes health probes must work without auth/cookies.
+  const preAction = new URL(request.url).searchParams.get('action') || 'overview'
+  if (preAction === 'health') {
+    const health = await performHealthCheck()
+    return NextResponse.json(health)
+  }
+
   const auth = requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolation = getWorkspaceIsolation(auth.user)
+  if (!isolation) {
+    return NextResponse.json({ error: 'Workspace isolation context is unavailable' }, { status: 403 })
+  }
+  const includeGlobalRuntime = isolation === 'shared'
 
   try {
     const { searchParams } = new URL(request.url)
     const action = searchParams.get('action') || 'overview'
 
     if (action === 'overview') {
-      const status = await getSystemStatus(auth.user.workspace_id ?? 1)
+      const status = await getSystemStatus(auth.user.workspace_id ?? 1, includeGlobalRuntime)
       return NextResponse.json(status)
     }
 
     if (action === 'dashboard') {
-      const data = await getDashboardData(auth.user.workspace_id ?? 1)
+      const data = await getDashboardData(auth.user.workspace_id ?? 1, includeGlobalRuntime)
       return NextResponse.json(data)
     }
 
@@ -48,17 +62,7 @@ export async function GET(request: NextRequest) {
     }
 
     if (action === 'capabilities') {
-      const capabilities = await Promise.race([
-        getCapabilities(request),
-        new Promise<Awaited<ReturnType<typeof getCapabilities>>>(resolve =>
-          setTimeout(() => resolve({
-            gateway: false, nanobotHome: false, claudeHome: false,
-            claudeSessions: 0, subscription: null, subscriptions: {},
-            processUser: os.userInfo().username, interfaceMode: 'essential',
-            dashboardRegistration: null,
-          }), 3000)
-        ),
-      ])
+      const capabilities = await getCapabilities(request, includeGlobalRuntime)
       return NextResponse.json(capabilities)
     }
 
@@ -73,9 +77,9 @@ export async function GET(request: NextRequest) {
  * Aggregate all dashboard data in a single request.
  * Combines system health, DB stats, audit summary, and recent activity.
  */
-async function getDashboardData(workspaceId: number) {
+async function getDashboardData(workspaceId: number, includeGlobalRuntime: boolean) {
   const [system, dbStats] = await Promise.all([
-    getSystemStatus(workspaceId),
+    getSystemStatus(workspaceId, includeGlobalRuntime),
     getDbStats(workspaceId),
   ])
 
@@ -164,13 +168,13 @@ function getDbStats(workspaceId: number) {
     }
 
     // Audit events (24h / 7d)
-    const auditDay = (db.prepare('SELECT COUNT(*) as c FROM audit_log WHERE created_at > ?').get(day) as any).c
-    const auditWeek = (db.prepare('SELECT COUNT(*) as c FROM audit_log WHERE created_at > ?').get(week) as any).c
+    const auditDay = (db.prepare('SELECT COUNT(*) as c FROM audit_log WHERE created_at > ? AND workspace_id = ?').get(day, workspaceId) as any).c
+    const auditWeek = (db.prepare('SELECT COUNT(*) as c FROM audit_log WHERE created_at > ? AND workspace_id = ?').get(week, workspaceId) as any).c
 
     // Security events (login failures in last 24h)
     const loginFailures = (db.prepare(
-      "SELECT COUNT(*) as c FROM audit_log WHERE action = 'login_failed' AND created_at > ?"
-    ).get(day) as any).c
+      "SELECT COUNT(*) as c FROM audit_log WHERE action = 'login_failed' AND created_at > ? AND workspace_id = ?"
+    ).get(day, workspaceId) as any).c
 
     // Activities (24h)
     const activityDay = (
@@ -186,8 +190,8 @@ function getDbStats(workspaceId: number) {
     let pipelineActive = 0
     let pipelineRecent = 0
     try {
-      pipelineActive = (db.prepare("SELECT COUNT(*) as c FROM pipeline_runs WHERE status = 'running'").get() as any).c
-      pipelineRecent = (db.prepare('SELECT COUNT(*) as c FROM pipeline_runs WHERE created_at > ?').get(day) as any).c
+      pipelineActive = (db.prepare("SELECT COUNT(*) as c FROM pipeline_runs WHERE status = 'running' AND workspace_id = ?").get(workspaceId) as any).c
+      pipelineRecent = (db.prepare('SELECT COUNT(*) as c FROM pipeline_runs WHERE created_at > ? AND workspace_id = ?').get(day, workspaceId) as any).c
     } catch {
       // Pipeline tables may not exist yet
     }
@@ -227,7 +231,7 @@ function getDbStats(workspaceId: number) {
     // Webhook configs count
     let webhookCount = 0
     try {
-      webhookCount = (db.prepare('SELECT COUNT(*) as c FROM webhooks').get() as any).c
+      webhookCount = (db.prepare('SELECT COUNT(*) as c FROM webhooks WHERE workspace_id = ?').get(workspaceId) as any).c
     } catch {
       // table may not exist
     }
@@ -249,7 +253,7 @@ function getDbStats(workspaceId: number) {
   }
 }
 
-async function getSystemStatus(workspaceId: number) {
+async function getSystemStatus(workspaceId: number, includeGlobalRuntime: boolean) {
   const status: any = {
     timestamp: Date.now(),
     uptime: 0,
@@ -329,47 +333,49 @@ async function getSystemStatus(workspaceId: number) {
           command: parts.slice(2).join(' ')
         }
       })
-      .filter((proc) => /clawdbot|nanobot/i.test(proc.command))
+      .filter((proc) => /clawdbot|openclaw/i.test(proc.command))
     status.processes = processes
   } catch (error) {
     logger.error({ err: error }, 'Error getting process info')
   }
 
-  try {
-    // Read sessions directly from agent session stores on disk
-    const gatewaySessions = getAllGatewaySessions()
-    status.sessions = {
-      total: gatewaySessions.length,
-      active: gatewaySessions.filter((s) => s.active).length,
-    }
-
-    // Sync agent statuses in DB from live session data
+  if (includeGlobalRuntime) {
     try {
-      const db = getDatabase()
-      const liveStatuses = getAgentLiveStatuses()
-      const now = Math.floor(Date.now() / 1000)
-      // Match by: exact name, lowercase, or normalized (spaces→hyphens)
-      const updateStmt = db.prepare(
-        `UPDATE agents SET status = ?, last_seen = ?, updated_at = ?
-         WHERE workspace_id = ?
-           AND (LOWER(name) = LOWER(?)
-           OR LOWER(REPLACE(name, ' ', '-')) = LOWER(?))`
-      )
-      for (const [agentName, info] of liveStatuses) {
-        updateStmt.run(
-          info.status,
-          Math.floor(info.lastActivity / 1000),
-          now,
-          workspaceId,
-          agentName,
-          agentName
-        )
+      // Read sessions directly from agent session stores on disk
+      const gatewaySessions = getAllGatewaySessions()
+      status.sessions = {
+        total: gatewaySessions.length,
+        active: gatewaySessions.filter((s) => s.active).length,
       }
-    } catch (dbErr) {
-      logger.error({ err: dbErr }, 'Error syncing agent statuses')
+
+      // Sync agent statuses in DB from live session data
+      try {
+        const db = getDatabase()
+        const liveStatuses = getAgentLiveStatuses()
+        const now = Math.floor(Date.now() / 1000)
+        // Match by: exact name, lowercase, or normalized (spaces→hyphens)
+        const updateStmt = db.prepare(
+          `UPDATE agents SET status = ?, last_seen = ?, updated_at = ?
+           WHERE workspace_id = ?
+             AND (LOWER(name) = LOWER(?)
+             OR LOWER(REPLACE(name, ' ', '-')) = LOWER(?))`
+        )
+        for (const [agentName, info] of liveStatuses) {
+          updateStmt.run(
+            info.status,
+            Math.floor(info.lastActivity / 1000),
+            now,
+            workspaceId,
+            agentName,
+            agentName
+          )
+        }
+      } catch (dbErr) {
+        logger.error({ err: dbErr }, 'Error syncing agent statuses')
+      }
+    } catch (error) {
+      logger.error({ err: error }, 'Error reading session stores')
     }
-  } catch (error) {
-    logger.error({ err: error }, 'Error reading session stores')
   }
 
   return status
@@ -378,7 +384,7 @@ async function getSystemStatus(workspaceId: number) {
 async function getGatewayStatus() {
   const gatewayStatus: any = {
     running: false,
-    port: config.nanobotGatewayPort,
+    port: config.gatewayPort,
     pid: null,
     uptime: 0,
     version: null,
@@ -391,7 +397,7 @@ async function getGatewayStatus() {
     })
     const match = stdout
       .split('\n')
-      .find((line) => /clawdbot-gateway|nanobot-gateway|nanobot.*gateway/i.test(line))
+      .find((line) => /clawdbot-gateway|openclaw-gateway|openclaw.*gateway/i.test(line))
     if (match) {
       const parts = match.trim().split(/\s+/)
       gatewayStatus.running = true
@@ -402,13 +408,13 @@ async function getGatewayStatus() {
   }
 
   try {
-    gatewayStatus.port_listening = await isPortOpen(config.nanobotGatewayHost, config.nanobotGatewayPort)
+    gatewayStatus.port_listening = await isPortOpen(config.gatewayHost, config.gatewayPort)
   } catch (error) {
     logger.error({ err: error }, 'Error checking port')
   }
 
   try {
-    const { stdout } = await runNanobot(['--version'], { timeoutMs: 3000 })
+    const { stdout } = await runOpenClaw(['--version'], { timeoutMs: 3000 })
     gatewayStatus.version = stdout.trim()
   } catch (error) {
     try {
@@ -423,38 +429,39 @@ async function getGatewayStatus() {
 }
 
 async function getAvailableModels() {
-  // This would typically query the gateway or config files
   // Model catalog is the single source of truth
   const models = [...MODEL_CATALOG]
 
   try {
-    // Check which Ollama models are available locally
-    const { stdout: ollamaOutput } = await runCommand('ollama', ['list'], {
-      timeoutMs: 5000
+    // Use Ollama HTTP API instead of `ollama list` CLI.
+    // On macOS desktop app installs, spawning CLI commands can restart/crash the GUI process.
+    const res = await fetch('http://127.0.0.1:11434/api/tags', {
+      signal: AbortSignal.timeout(5000),
     })
-    const ollamaModels = ollamaOutput.split('\n')
-      .slice(1) // Skip header
-      .filter(line => line.trim())
-      .map(line => {
-        const parts = line.split(/\s+/)
-        return {
-          alias: parts[0],
-          name: `ollama/${parts[0]}`,
-          provider: 'ollama',
-          description: 'Local model',
-          costPer1k: 0.0,
-          size: parts[1] || 'unknown'
-        }
-      })
 
-    // Add Ollama models that aren't already in the list
-    ollamaModels.forEach(model => {
-      if (!models.find(m => m.name === model.name)) {
+    if (!res.ok) {
+      throw new Error(`Ollama tags endpoint returned ${res.status}`)
+    }
+
+    const data = await res.json() as { models?: Array<{ name?: string; size?: number }> }
+    const ollamaModels = (data.models || [])
+      .filter((m) => typeof m?.name === 'string' && m.name.trim().length > 0)
+      .map((m) => ({
+        alias: m.name!.trim(),
+        name: `ollama/${m.name!.trim()}`,
+        provider: 'ollama',
+        description: 'Local model',
+        costPerMTok: { input: 0.0, output: 0.0 },
+        size: typeof m.size === 'number' ? String(m.size) : 'unknown',
+      }))
+
+    for (const model of ollamaModels) {
+      if (!models.find((m) => m.name === model.name)) {
         models.push(model)
       }
-    })
+    }
   } catch (error) {
-    logger.error({ err: error }, 'Error checking Ollama models')
+    logger.error({ err: error }, 'Error checking Ollama models via HTTP API')
   }
 
   return models
@@ -488,11 +495,14 @@ async function performHealthCheck() {
       status: dbStatus,
       message: dbStatus === 'healthy' ? `DB reachable (${elapsed}ms)` : `DB slow (${elapsed}ms)`
     })
-  } catch (error) {
+  } catch (error: any) {
+    const isNativeModuleError = error?.code === 'ERR_DLOPEN_FAILED' || /NODE_MODULE_VERSION/.test(error?.message || '')
     health.checks.push({
       name: 'Database',
       status: 'unhealthy',
-      message: 'DB connectivity failed'
+      message: isNativeModuleError
+        ? 'better-sqlite3 compiled for wrong Node.js version. Run: pnpm rebuild better-sqlite3'
+        : 'DB connectivity failed'
     })
   }
 
@@ -602,46 +612,50 @@ async function performHealthCheck() {
   return health
 }
 
-async function getCapabilities(request?: NextRequest) {
-  // Probe configured gateways (if any) or fall back to the default nanobot gateway port.
+async function getCapabilities(request?: NextRequest, includeGlobalRuntime = true) {
+  // Probe configured gateways (if any) or fall back to the default port.
   // A DB row alone isn't enough — the gateway must actually be reachable.
   let gatewayReachable = false
-  try {
-    const db = getDatabase()
-    const table = db.prepare(
-      "SELECT name FROM sqlite_master WHERE type='table' AND name='gateways'"
-    ).get() as { name?: string } | undefined
-    if (table?.name) {
-      const rows = db.prepare('SELECT host, port FROM gateways').all() as { host: string; port: number }[]
-      if (rows.length > 0) {
-        const probes = rows.map(r => isPortOpen(r.host, Number(r.port)))
-        const results = await Promise.all(probes)
-        gatewayReachable = results.some(Boolean)
+  if (includeGlobalRuntime) {
+    try {
+      const db = getDatabase()
+      const table = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='gateways'"
+      ).get() as { name?: string } | undefined
+      if (table?.name) {
+        const rows = db.prepare('SELECT host, port FROM gateways').all() as { host: string; port: number }[]
+        if (rows.length > 0) {
+          const probes = rows.map(r => isPortOpen(r.host, Number(r.port)))
+          const results = await Promise.all(probes)
+          gatewayReachable = results.some(Boolean)
+        }
       }
+    } catch {
+      // ignore — fall through to default probe
     }
-  } catch {
-    // ignore — fall through to default probe
   }
 
-  const gateway = gatewayReachable || await isPortOpen(config.nanobotGatewayHost, config.nanobotGatewayPort)
+  const gateway = includeGlobalRuntime && (gatewayReachable || await isPortOpen(config.gatewayHost, config.gatewayPort))
 
-  const nanobotHome = Boolean(
-    (config.nanobotStateDir && existsSync(config.nanobotStateDir)) ||
-    (config.nanobotConfigPath && existsSync(config.nanobotConfigPath))
+  const openclawHome = includeGlobalRuntime && Boolean(
+    (config.openclawStateDir && existsSync(config.openclawStateDir)) ||
+    (config.openclawConfigPath && existsSync(config.openclawConfigPath))
   )
 
   const claudeProjectsPath = path.join(config.claudeHome, 'projects')
-  const claudeHome = existsSync(claudeProjectsPath)
+  const claudeHome = includeGlobalRuntime && existsSync(claudeProjectsPath)
 
   let claudeSessions = 0
-  try {
-    const db = getDatabase()
-    const row = db.prepare(
-      "SELECT COUNT(*) as c FROM claude_sessions WHERE is_active = 1"
-    ).get() as { c: number } | undefined
-    claudeSessions = row?.c ?? 0
-  } catch {
-    // claude_sessions table may not exist
+  if (includeGlobalRuntime) {
+    try {
+      const db = getDatabase()
+      const row = db.prepare(
+        "SELECT COUNT(*) as c FROM claude_sessions WHERE is_active = 1"
+      ).get() as { c: number } | undefined
+      claudeSessions = row?.c ?? 0
+    } catch {
+      // claude_sessions table may not exist
+    }
   }
 
   const subscriptions = detectProviderSubscriptions().active
@@ -680,9 +694,17 @@ async function getCapabilities(request?: NextRequest) {
     // settings table may not exist yet
   }
 
-  // Auto-register MC as default dashboard when gateway + nanobot home detected
+  const hermesInstalled = isHermesInstalled()
+  let hermesSessions = 0
+  if (includeGlobalRuntime && hermesInstalled) {
+    try {
+      hermesSessions = scanHermesSessions(50).filter(s => s.isActive).length
+    } catch { /* ignore */ }
+  }
+
+  // Auto-register MC as default dashboard when gateway + openclaw home detected
   let dashboardRegistration: { registered: boolean; alreadySet: boolean } | null = null
-  if (gateway && nanobotHome) {
+  if (includeGlobalRuntime && gateway && openclawHome) {
     try {
       let mcUrl = process.env.MC_BASE_URL || ''
       if (!mcUrl && request) {
@@ -698,13 +720,15 @@ async function getCapabilities(request?: NextRequest) {
     }
   }
 
-  return { gateway, nanobotHome, claudeHome, claudeSessions, subscription, subscriptions, processUser, interfaceMode, dashboardRegistration }
+  const isDocker = existsSync('/.dockerenv')
+
+  return { gateway, openclawHome, claudeHome, claudeSessions, hermesInstalled, hermesSessions, subscription, subscriptions, processUser, interfaceMode, dashboardRegistration, isDocker }
 }
 
 function isPortOpen(host: string, port: number): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = new net.Socket()
-    const timeoutMs = 500
+    const timeoutMs = 1500
 
     const cleanup = () => {
       socket.removeAllListeners()

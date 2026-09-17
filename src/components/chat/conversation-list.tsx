@@ -3,13 +3,14 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import { useMissionControl, Conversation } from '@/store'
 import { useSmartPoll } from '@/lib/use-smart-poll'
+import { apiFetch, ApiError } from '@/lib/api-client'
 import { createClientLogger } from '@/lib/client-logger'
 import { Button } from '@/components/ui/button'
 import { SessionKindAvatar, SessionKindPill } from './session-kind-brand'
 
 const log = createClientLogger('ConversationList')
 
-type SessionKind = 'claude-code' | 'codex-cli' | 'gateway'
+type SessionKind = 'claude-code' | 'codex-cli' | 'hermes' | 'opencode' | 'gateway'
 
 type SessionRecord = {
   id: string
@@ -126,17 +127,20 @@ interface ConversationListProps {
   onNewConversation: (agentName: string) => void
 }
 
-export function ConversationList({ onNewConversation: _onNewConversation }: ConversationListProps) {
+export function ConversationList({ onNewConversation }: ConversationListProps) {
   const {
     conversations,
     setConversations,
     activeConversation,
     setActiveConversation,
     markConversationRead,
-    dashboardMode,
+    sessionAttention,
+    setSessionAttention,
+    addSplitPane,
+    agents,
   } = useMissionControl()
   const [search, setSearch] = useState('')
-  const isGatewayMode = dashboardMode !== 'local'
+  const [initialLoading, setInitialLoading] = useState(conversations.length === 0)
 
   // Context menu state
   const [ctxMenu, setCtxMenu] = useState<{ convId: string; x: number; y: number } | null>(null)
@@ -198,16 +202,18 @@ export function ConversationList({ onNewConversation: _onNewConversation }: Conv
       if (name !== undefined) body.name = name || null
       if (color !== undefined) body.color = color || null
 
-      const res = await fetch('/api/chat/session-prefs', {
+      await apiFetch('/api/chat/session-prefs', {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
-      if (!res.ok) {
-        log.error('Failed to save session pref, server returned', res.status)
-      }
     } catch (err) {
-      log.error('Failed to save session pref:', err)
+      // apiFetch throws on non-OK; preserve the prior graceful degradation
+      // (log only — the optimistic update stays in place).
+      if (err instanceof ApiError) {
+        log.error('Failed to save session pref, server returned', err.status)
+      } else {
+        log.error('Failed to save session pref:', err)
+      }
     }
   }, [conversations, setConversations])
 
@@ -247,48 +253,42 @@ export function ConversationList({ onNewConversation: _onNewConversation }: Conv
 
   const loadConversations = useCallback(async () => {
     try {
-      const sessionsUrl = dashboardMode === 'local'
-        ? '/api/sessions?include_local=1'
-        : '/api/sessions'
-      const requests: Promise<Response>[] = [
-        fetch(sessionsUrl),
-        fetch('/api/chat/session-prefs'),
-      ]
-
-      const [sessionsRes, prefsRes] = await Promise.all(requests)
-      const sessionsData = sessionsRes.ok ? readSessions(await sessionsRes.json()) : []
-      const prefs = prefsRes.ok ? readSessionPrefs(await prefsRes.json().catch(() => null)) : {}
+      // apiFetch throws on non-OK / network errors. The originals used
+      // `.ok ? parse : default` for INDEPENDENT graceful degradation, so each
+      // request is caught on its own — a failed prefs fetch must not discard
+      // successfully-loaded sessions (and vice versa).
+      const [sessionsData, prefs] = await Promise.all([
+        apiFetch<unknown>('/api/sessions')
+          .then((payload) => readSessions(payload))
+          .catch(() => [] as SessionRecord[]),
+        apiFetch<unknown>('/api/chat/session-prefs')
+          .then((payload) => readSessionPrefs(payload))
+          .catch(() => ({} as SessionPrefs)),
+      ])
 
       const providerSessions = sessionsData
-        .filter((s) => {
-          if (dashboardMode === 'local') {
-            return s?.source === 'local' && (s?.kind === 'claude-code' || s?.kind === 'codex-cli')
-          }
-          return s?.source === 'gateway'
-        })
         .map((s, idx: number) => {
           const lastActivityMs = Number(s.lastActivity || s.startTime || 0)
           const updatedAt = lastActivityMs > 1_000_000_000_000
             ? Math.floor(lastActivityMs / 1000)
             : lastActivityMs
-          const sessionKind: SessionKind = s.kind === 'claude-code' || s.kind === 'codex-cli'
+          const sessionKind: SessionKind = s.kind === 'claude-code' || s.kind === 'codex-cli' || s.kind === 'hermes' || s.kind === 'opencode'
             ? s.kind
             : 'gateway'
           const kindLabel = sessionKind === 'codex-cli'
             ? 'Codex'
             : sessionKind === 'claude-code'
               ? 'Claude'
-              : 'Gateway'
+              : sessionKind === 'hermes'
+                ? 'Hermes'
+                : sessionKind === 'opencode'
+                  ? 'OpenCode'
+                : 'Gateway'
           const prefKey = `${sessionKind}:${s.id}`
           const pref = prefs[prefKey] || {}
-          const rawKey = s.key || s.id
-          // Strip full paths down to last segment (e.g. "/Users/designmac/projects/foo" → "foo")
-          const shorten = (v: string) => v.includes('/') ? v.split('/').filter(Boolean).pop() || v : v
-          const shortKey = shorten(rawKey)
-          const shortAgent = s.agent ? shorten(s.agent) : 'Gateway'
-          const defaultName = dashboardMode === 'local'
-            ? `${kindLabel} • ${shortKey}`
-            : `${shortAgent} • ${shortKey}`
+          const defaultName = s.source === 'local'
+            ? `${kindLabel} • ${s.key || s.id}`
+            : `${s.agent || 'Gateway'} • ${s.key || s.id}`
           const sessionName = pref.name || defaultName
 
           return {
@@ -329,16 +329,23 @@ export function ConversationList({ onNewConversation: _onNewConversation }: Conv
       setConversations(
         providerSessions.sort((a: Conversation, b: Conversation) => b.updatedAt - a.updatedAt)
       )
+      setInitialLoading(false)
     } catch (err) {
       log.error('Failed to load conversations:', err)
+      setInitialLoading(false)
     }
-  }, [dashboardMode, setConversations])
+  }, [setConversations])
 
-  useSmartPoll(loadConversations, 15000)
+  useSmartPoll(loadConversations, 30000, { pauseWhenSseConnected: true })
 
   const handleSelect = (convId: string) => {
     setActiveConversation(convId)
     markConversationRead(convId)
+    // Clear attention when user views the session
+    const conv = conversations.find((c) => c.id === convId)
+    if (conv?.session?.sessionId) {
+      setSessionAttention(conv.session.sessionId, null)
+    }
   }
 
   const filteredConversations = conversations.filter((c) => {
@@ -352,55 +359,104 @@ export function ConversationList({ onNewConversation: _onNewConversation }: Conv
     )
   })
 
-  const gatewayRows = filteredConversations.filter((c) => c.source === 'session' && c.session?.sessionKind === 'gateway')
-  const activeGatewayRows = gatewayRows.filter((c) => c.session?.active)
-  const inactiveGatewayRows = gatewayRows.filter((c) => !c.session?.active)
-  const localRows = filteredConversations.filter((c) => c.source === 'session' && (c.session?.sessionKind === 'claude-code' || c.session?.sessionKind === 'codex-cli'))
-  const activeLocalRows = localRows.filter((c) => c.session?.active)
-  const inactiveLocalRows = localRows.filter((c) => !c.session?.active)
+  const allSessions = filteredConversations.filter((c) => c.source === 'session')
+  const activeRows = allSessions.filter((c) => c.session?.active)
+  const recentRows = allSessions.filter((c) => !c.session?.active)
+  // Direct agent conversations (agent_<name>) are not gateway/local sessions but
+  // must still appear in the list once started (issue #611).
+  const directRows = filteredConversations.filter((c) => c.source !== 'session')
+
+  // Registered agents the user can start a direct conversation with, even when
+  // no live gateway/local sessions exist yet (issue #611). Clicking one opens an
+  // `agent_<name>` conversation (handled by onNewConversation), enabling chat.
+  const agentRows = (agents || []).filter((a) => {
+    if (!a.name) return false
+    if (!search) return true
+    return a.name.toLowerCase().includes(search.toLowerCase())
+  })
+
+  function renderAgentItem(agent: { name: string; status?: string }) {
+    const convId = `agent_${agent.name}`
+    const isSelected = activeConversation === convId
+    const online = agent.status === 'idle' || agent.status === 'busy'
+    return (
+      <button
+        key={`agent:${agent.name}`}
+        type="button"
+        onClick={() => onNewConversation(agent.name)}
+        className={`w-full text-left px-3 py-2 transition-colors group ${
+          isSelected
+            ? 'bg-accent/60 border-l-2 border-primary'
+            : 'border-l-2 border-transparent hover:bg-accent/30'
+        }`}
+      >
+        <div className="flex items-center gap-2.5 w-full">
+          <span
+            className={`h-1.5 w-1.5 rounded-full shrink-0 ${online ? 'bg-green-500' : 'bg-muted-foreground/40'}`}
+          />
+          <span className="text-xs text-foreground truncate">{agent.name}</span>
+          {online && <span className="text-[10px] text-green-400/60 ml-auto">online</span>}
+        </div>
+      </button>
+    )
+  }
 
   function renderConversationItem(conv: Conversation) {
     const displayName = conv.name || conv.id.replace('agent_', '')
     const isSessionRow = conv.id.startsWith('session:')
     const isSelected = activeConversation === conv.id
     const isEditing = editingId === conv.id
+    const session = conv.session
+    const attentionLevel = session?.sessionId ? sessionAttention[session.sessionId] : undefined
+
+    // Extract working directory leaf name for compact display
+    const workDirLeaf = session?.workingDir
+      ? session.workingDir.split('/').filter(Boolean).pop() || session.workingDir
+      : null
+
+    // Derive last prompt preview
+    const promptPreview = session?.lastUserPrompt
+      ? (session.lastUserPrompt.length > 60 ? session.lastUserPrompt.slice(0, 60) + '...' : session.lastUserPrompt)
+      : null
 
     return (
-      <Button
+      <button
         key={conv.id}
+        type="button"
         onClick={() => handleSelect(conv.id)}
-        onDoubleClick={() => { if (conv.session?.prefKey) startRename(conv) }}
+        onDoubleClick={() => { if (session?.prefKey) startRename(conv) }}
         onContextMenu={(e) => handleContextMenu(e, conv)}
-        variant="ghost"
-        className={`w-full justify-start h-auto px-3 py-2.5 rounded-none ${
+        className={`w-full text-left px-3 py-2 transition-colors group ${
           isSelected
             ? 'bg-accent/60 border-l-2 border-primary'
-            : 'border-l-2 border-transparent'
+            : 'border-l-2 border-transparent hover:bg-accent/30'
         }`}
       >
-        <div className="flex items-center gap-2 w-full">
-          {/* Mini avatar */}
-          <div className="relative flex-shrink-0">
+        <div className="flex items-start gap-2.5 w-full">
+          {/* Avatar with status ring + attention indicator */}
+          <div className={`relative shrink-0 mt-0.5 ${
+            attentionLevel ? 'ring-2 ring-offset-1 ring-offset-card rounded-full ring-blue-400 animate-pulse' : ''
+          }`}>
             <SessionKindAvatar
-              kind={conv.session?.sessionKind || 'gateway'}
+              kind={session?.sessionKind || 'gateway'}
               fallback={displayName.charAt(0).toUpperCase()}
             />
-            {isSessionRow && conv.session?.active && (
-              <div className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-card ${STATUS_COLORS.busy}`} />
+            {isSessionRow && session?.active && (
+              <div className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-card ${
+                attentionLevel === 'error' ? STATUS_COLORS.error : STATUS_COLORS.busy
+              }`} />
             )}
-            {!isSessionRow && (
+            {isSessionRow && !session?.active && (
               <div className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-card ${STATUS_COLORS.offline}`} />
             )}
           </div>
 
-          <div className="flex-1 min-w-0 text-left">
-            <div className="flex items-center justify-between">
+          <div className="flex-1 min-w-0">
+            {/* Row 1: Name + time */}
+            <div className="flex items-center justify-between gap-1">
               <div className="flex items-center gap-1.5 min-w-0">
-                {conv.session?.colorTag && TAG_COLORS[conv.session.colorTag] && (
-                  <span className={`h-2 w-2 rounded-full ${TAG_COLORS[conv.session.colorTag]}`} />
-                )}
-                {isSessionRow && conv.session?.sessionKind && conv.session.sessionKind !== 'gateway' && (
-                  <SessionKindPill kind={conv.session.sessionKind} />
+                {session?.colorTag && TAG_COLORS[session.colorTag] && (
+                  <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${TAG_COLORS[session.colorTag]}`} />
                 )}
                 {isEditing ? (
                   <input
@@ -414,7 +470,7 @@ export function ConversationList({ onNewConversation: _onNewConversation }: Conv
                     }}
                     onClick={(e) => e.stopPropagation()}
                     maxLength={80}
-                    className="w-full bg-surface-1 rounded px-1 py-0.5 text-xs font-medium text-foreground outline-none ring-1 ring-primary/40"
+                    className="w-full bg-surface-1 rounded px-1 py-0.5 text-xs font-medium text-foreground outline-hidden ring-1 ring-primary/40"
                   />
                 ) : (
                   <span className="text-xs font-medium text-foreground truncate">
@@ -422,9 +478,9 @@ export function ConversationList({ onNewConversation: _onNewConversation }: Conv
                   </span>
                 )}
               </div>
-              <div className="flex items-center gap-1 flex-shrink-0 ml-1">
+              <div className="flex items-center gap-1 shrink-0">
                 {conv.unreadCount > 0 && (
-                  <span className="bg-primary text-primary-foreground text-[9px] rounded-full w-4 h-4 flex items-center justify-center font-medium">
+                  <span className="bg-blue-500 text-white text-[9px] rounded-full w-4 h-4 flex items-center justify-center font-medium">
                     {conv.unreadCount}
                   </span>
                 )}
@@ -433,25 +489,49 @@ export function ConversationList({ onNewConversation: _onNewConversation }: Conv
                 </span>
               </div>
             </div>
-            {conv.lastMessage && !isEditing && (
-              <p className="text-[11px] text-muted-foreground/60 truncate mt-0.5">
-                {conv.lastMessage.from_agent === 'human'
-                  ? `You: ${conv.lastMessage.content}`
-                  : conv.lastMessage.content}
+
+            {/* Row 2: Metadata badges (working dir, model, kind) */}
+            {!isEditing && (
+              <div className="flex items-center gap-1.5 mt-1 flex-wrap">
+                {isSessionRow && session?.sessionKind && session.sessionKind !== 'gateway' && (
+                  <SessionKindPill kind={session.sessionKind} />
+                )}
+                {workDirLeaf && (
+                  <span className="text-[10px] text-muted-foreground/50 font-mono truncate max-w-32" title={session?.workingDir || ''}>
+                    {workDirLeaf}
+                  </span>
+                )}
+                {session?.model && (
+                  <span className="text-[10px] text-muted-foreground/30 hidden group-hover:inline">
+                    {session.model}
+                  </span>
+                )}
+              </div>
+            )}
+
+            {/* Row 3: Last prompt or status preview */}
+            {!isEditing && promptPreview && (
+              <p className="text-[10px] text-muted-foreground/40 truncate mt-0.5 leading-relaxed">
+                $ {promptPreview}
+              </p>
+            )}
+            {!isEditing && !promptPreview && conv.lastMessage && (
+              <p className="text-[10px] text-muted-foreground/40 truncate mt-0.5">
+                {conv.lastMessage.content}
               </p>
             )}
           </div>
         </div>
-      </Button>
+      </button>
     )
   }
 
   return (
     <div className="flex flex-col h-full bg-card">
       {/* Header */}
-      <div className="p-3 border-b border-border flex-shrink-0">
+      <div className="p-3 border-b border-border shrink-0">
         <div className="mb-2 text-xs font-semibold text-muted-foreground uppercase tracking-wider">
-      {isGatewayMode ? 'Gateway Sessions' : 'Sessions'}
+      Sessions
         </div>
         <div className="relative">
           <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" className="absolute left-2 top-1/2 -translate-y-1/2 text-muted-foreground/50">
@@ -463,51 +543,69 @@ export function ConversationList({ onNewConversation: _onNewConversation }: Conv
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Search..."
-            className="w-full bg-surface-1 rounded-md pl-7 pr-2 py-1.5 text-xs text-foreground placeholder:text-muted-foreground/40 focus:outline-none focus:ring-1 focus:ring-primary/30"
+            className="w-full bg-surface-1 rounded-md pl-7 pr-2 py-1.5 text-xs text-foreground placeholder:text-muted-foreground/40 focus:outline-hidden focus:ring-1 focus:ring-primary/30"
           />
         </div>
       </div>
 
       {/* Conversation list */}
       <div className="flex-1 overflow-y-auto">
-        {filteredConversations.length === 0 ? (
+        {filteredConversations.length === 0 && agentRows.length === 0 ? (
           <div className="p-4 text-center text-xs text-muted-foreground/50">
-            No conversations yet
+            {initialLoading ? (
+              <div className="flex items-center justify-center gap-2">
+                <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+                <span>Loading sessions...</span>
+              </div>
+            ) : (
+              'No sessions or agents found'
+            )}
           </div>
         ) : (
           <>
-            {dashboardMode === 'local' && activeLocalRows.length > 0 && (
+            {directRows.length > 0 && (
               <div>
-                <div className="px-3 pt-2 py-1 flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-green-400/70">
-                  <span className="h-1.5 w-1.5 rounded-full bg-green-500 animate-pulse" />
-                  Active
+                <div className="px-3 pt-2.5 pb-1 flex items-center justify-between">
+                  <span className="text-[10px] uppercase tracking-wider text-muted-foreground/40">
+                    Conversations
+                    <span className="ml-1 font-mono">{directRows.length}</span>
+                  </span>
                 </div>
-                {activeLocalRows.map(renderConversationItem)}
+                {directRows.map(renderConversationItem)}
               </div>
             )}
-            {dashboardMode === 'local' && inactiveLocalRows.length > 0 && (
+            {activeRows.length > 0 && (
               <div>
-                <div className="px-3 pt-2 py-1 text-[10px] uppercase tracking-wider text-muted-foreground/40">
-                  Recent
+                <div className="px-3 pt-2.5 pb-1 flex items-center justify-between">
+                  <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-green-400/70">
+                    <span className="h-1.5 w-1.5 rounded-full bg-green-500 animate-pulse" />
+                    Active
+                    <span className="text-green-400/40 font-mono">{activeRows.length}</span>
+                  </div>
                 </div>
-                {inactiveLocalRows.map(renderConversationItem)}
+                {activeRows.map(renderConversationItem)}
               </div>
             )}
-            {isGatewayMode && activeGatewayRows.length > 0 && (
+            {recentRows.length > 0 && (
               <div>
-                <div className="px-3 pt-2 py-1 flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-green-400/70">
-                  <span className="h-1.5 w-1.5 rounded-full bg-green-500 animate-pulse" />
-                  Active
+                <div className="px-3 pt-2.5 pb-1 flex items-center justify-between">
+                  <span className="text-[10px] uppercase tracking-wider text-muted-foreground/40">
+                    Recent
+                    <span className="ml-1 font-mono">{recentRows.length}</span>
+                  </span>
                 </div>
-                {activeGatewayRows.map(renderConversationItem)}
+                {recentRows.map(renderConversationItem)}
               </div>
             )}
-            {isGatewayMode && inactiveGatewayRows.length > 0 && (
+            {agentRows.length > 0 && (
               <div>
-                <div className="px-3 pt-2 py-1 text-[10px] uppercase tracking-wider text-muted-foreground/40">
-                  Recent
+                <div className="px-3 pt-2.5 pb-1 flex items-center justify-between">
+                  <span className="text-[10px] uppercase tracking-wider text-muted-foreground/40">
+                    Agents
+                    <span className="ml-1 font-mono">{agentRows.length}</span>
+                  </span>
                 </div>
-                {inactiveGatewayRows.map(renderConversationItem)}
+                {agentRows.map(renderAgentItem)}
               </div>
             )}
           </>

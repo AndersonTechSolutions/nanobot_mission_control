@@ -1,10 +1,20 @@
 import type Database from 'better-sqlite3'
 
+// Allowed workspace isolation policies (issue #677 slice 1):
+// - 'shared': cross-workspace memory access from agents is allowed (default)
+// - 'strict': cross-workspace memory access from agents is not allowed
+// SQLite ALTER TABLE cannot add CHECK constraints, so these values are the
+// single source of truth for the validation layer.
+export const WORKSPACE_ISOLATION_VALUES = ['shared', 'strict'] as const
+export type WorkspaceIsolation = (typeof WORKSPACE_ISOLATION_VALUES)[number]
+
 export interface WorkspaceRecord {
   id: number
   slug: string
   name: string
   tenant_id: number
+  brand: string | null
+  isolation: WorkspaceIsolation
   created_at: number
   updated_at: number
 }
@@ -38,9 +48,13 @@ function logTenantAccessDenied(
   tenantId: number,
   context: AccessAuditContext
 ) {
+  const actorWorkspace = context.actorId
+    ? db.prepare('SELECT workspace_id FROM users WHERE id = ?').get(context.actorId) as { workspace_id?: number } | undefined
+    : undefined
+  const workspaceId = actorWorkspace?.workspace_id ?? 1
   db.prepare(`
-    INSERT INTO audit_log (action, actor, actor_id, target_type, target_id, detail, ip_address, user_agent)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO audit_log (action, actor, actor_id, target_type, target_id, detail, ip_address, user_agent, workspace_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     'tenant_access_denied',
     context.actor || 'unknown',
@@ -52,7 +66,8 @@ function logTenantAccessDenied(
       route: context.route || null,
     }),
     context.ipAddress ?? null,
-    context.userAgent ?? null
+    context.userAgent ?? null,
+    workspaceId
   )
 }
 
@@ -62,7 +77,7 @@ export function getWorkspaceForTenant(
   tenantId: number
 ): WorkspaceRecord | null {
   const row = db.prepare(`
-    SELECT id, slug, name, tenant_id, created_at, updated_at
+    SELECT id, slug, name, tenant_id, brand, isolation, created_at, updated_at
     FROM workspaces
     WHERE id = ? AND tenant_id = ?
     LIMIT 1
@@ -75,7 +90,7 @@ export function listWorkspacesForTenant(
   tenantId: number
 ): WorkspaceRecord[] {
   return db.prepare(`
-    SELECT id, slug, name, tenant_id, created_at, updated_at
+    SELECT id, slug, name, tenant_id, brand, isolation, created_at, updated_at
     FROM workspaces
     WHERE tenant_id = ?
     ORDER BY CASE WHEN slug = 'default' THEN 0 ELSE 1 END, name COLLATE NOCASE ASC

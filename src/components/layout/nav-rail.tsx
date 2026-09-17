@@ -2,11 +2,14 @@
 
 import Image from 'next/image'
 import { useState, useEffect } from 'react'
+import { useTranslations } from 'next-intl'
 import { useMissionControl } from '@/store'
 import { useNavigateToPanel, usePrefetchPanel } from '@/lib/navigation'
+import { useRouter } from 'next/navigation'
 import { Button } from '@/components/ui/button'
 import { APP_VERSION } from '@/lib/version'
 import { getPluginNavItems } from '@/lib/plugins'
+import { apiFetch } from '@/lib/api-client'
 
 interface NavItem {
   id: string
@@ -44,10 +47,11 @@ const navGroups: NavGroup[] = [
       { id: 'activity', label: 'Activity', icon: <ActivityIcon />, priority: true, essential: true },
       { id: 'logs', label: 'Logs', icon: <LogsIcon />, priority: false, essential: true },
       { id: 'nanobot-tokens', label: 'Tokens', icon: <TokensIcon />, priority: false },
-      { id: 'cost-tracker', label: 'Cost Tracker', icon: <AgentCostsIcon />, priority: false },
+      { id: 'cost-tracker', label: 'Cost Tracker', icon: <TokensIcon />, priority: false },
       { id: 'nodes', label: 'Nodes', icon: <NodesIcon />, priority: false },
       { id: 'exec-approvals', label: 'Approvals', icon: <ApprovalsIcon />, priority: false },
       { id: 'office', label: 'Office', icon: <OfficeIcon />, priority: false },
+      { id: 'monitor', label: 'Monitor', icon: <MonitorIcon />, priority: false },
     ],
   },
   {
@@ -81,22 +85,66 @@ const navGroups: NavGroup[] = [
   },
 ]
 
+// Map nav item IDs to translation keys in the 'nav' namespace
+const navItemTranslationKeys: Record<string, string> = {
+  overview: 'overview',
+  agents: 'agents',
+  tasks: 'tasks',
+  chat: 'chat',
+  channels: 'channels',
+  skills: 'skills',
+  memory: 'memory',
+  activity: 'activity',
+  logs: 'logs',
+  'cost-tracker': 'costTracker',
+  nodes: 'nodes',
+  'exec-approvals': 'approvals',
+  office: 'office',
+  cron: 'cron',
+  webhooks: 'webhooks',
+  alerts: 'alerts',
+  github: 'github',
+  security: 'security',
+  users: 'users',
+  audit: 'audit',
+  'gateway-parent': 'gateway',
+  gateways: 'gateways',
+  'gateway-config': 'config',
+  integrations: 'integrations',
+  debug: 'debug',
+  settings: 'settings',
+}
+
+// Map group IDs to translation keys in the 'nav.group' namespace
+const groupTranslationKeys: Record<string, string> = {
+  observe: 'observe',
+  automate: 'automate',
+  admin: 'admin',
+}
+
 const gatewayOnlyPanels = new Set([
-  // Require a live gateway connection
   'gateways', 'gateway-config', 'channels', 'nodes', 'exec-approvals',
-  // Empty / non-functional without a gateway writing events
-  'activity', 'standup', 'webhooks', 'alerts',
-  'notifications', 'cost-tracker',
   ...getPluginNavItems().filter(pi => pi.gatewayOnly).map(pi => pi.id),
 ])
 const adminOnlyPanels = new Set<string>([])
 
 export function NavRail() {
-  const { activeTab, connection, dashboardMode, currentUser, activeTenant, tenants, osUsers, setActiveTenant, fetchTenants, fetchOsUsers, activeProject, projects, setActiveProject, fetchProjects, sidebarExpanded, collapsedGroups, toggleSidebar, toggleGroup, defaultOrgName, interfaceMode, setInterfaceMode, discoveredAgents } = useMissionControl()
+  const { activeTab, connection, dashboardMode, currentUser, activeTenant, tenants, osUsers, setActiveTenant, fetchTenants, fetchOsUsers, activeProject, projects, setActiveProject, fetchProjects, sidebarExpanded, collapsedGroups, toggleSidebar, toggleGroup, defaultOrgName, interfaceMode, setInterfaceMode } = useMissionControl()
   const navigateToPanel = useNavigateToPanel()
   const prefetchPanel = usePrefetchPanel()
+  const tn = useTranslations('nav')
+  const tc = useTranslations('common')
+
+  // Translate a nav item label using the translation key map
+  function tLabel(id: string, fallback: string): string {
+    const key = navItemTranslationKeys[id]
+    return key ? tn(key) : fallback
+  }
+  function tGroup(id: string, fallback?: string): string | undefined {
+    const key = groupTranslationKeys[id]
+    return key ? tn(`group.${key}`) : fallback
+  }
   const isLocal = dashboardMode === 'local'
-  const hasRedAgent = discoveredAgents.some((a) => a.health.overall === 'red')
   const isAdmin = currentUser?.role === 'admin'
   const [expandedParents, setExpandedParents] = useState<Set<string>>(new Set())
 
@@ -145,7 +193,14 @@ export function NavRail() {
       })
       .filter((i): i is NavItem => i !== null)
   }
-  // Merge plugin nav items into groups by groupId
+  // Translate nav item labels and merge plugin items
+  function translateItems(items: NavItem[]): NavItem[] {
+    return items.map(item => ({
+      ...item,
+      label: tLabel(item.id, item.label),
+      children: item.children ? translateItems(item.children) : undefined,
+    }))
+  }
   const mergedGroups = navGroups.map(g => {
     const pluginItems = getPluginNavItems()
       .filter(pi => pi.groupId === g.id)
@@ -155,8 +210,8 @@ export function NavRail() {
         icon: pi.icon ? <span>{pi.icon}</span> : <PluginIcon />,
         priority: false,
       } as NavItem))
-    if (pluginItems.length === 0) return g
-    return { ...g, items: [...g.items, ...pluginItems] }
+    const items = translateItems(pluginItems.length > 0 ? [...g.items, ...pluginItems] : g.items)
+    return { ...g, label: tGroup(g.id, g.label), items }
   })
 
   const filteredGroups = mergedGroups
@@ -185,7 +240,7 @@ export function NavRail() {
       <nav
         role="navigation"
         aria-label="Main navigation"
-        className={`hidden md:flex flex-col bg-gradient-to-b from-card to-background border-r border-border shrink-0 transition-all duration-200 ease-in-out ${
+        className={`hidden md:flex flex-col bg-linear-to-b from-card to-background border-r border-border shrink-0 transition-all duration-200 ease-in-out ${
           sidebarExpanded ? 'w-[220px]' : 'w-14'
         }`}
       >
@@ -210,7 +265,7 @@ export function NavRail() {
             variant="ghost"
             size="icon-xs"
             onClick={toggleSidebar}
-            title={sidebarExpanded ? 'Collapse sidebar' : 'Expand sidebar'}
+            title={sidebarExpanded ? tn('collapseSidebar') : tn('expandSidebar')}
             className="shrink-0"
           >
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4">
@@ -266,9 +321,6 @@ export function NavRail() {
               >
                 <div className={`flex flex-col ${sidebarExpanded ? 'gap-0.5 px-2' : 'items-center gap-1'}`}>
                   {group.items.map((item) => {
-                    const showBadge = item.id === 'overview' && hasRedAgent
-                    const isActive = activeTab === item.id || activeTab.startsWith(item.id + '/')
-
                     if (item.children) {
                       const isParentExpanded = expandedParents.has(item.id)
                       const childActive = item.children.some(c => activeTab === c.id)
@@ -352,9 +404,8 @@ export function NavRail() {
                       <NavButton
                         key={item.id}
                         item={item}
-                        active={isActive}
+                        active={activeTab === item.id}
                         expanded={sidebarExpanded}
-                        showBadge={showBadge}
                         onClick={() => navigateToPanel(item.id)}
                         onPrefetch={() => prefetchPanel(item.id)}
                       />
@@ -366,6 +417,47 @@ export function NavRail() {
           ))}
         </div>
 
+        {/* Promo banners */}
+        {sidebarExpanded && (
+          <div className="px-2 pb-2 space-y-2 shrink-0">
+            <a
+              href="https://x.com/nykdotdev/status/2022996371922649192?s=20"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="block rounded-lg border border-border/50 bg-surface-1 hover:bg-surface-2 hover:border-primary/30 transition-all duration-200 p-2 group"
+            >
+              <div className="flex items-center gap-1.5 mb-0.5">
+                <span className="text-2xs font-semibold text-foreground group-hover:text-primary transition-colors">xint</span>
+                <span className="text-[9px] px-1 py-px rounded bg-primary/15 text-primary font-mono">CLI</span>
+              </div>
+              <p className="text-[10px] text-muted-foreground/70 leading-snug">X power tools for agents.</p>
+            </a>
+            <a
+              href="https://builderz.dev"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="block rounded-lg border border-void-cyan/20 bg-linear-to-br from-void-cyan/5 to-transparent hover:from-void-cyan/10 hover:border-void-cyan/40 transition-all duration-200 p-2 group"
+            >
+              <div className="flex items-center gap-1.5 mb-0.5">
+                <span className="text-2xs font-bold text-foreground group-hover:text-void-cyan transition-colors">builderz</span>
+                <span className="text-[9px] px-1 py-px rounded bg-void-cyan/15 text-void-cyan">.dev</span>
+              </div>
+              <p className="text-[10px] text-muted-foreground/70 leading-snug">AI-native dev shop · Solana experts.</p>
+            </a>
+          </div>
+        )}
+
+        {/* Attribution */}
+        {sidebarExpanded && (
+          <div className="px-3 pb-1">
+            <p className="text-[10px] text-muted-foreground/30 text-center">
+              Built with care by{' '}
+              <a href="https://x.com/nykdotdev" target="_blank" rel="noopener noreferrer" className="text-muted-foreground/50 hover:text-primary transition-colors">
+                nyk
+              </a>
+            </p>
+          </div>
+        )}
 
         {/* Context switcher (profile-style, bottom of sidebar) */}
         <ContextSwitcher
@@ -397,11 +489,10 @@ export function NavRail() {
   )
 }
 
-function NavButton({ item, active, expanded, showBadge, onClick, onPrefetch, nested }: {
+function NavButton({ item, active, expanded, onClick, onPrefetch, nested }: {
   item: NavItem
   active: boolean
   expanded: boolean
-  showBadge?: boolean
   onClick: () => void
   onPrefetch?: () => void
   nested?: boolean
@@ -425,12 +516,7 @@ function NavButton({ item, active, expanded, showBadge, onClick, onPrefetch, nes
         {active && (
           <span className="absolute left-0 w-0.5 h-5 bg-void-cyan rounded-r glow-cyan" />
         )}
-        <div className={`shrink-0 relative ${nested ? 'w-4 h-4' : 'w-5 h-5'}`}>
-          {item.icon}
-          {showBadge && (
-            <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-destructive" />
-          )}
-        </div>
+        <div className={`shrink-0 ${nested ? 'w-4 h-4' : 'w-5 h-5'}`}>{item.icon}</div>
         <span className={`truncate ${nested ? 'text-xs' : 'text-sm'}`}>{item.label}</span>
       </Button>
     )
@@ -451,12 +537,7 @@ function NavButton({ item, active, expanded, showBadge, onClick, onPrefetch, nes
           : ''
       }`}
     >
-      <div className="w-5 h-5 relative">
-        {item.icon}
-        {showBadge && (
-          <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-destructive" />
-        )}
-      </div>
+      <div className="w-5 h-5">{item.icon}</div>
       {/* Tooltip */}
       <span className="absolute left-full ml-2 px-2 py-1 text-xs font-medium bg-popover text-popover-foreground border border-border rounded-md opacity-0 group-hover:opacity-100 pointer-events-none whitespace-nowrap z-50 transition-opacity">
         {item.label}
@@ -475,6 +556,7 @@ function MobileBottomBar({ activeTab, navigateToPanel, groups, items }: {
   groups: NavGroup[]
   items: NavItem[]
 }) {
+  const tn = useTranslations('nav')
   const [sheetOpen, setSheetOpen] = useState(false)
   const priorityItems = items.filter(i => i.priority)
   const nonPriorityIds = new Set(items.filter(i => !i.priority).map(i => i.id))
@@ -514,7 +596,7 @@ function MobileBottomBar({ activeTab, navigateToPanel, groups, items }: {
                 <circle cx="12" cy="8" r="1.5" />
               </svg>
             </div>
-            <span className="text-[10px] font-medium">More</span>
+            <span className="text-[10px] font-medium">{tn('more')}</span>
             {moreIsActive && (
               <span className="absolute top-1.5 right-2.5 w-1.5 h-1.5 rounded-full bg-primary" />
             )}
@@ -564,7 +646,7 @@ function MobileBottomSheet({ open, onClose, activeTab, navigateToPanel, groups }
   if (!open) return null
 
   return (
-    <div className="md:hidden fixed inset-0 z-[60]">
+    <div className="md:hidden fixed inset-0 z-60">
       {/* Backdrop */}
       <div
         className={`absolute inset-0 bg-black/40 transition-opacity duration-200 ${
@@ -639,6 +721,7 @@ function OrgRow({ label, initial, active, colorClass, onClick, isActiveOrg, proj
   onSwitchProject: (project: import('@/store').Project | null) => void
   onNewProject: () => void
 }) {
+  const tcs = useTranslations('contextSwitcher')
   return (
     <div>
       <Button
@@ -671,7 +754,7 @@ function OrgRow({ label, initial, active, colorClass, onClick, isActiveOrg, proj
                 <circle cx="8" cy="8" r="2" />
               </svg>
             </div>
-            All
+            {tcs('all')}
           </Button>
           {projects.map((project) => (
             <Button
@@ -740,6 +823,10 @@ function ContextSwitcher({ currentUser, isAdmin, isLocal, isConnected, tenants, 
   activeTab: string
 }) {
   const { setShowProjectManagerModal } = useMissionControl()
+  const tcs = useTranslations('contextSwitcher')
+  const tn = useTranslations('nav')
+  const tc = useTranslations('common')
+  const router = useRouter()
   // Build unified org list: DB tenants + unlinked OS users
   const linkedUsernames = new Set(tenants.map(t => t.linux_user))
   const unlinkedOsUsers = osUsers.filter(u => !linkedUsernames.has(u.username) && !u.is_process_owner)
@@ -754,7 +841,7 @@ function ContextSwitcher({ currentUser, isAdmin, isLocal, isConnected, tenants, 
   const tenantName = activeTenant?.display_name || defaultOrgName
   const projectName = activeProject?.name
   const contextLine = projectName ? `${tenantName} / ${projectName}` : tenantName
-  const connectionLabel = isLocal ? 'Local Mode' : isConnected ? 'Connected' : 'Disconnected'
+  const connectionLabel = isLocal ? tcs('localMode') : isConnected ? tcs('connected') : tcs('disconnected')
   const connectionDotClass = isLocal ? 'bg-void-cyan' : isConnected ? 'bg-green-500' : 'bg-red-500'
 
   return (
@@ -854,7 +941,7 @@ function ContextSwitcher({ currentUser, isAdmin, isLocal, isConnected, tenants, 
             {/* Interface mode toggle */}
             <div className="mx-2 border-t border-border my-1" />
             <div className="px-3 py-1.5 flex items-center justify-between">
-              <span className="text-xs text-muted-foreground">Interface</span>
+              <span className="text-xs text-muted-foreground">{tcs('interface')}</span>
               <div className="flex rounded-md border border-border overflow-hidden">
                 <button
                   onClick={async () => {
@@ -862,7 +949,7 @@ function ContextSwitcher({ currentUser, isAdmin, isLocal, isConnected, tenants, 
                     setInterfaceMode('essential')
                     const essentialIds = new Set(['overview', 'agents', 'tasks', 'chat', 'activity', 'logs', 'settings'])
                     if (!essentialIds.has(activeTab)) navigateToPanel('overview')
-                    try { await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: { 'general.interface_mode': 'essential' } }) }) } catch {}
+                    try { await apiFetch('/api/settings', { method: 'PUT', body: JSON.stringify({ settings: { 'general.interface_mode': 'essential' } }) }) } catch {}
                   }}
                   className={`flex items-center gap-1 px-2 py-1 text-[11px] font-medium transition-colors ${
                     interfaceMode === 'essential'
@@ -871,13 +958,13 @@ function ContextSwitcher({ currentUser, isAdmin, isLocal, isConnected, tenants, 
                   }`}
                 >
                   <span className={`w-1.5 h-1.5 rounded-full ${interfaceMode === 'essential' ? 'bg-void-amber' : 'bg-muted-foreground/30'}`} />
-                  Essential
+                  {tcs('essential')}
                 </button>
                 <button
                   onClick={async () => {
                     if (interfaceMode === 'full') return
                     setInterfaceMode('full')
-                    try { await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: { 'general.interface_mode': 'full' } }) }) } catch {}
+                    try { await apiFetch('/api/settings', { method: 'PUT', body: JSON.stringify({ settings: { 'general.interface_mode': 'full' } }) }) } catch {}
                   }}
                   className={`flex items-center gap-1 px-2 py-1 text-[11px] font-medium transition-colors border-l border-border ${
                     interfaceMode === 'full'
@@ -886,7 +973,7 @@ function ContextSwitcher({ currentUser, isAdmin, isLocal, isConnected, tenants, 
                   }`}
                 >
                   <span className={`w-1.5 h-1.5 rounded-full ${interfaceMode === 'full' ? 'bg-void-cyan' : 'bg-muted-foreground/30'}`} />
-                  Full
+                  {tcs('full')}
                 </button>
               </div>
             </div>
@@ -903,7 +990,7 @@ function ContextSwitcher({ currentUser, isAdmin, isLocal, isConnected, tenants, 
                   <circle cx="8" cy="8" r="3" />
                   <path d="M8 1v2M8 13v2M1 8h2M13 8h2M2.9 2.9l1.4 1.4M11.7 11.7l1.4 1.4M13.1 2.9l-1.4 1.4M4.3 11.7l-1.4 1.4" />
                 </svg>
-                Settings
+                {tn('settings')}
               </Button>
               <Button
                 variant="ghost"
@@ -913,7 +1000,25 @@ function ContextSwitcher({ currentUser, isAdmin, isLocal, isConnected, tenants, 
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5 shrink-0 text-muted-foreground/60">
                   <path d="M14 8H11L9.5 13L6.5 3L5 8H2" />
                 </svg>
-                Activity
+                {tn('activity')}
+              </Button>
+
+              {/* Logout */}
+              <div className="mx-2 border-t border-border my-1" />
+              <Button
+                variant="ghost"
+                onClick={async () => {
+                  try {
+                    await apiFetch('/api/auth/logout', { method: 'POST' })
+                  } catch {}
+                  router.push('/login')
+                }}
+                className="w-full flex items-center gap-2 px-2 py-1.5 h-auto rounded-md text-xs justify-start text-red-400 hover:text-red-300 hover:bg-red-500/10"
+              >
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5 shrink-0">
+                  <path d="M6 14H3a1 1 0 01-1-1V3a1 1 0 011-1h3M11 11l3-3-3-3M6 8h8" />
+                </svg>
+                {tn('logout')}
               </Button>
             </div>
 
@@ -922,7 +1027,7 @@ function ContextSwitcher({ currentUser, isAdmin, isLocal, isConnected, tenants, 
               <>
                 <div className="mx-2 border-t border-border my-1" />
                 <div className="px-3 pt-2 pb-1">
-                  <span className="text-[10px] tracking-wider text-muted-foreground/60 font-semibold">ORGANIZATIONS</span>
+                  <span className="text-[10px] tracking-wider text-muted-foreground/60 font-semibold">{tcs('organizations')}</span>
                 </div>
                 <div className="px-1">
                   {/* Default org */}
@@ -964,8 +1069,8 @@ function ContextSwitcher({ currentUser, isAdmin, isLocal, isConnected, tenants, 
                       osUser.has_openclaw && 'openclaw',
                     ].filter(Boolean)
                     const statusLabel = isLocal
-                      ? (tools.length > 0 ? tools.join('+') : 'no tools')
-                      : 'unlinked'
+                      ? (tools.length > 0 ? tools.join('+') : tcs('noTools'))
+                      : tcs('unlinked')
                     return (
                       <Button
                         key={osUser.username}
@@ -997,43 +1102,44 @@ function ContextSwitcher({ currentUser, isAdmin, isLocal, isConnected, tenants, 
                   {!createMode ? (
                     <Button
                       variant="ghost"
-                      onClick={() => { setCreateMode(true); setCreateError(null) }}
-                      className="w-full flex items-center gap-2 px-2 py-1.5 h-auto rounded-md text-xs justify-start"
+                      disabled
+                      title="Temporarily disabled — not functional yet"
+                      className="w-full flex items-center gap-2 px-2 py-1.5 h-auto rounded-md text-xs justify-start text-muted-foreground/40 cursor-not-allowed"
                     >
-                      <div className="w-5 h-5 flex items-center justify-center text-muted-foreground/60">
+                      <div className="w-5 h-5 flex items-center justify-center text-muted-foreground/40">
                         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" className="w-3.5 h-3.5">
                           <path d="M8 3v10M3 8h10" />
                         </svg>
                       </div>
-                      New organization...
+                      {tcs('newOrganization')}
                     </Button>
                   ) : (
                     <div className="px-1 pt-1 pb-1 space-y-1.5">
                       <input
                         value={createForm.username}
                         onChange={(e) => setCreateForm(f => ({ ...f, username: e.target.value }))}
-                        placeholder="Username (OS user)"
+                        placeholder={tcs('usernamePlaceholder')}
                         autoFocus
-                        className="w-full h-7 px-2 rounded bg-secondary border border-border text-xs text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/50"
+                        className="w-full h-7 px-2 rounded bg-secondary border border-border text-xs text-foreground placeholder:text-muted-foreground/50 focus:outline-hidden focus:border-primary/50"
                       />
                       <input
                         value={createForm.display_name}
                         onChange={(e) => setCreateForm(f => ({ ...f, display_name: e.target.value }))}
-                        placeholder="Display name"
-                        className="w-full h-7 px-2 rounded bg-secondary border border-border text-xs text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/50"
+                        placeholder={tcs('displayNamePlaceholder')}
+                        className="w-full h-7 px-2 rounded bg-secondary border border-border text-xs text-foreground placeholder:text-muted-foreground/50 focus:outline-hidden focus:border-primary/50"
                       />
                       {!isLocal && (
                         <input
                           value={createForm.gateway_port}
                           onChange={(e) => setCreateForm(f => ({ ...f, gateway_port: e.target.value }))}
-                          placeholder="Gateway port (required)"
-                          className="w-full h-7 px-2 rounded bg-secondary border border-border text-xs text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/50"
+                          placeholder={tcs('gatewayPortPlaceholder')}
+                          className="w-full h-7 px-2 rounded bg-secondary border border-border text-xs text-foreground placeholder:text-muted-foreground/50 focus:outline-hidden focus:border-primary/50"
                         />
                       )}
                       {/* Tool installation checkboxes */}
                       {isLocal && (
                         <div className="space-y-1 px-0.5">
-                          <div className="text-[10px] text-muted-foreground/60 font-semibold tracking-wider">INSTALL TOOLS</div>
+                          <div className="text-[10px] text-muted-foreground/60 font-semibold tracking-wider">{tcs('installTools')}</div>
                           <div className="flex flex-wrap gap-x-3 gap-y-0.5">
                             <label className="flex items-center gap-1 cursor-pointer">
                               <input
@@ -1079,15 +1185,15 @@ function ContextSwitcher({ currentUser, isAdmin, isLocal, isConnected, tenants, 
                           onClick={async () => {
                             const username = createForm.username.trim().toLowerCase()
                             const display_name = createForm.display_name.trim()
-                            if (!username || !display_name) { setCreateError('Username and display name required'); return }
-                            if (!/^[a-z][a-z0-9_-]{1,30}[a-z0-9]$/.test(username)) { setCreateError('Invalid username format'); return }
-                            if (!isLocal && !createForm.gateway_port) { setCreateError('Gateway port required'); return }
+                            if (!username || !display_name) { setCreateError(tcs('usernameAndDisplayRequired')); return }
+                            if (!/^[a-z][a-z0-9_-]{1,30}[a-z0-9]$/.test(username)) { setCreateError(tcs('invalidUsernameFormat')); return }
+                            if (!isLocal && !createForm.gateway_port) { setCreateError(tcs('gatewayPortRequired')); return }
                             setCreating(true)
                             setCreateError(null)
                             try {
-                              const res = await fetch('/api/super/os-users', {
+                              const res = await apiFetch<Response>('/api/super/os-users', {
                                 method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
+                                raw: true,
                                 body: JSON.stringify({
                                   username,
                                   display_name,
@@ -1103,15 +1209,15 @@ function ContextSwitcher({ currentUser, isAdmin, isLocal, isConnected, tenants, 
                               setCreateForm({ username: '', display_name: '', gateway_port: '', install_openclaw: true, install_claude: false, install_codex: false })
                               setCreateMode(false)
                               await Promise.all([fetchTenants(), fetchOsUsers()])
-                            } catch (e: any) {
-                              setCreateError(e?.message || 'Failed to create')
+                            } catch (error: unknown) {
+                              setCreateError(error instanceof Error ? error.message : 'Failed to create')
                             } finally {
                               setCreating(false)
                             }
                           }}
                           className="flex-1 text-[11px]"
                         >
-                          {creating ? 'Creating...' : isLocal ? 'Create User' : 'Create + Queue'}
+                          {creating ? tcs('creating') : isLocal ? tcs('createUser') : tcs('createAndQueue')}
                         </Button>
                         <Button
                           variant="outline"
@@ -1119,7 +1225,7 @@ function ContextSwitcher({ currentUser, isAdmin, isLocal, isConnected, tenants, 
                           onClick={() => { setCreateMode(false); setCreateError(null) }}
                           className="text-[11px]"
                         >
-                          Cancel
+                          {tc('cancel')}
                         </Button>
                       </div>
                     </div>
@@ -1427,6 +1533,16 @@ function PluginIcon() {
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
       <path d="M6 2v3M10 2v3M4 5h8a1 1 0 011 1v7a1 1 0 01-1 1H4a1 1 0 01-1-1V6a1 1 0 011-1z" />
       <circle cx="8" cy="10" r="1.5" />
+    </svg>
+  )
+}
+
+function MonitorIcon() {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="1" y="2" width="14" height="10" rx="1.5" />
+      <polyline points="4,9 6,6 8,8 12,4" />
+      <path d="M5 14h6" />
     </svg>
   )
 }

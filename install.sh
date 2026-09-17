@@ -44,6 +44,20 @@ die()   { err "$*"; exit 1; }
 
 command_exists() { command -v "$1" &>/dev/null; }
 
+# Escape sed replacement metacharacters (|, &, \) in a value.
+# Does not handle newlines — callers must ensure single-line input.
+sed_escape() { printf '%s' "$1" | sed 's/[|&\\]/\\&/g'; }
+
+# Portable in-place sed (macOS requires -i '', Linux uses -i)
+portable_sed() {
+  local pattern="$1" file="$2"
+  if [[ "$(uname)" == "Darwin" ]]; then
+    sed -i '' "$pattern" "$file"
+  else
+    sed -i "$pattern" "$file"
+  fi
+}
+
 detect_os() {
   local os arch
   os="$(uname -s)"
@@ -151,10 +165,36 @@ setup_env() {
 
   # Set the port if non-default
   if [[ "$MC_PORT" != "3000" ]]; then
-    if [[ "$(uname)" == "Darwin" ]]; then
-      sed -i '' "s|^# PORT=3000|PORT=$MC_PORT|" "$INSTALL_DIR/.env"
-    else
-      sed -i "s|^# PORT=3000|PORT=$MC_PORT|" "$INSTALL_DIR/.env"
+    portable_sed "s|^# PORT=3000|PORT=$(sed_escape "$MC_PORT")|" "$INSTALL_DIR/.env"
+  fi
+
+  # Auto-detect and write OpenClaw home directory into .env
+  local oc_home="${OPENCLAW_HOME:-$HOME/.openclaw}"
+  if [[ -d "$oc_home" ]]; then
+    portable_sed "s|^OPENCLAW_HOME=.*|OPENCLAW_HOME=$(sed_escape "$oc_home")|" "$INSTALL_DIR/.env"
+    info "Set OPENCLAW_HOME=$oc_home in .env"
+  fi
+
+  # In Docker mode, the gateway runs on the host, not inside the container.
+  # Set OPENCLAW_GATEWAY_HOST to the Docker host gateway IP so the container
+  # can reach the gateway. Users may override this with the gateway container
+  # name if running OpenClaw in a container on the same network.
+  if [[ "$DEPLOY_MODE" == "docker" ]]; then
+    local gw_host="${OPENCLAW_GATEWAY_HOST:-}"
+    if [[ -z "$gw_host" ]]; then
+      # Detect Docker host IP (host-gateway alias or default bridge)
+      if getent hosts host-gateway &>/dev/null 2>&1; then
+        gw_host="host-gateway"
+      else
+        # Fallback: use the default Docker bridge gateway (172.17.0.1)
+        gw_host=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}' || echo "172.17.0.1")
+      fi
+    fi
+    if [[ -n "$gw_host" && "$gw_host" != "127.0.0.1" ]]; then
+      portable_sed "s|^OPENCLAW_GATEWAY_HOST=.*|OPENCLAW_GATEWAY_HOST=$(sed_escape "$gw_host")|" "$INSTALL_DIR/.env"
+      info "Set OPENCLAW_GATEWAY_HOST=$gw_host in .env (Docker host IP)"
+      info "  If your gateway runs in a Docker container, update OPENCLAW_GATEWAY_HOST"
+      info "  to the container name and add it to the mc-net network."
     fi
   fi
 
@@ -197,6 +237,7 @@ deploy_local() {
 
   cd "$INSTALL_DIR"
   pnpm install --frozen-lockfile 2>/dev/null || pnpm install
+  pnpm rebuild better-sqlite3 2>/dev/null || true
   ok "Dependencies installed"
 
   info "Building Mission Control..."

@@ -3,6 +3,8 @@ import { getProviderFromModel } from '@/lib/provider-subscriptions'
 interface ModelPricing {
   inputPerMTok: number
   outputPerMTok: number
+  cacheReadPerMTok?: number
+  cacheWritePerMTok?: number | null
 }
 
 const DEFAULT_MODEL_PRICING: ModelPricing = {
@@ -12,31 +14,51 @@ const DEFAULT_MODEL_PRICING: ModelPricing = {
 
 const MODEL_PRICING: Record<string, ModelPricing> = {
   'anthropic/claude-3-5-haiku-latest': { inputPerMTok: 0.8, outputPerMTok: 4.0 },
-  'claude-3-5-haiku': { inputPerMTok: 0.8, outputPerMTok: 4.0 },
-  'anthropic/claude-haiku-4-5': { inputPerMTok: 0.8, outputPerMTok: 4.0 },
-  'claude-haiku-4-5': { inputPerMTok: 0.8, outputPerMTok: 4.0 },
-
+  // Opus 4.5/4.6/4.7 = $5/$25 (only the older Opus 4.1/4 line is $15/$75);
+  // Haiku 4.5 = $1/$5 (Haiku 3.5 retired stays $0.80/$4); Sonnet 4.x = $3/$15.
+  // Verified 2026-05 against platform.claude.com/docs/en/about-claude/pricing.
+  'anthropic/claude-haiku-4-5': { inputPerMTok: 1.0, outputPerMTok: 5.0 },
+  'anthropic/claude-haiku-4-5-20251001': { inputPerMTok: 1.0, outputPerMTok: 5.0 },
+  'anthropic/claude-opus-4-1-20250805': { inputPerMTok: 15.0, outputPerMTok: 75.0 },
+  'anthropic/claude-opus-4-20250514': { inputPerMTok: 15.0, outputPerMTok: 75.0 },
+  'anthropic/claude-opus-4-5': { inputPerMTok: 5.0, outputPerMTok: 25.0 },
+  'anthropic/claude-opus-4-5-20251101': { inputPerMTok: 5.0, outputPerMTok: 25.0 },
+  'anthropic/claude-opus-4-6': { inputPerMTok: 5.0, outputPerMTok: 25.0 },
+  'anthropic/claude-opus-4-7': { inputPerMTok: 5.0, outputPerMTok: 25.0 },
   'anthropic/claude-sonnet-4-20250514': { inputPerMTok: 3.0, outputPerMTok: 15.0 },
-  'claude-sonnet-4': { inputPerMTok: 3.0, outputPerMTok: 15.0 },
   'anthropic/claude-sonnet-4-5': { inputPerMTok: 3.0, outputPerMTok: 15.0 },
-  'claude-sonnet-4-5': { inputPerMTok: 3.0, outputPerMTok: 15.0 },
+  'anthropic/claude-sonnet-4-5-20250929': { inputPerMTok: 3.0, outputPerMTok: 15.0 },
   'anthropic/claude-sonnet-4-6': { inputPerMTok: 3.0, outputPerMTok: 15.0 },
+  'claude-3-5-haiku': { inputPerMTok: 0.8, outputPerMTok: 4.0 },
+  'claude-haiku-4-5': { inputPerMTok: 1.0, outputPerMTok: 5.0 },
+  'claude-haiku-4-5-20251001': { inputPerMTok: 1.0, outputPerMTok: 5.0 },
+  'claude-opus-4-1-20250805': { inputPerMTok: 15.0, outputPerMTok: 75.0 },
+  'claude-opus-4-20250514': { inputPerMTok: 15.0, outputPerMTok: 75.0 },
+  'claude-opus-4-5': { inputPerMTok: 5.0, outputPerMTok: 25.0 },
+  'claude-opus-4-5-20251101': { inputPerMTok: 5.0, outputPerMTok: 25.0 },
+  'claude-opus-4-6': { inputPerMTok: 5.0, outputPerMTok: 25.0 },
+  'claude-opus-4-7': { inputPerMTok: 5.0, outputPerMTok: 25.0 },
+  'claude-sonnet-4': { inputPerMTok: 3.0, outputPerMTok: 15.0 },
+  'claude-sonnet-4-20250514': { inputPerMTok: 3.0, outputPerMTok: 15.0 },
+  'claude-sonnet-4-5': { inputPerMTok: 3.0, outputPerMTok: 15.0 },
+  'claude-sonnet-4-5-20250929': { inputPerMTok: 3.0, outputPerMTok: 15.0 },
   'claude-sonnet-4-6': { inputPerMTok: 3.0, outputPerMTok: 15.0 },
 
-  'anthropic/claude-opus-4-5': { inputPerMTok: 15.0, outputPerMTok: 75.0 },
-  'claude-opus-4-5': { inputPerMTok: 15.0, outputPerMTok: 75.0 },
-  'anthropic/claude-opus-4-6': { inputPerMTok: 15.0, outputPerMTok: 75.0 },
-  'claude-opus-4-6': { inputPerMTok: 15.0, outputPerMTok: 75.0 },
-
-  // For non-Anthropic models where we only have one published blended estimate,
-  // apply the same rate for both input and output.
-  'groq/llama-3.1-8b-instant': { inputPerMTok: 0.05, outputPerMTok: 0.05 },
-  'groq/llama-3.3-70b-versatile': { inputPerMTok: 0.59, outputPerMTok: 0.59 },
-  'moonshot/kimi-k2.5': { inputPerMTok: 1.0, outputPerMTok: 1.0 },
-  'minimax/minimax-m2.1': { inputPerMTok: 0.3, outputPerMTok: 0.3 },
+  // Non-Anthropic providers — verified 2026-07-04:
+  // Groq https://groq.com/pricing; Moonshot Kimi K2.5 $0.60/$3.00
+  // (https://openrouter.ai/moonshotai/kimi-k2.5, Moonshot list price);
+  // MiniMax M2.1 $0.30/$1.20 (https://platform.minimax.io/docs/guides/pricing-paygo);
+  // Venice https://docs.venice.ai/overview/pricing.
+  'groq/llama-3.1-8b-instant': { inputPerMTok: 0.05, outputPerMTok: 0.08 },
+  'groq/llama-3.3-70b-versatile': { inputPerMTok: 0.59, outputPerMTok: 0.79 },
+  'minimax/minimax-m2.1': { inputPerMTok: 0.3, outputPerMTok: 1.2 },
+  'minimax/minimax-m3': { inputPerMTok: 0.6, outputPerMTok: 2.4, cacheReadPerMTok: 0.12, cacheWritePerMTok: null },
+  'minimax/minimax-m2.7': { inputPerMTok: 0.3, outputPerMTok: 1.2, cacheReadPerMTok: 0.06, cacheWritePerMTok: 0.375 },
+  'moonshot/kimi-k2.5': { inputPerMTok: 0.6, outputPerMTok: 3.0 },
   'ollama/deepseek-r1:14b': { inputPerMTok: 0.0, outputPerMTok: 0.0 },
-  'ollama/qwen2.5-coder:7b': { inputPerMTok: 0.0, outputPerMTok: 0.0 },
   'ollama/qwen2.5-coder:14b': { inputPerMTok: 0.0, outputPerMTok: 0.0 },
+  'ollama/qwen2.5-coder:7b': { inputPerMTok: 0.0, outputPerMTok: 0.0 },
+  'venice/llama-3.3-70b': { inputPerMTok: 0.7, outputPerMTok: 2.8 },
 }
 
 function normalizedModelName(modelName: string): string {

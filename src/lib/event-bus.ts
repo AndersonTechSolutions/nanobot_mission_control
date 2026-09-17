@@ -7,8 +7,17 @@ import { EventEmitter } from 'events'
 
 export interface ServerEvent {
   type: string
-  data: any
+  data: Record<string, unknown>
   timestamp: number
+}
+
+export interface WorkspaceEventData extends Record<string, unknown> {
+  workspace_id: number
+}
+
+export function eventBelongsToWorkspace(event: ServerEvent, workspaceId: number): boolean {
+  return typeof event.data?.workspace_id === 'number'
+    && event.data.workspace_id === workspaceId
 }
 
 // Event types emitted by the bus
@@ -32,7 +41,12 @@ export type EventType =
   | 'connection.created'
   | 'connection.disconnected'
   | 'github.synced'
-  | 'agent.lifecycle'
+  | 'run.created'
+  | 'run.updated'
+  | 'run.completed'
+  | 'run.eval_attached'
+  | 'task.escalated'
+  | 'session.updated'
 
 class ServerEventBus extends EventEmitter {
   private static instance: ServerEventBus | null = null
@@ -52,7 +66,7 @@ class ServerEventBus extends EventEmitter {
   /**
    * Broadcast an event to all SSE listeners
    */
-  broadcast(type: EventType, data: any): ServerEvent {
+  broadcast(type: EventType, data: WorkspaceEventData): ServerEvent {
     const event: ServerEvent = { type, data, timestamp: Date.now() }
     this.emit('server-event', event)
     return event

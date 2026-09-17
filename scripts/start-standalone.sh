@@ -4,6 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+. "$PROJECT_ROOT/scripts/load-env.sh"
 STANDALONE_DIR="$PROJECT_ROOT/.next/standalone"
 STANDALONE_NEXT_DIR="$STANDALONE_DIR/.next"
 STANDALONE_STATIC_DIR="$STANDALONE_NEXT_DIR/static"
@@ -30,4 +31,17 @@ if [[ -d "$SOURCE_PUBLIC_DIR" ]]; then
 fi
 
 cd "$STANDALONE_DIR"
+
+# Load .env as literal configuration if it exists (consistent with Docker).
+# NEXT_PUBLIC_* vars are already baked into the bundle at build time,
+# but server-side vars (AUTH_*, OPENCLAW_*, etc.) need this to take effect.
+if [[ -f "$PROJECT_ROOT/.env" ]]; then
+  load_env_file "$PROJECT_ROOT/.env"
+fi
+
+export MISSION_CONTROL_DATA_DIR="${MISSION_CONTROL_DATA_DIR:-$PROJECT_ROOT/.data}"
+
+# Next.js standalone server reads HOSTNAME to decide bind address.
+# Default to 0.0.0.0 so the server is accessible from outside the host.
+export HOSTNAME="${HOSTNAME:-0.0.0.0}"
 exec node server.js

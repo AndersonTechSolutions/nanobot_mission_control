@@ -1,7 +1,9 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
+import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
+import { apiFetch, ApiError } from '@/lib/api-client'
 import { useSmartPoll } from '@/lib/use-smart-poll'
 import { useMissionControl } from '@/store'
 
@@ -45,6 +47,37 @@ interface SchedulerTask {
   lastResult?: { ok: boolean; message: string; timestamp: number }
 }
 
+interface WebhookResult {
+  webhooks?: Webhook[]
+  secret?: string
+  success?: boolean
+  error?: string | null
+  duration_ms?: number
+  status_code?: number
+  [key: string]: unknown
+}
+
+interface SchedulerResult {
+  tasks?: SchedulerTask[]
+  ok?: boolean
+  error?: string
+  message?: string
+}
+
+function webhookErrorPayload<T>(error: unknown, fallback: T): T {
+  if (error instanceof ApiError && error.payload !== undefined) {
+    return error.payload as T
+  }
+  return fallback
+}
+
+function isWebhookTransportFailure(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    (error.code === 'NETWORK_ERROR' || error.code === 'PARSE_ERROR')
+  )
+}
+
 const AVAILABLE_EVENTS = [
   { value: '*', label: 'All events', description: 'Receive all event types' },
   { value: 'agent.error', label: 'Agent error', description: 'Agent enters error state' },
@@ -60,6 +93,7 @@ const AVAILABLE_EVENTS = [
 ]
 
 export function WebhookPanel() {
+  const t = useTranslations('webhooks')
   const { dashboardMode } = useMissionControl()
   const isLocalMode = dashboardMode === 'local'
   const [webhooks, setWebhooks] = useState<Webhook[]>([])
@@ -77,17 +111,12 @@ export function WebhookPanel() {
   const fetchWebhooks = useCallback(async () => {
     try {
       setLoading(true)
-      const res = await fetch('/api/webhooks')
-      if (!res.ok) {
-        const data = await res.json()
-        setError(data.error || 'Failed to fetch webhooks')
-        return
-      }
-      const data = await res.json()
+      const data = await apiFetch<WebhookResult>('/api/webhooks')
       setWebhooks(data.webhooks || [])
       setError('')
-    } catch {
-      setError('Network error')
+    } catch (err) {
+      const data = webhookErrorPayload<WebhookResult>(err, {})
+      setError(data.error || (isWebhookTransportFailure(err) ? 'Network error' : 'Failed to fetch webhooks'))
     } finally {
       setLoading(false)
     }
@@ -96,11 +125,10 @@ export function WebhookPanel() {
   const fetchDeliveries = useCallback(async () => {
     if (!selectedWebhook) return
     try {
-      const res = await fetch(`/api/webhooks/deliveries?webhook_id=${selectedWebhook}&limit=20`)
-      if (res.ok) {
-        const data = await res.json()
-        setDeliveries(data.deliveries || [])
-      }
+      const data = await apiFetch<{ deliveries?: Delivery[] }>(
+        `/api/webhooks/deliveries?webhook_id=${selectedWebhook}&limit=20`,
+      )
+      setDeliveries(data.deliveries || [])
     } catch { /* silent */ }
   }, [selectedWebhook])
 
@@ -110,9 +138,7 @@ export function WebhookPanel() {
       return
     }
     try {
-      const res = await fetch('/api/scheduler')
-      if (!res.ok) return
-      const data = await res.json()
+      const data = await apiFetch<SchedulerResult>('/api/scheduler')
       const tasks = Array.isArray(data.tasks) ? data.tasks : []
       const webhookTasks = tasks.filter((task: SchedulerTask) =>
         typeof task.id === 'string' && task.id.includes('webhook')
@@ -131,30 +157,37 @@ export function WebhookPanel() {
 
   async function handleCreate(form: { name: string; url: string; events: string[] }) {
     try {
-      const res = await fetch('/api/webhooks', {
+      const data = await apiFetch<WebhookResult>('/api/webhooks', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...form, generate_secret: true }),
       })
-      const data = await res.json()
-      if (!res.ok) { setError(data.error); return }
-      setNewSecret(data.secret)
+      setNewSecret(typeof data.secret === 'string' ? data.secret : null)
       setShowCreate(false)
       fetchWebhooks()
-    } catch { setError('Failed to create webhook') }
+    } catch (err) {
+      const data = webhookErrorPayload<WebhookResult>(err, {})
+      setError(data.error || 'Failed to create webhook')
+    }
   }
 
   async function handleToggle(id: number, enabled: boolean) {
-    await fetch('/api/webhooks', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, enabled }),
-    })
+    try {
+      await apiFetch('/api/webhooks', {
+        method: 'PUT',
+        body: JSON.stringify({ id, enabled }),
+      })
+    } catch (err) {
+      if (isWebhookTransportFailure(err)) return
+    }
     fetchWebhooks()
   }
 
   async function handleDelete(id: number) {
-    await fetch(`/api/webhooks?id=${id}`, { method: 'DELETE' })
+    try {
+      await apiFetch(`/api/webhooks?id=${id}`, { method: 'DELETE' })
+    } catch (err) {
+      if (isWebhookTransportFailure(err)) return
+    }
     if (selectedWebhook === id) setSelectedWebhook(null)
     fetchWebhooks()
   }
@@ -163,17 +196,19 @@ export function WebhookPanel() {
     setTestingId(id)
     setTestResult(null)
     try {
-      const res = await fetch('/api/webhooks/test', {
+      const data = await apiFetch<WebhookResult>('/api/webhooks/test', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id }),
       })
-      const data = await res.json()
       setTestResult(data)
       fetchWebhooks()
       if (selectedWebhook === id) fetchDeliveries()
-    } catch {
-      setTestResult({ error: 'Network error' })
+    } catch (err) {
+      setTestResult(webhookErrorPayload(err, { error: 'Network error' }))
+      if (!isWebhookTransportFailure(err)) {
+        fetchWebhooks()
+        if (selectedWebhook === id) fetchDeliveries()
+      }
     } finally {
       setTestingId(null)
     }
@@ -182,12 +217,12 @@ export function WebhookPanel() {
   async function handleRunAutomation(taskId: string) {
     setRunningAutomationId(taskId)
     try {
-      const res = await fetch('/api/scheduler', {
+      const res = await apiFetch<Response>('/api/scheduler', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ task_id: taskId }),
+        raw: true,
       })
-      const data = await res.json()
+      const data = (await res.json()) as SchedulerResult
       setTestResult({
         success: !!data.ok && res.ok,
         error: data.error || (!data.ok ? data.message : null),
@@ -195,8 +230,16 @@ export function WebhookPanel() {
         status_code: res.status,
       })
       await fetchWebhookAutomations()
-    } catch {
-      setTestResult({ success: false, error: 'Failed to run local automation' })
+    } catch (err) {
+      const data = webhookErrorPayload<SchedulerResult>(err, {})
+      setTestResult({
+        success: false,
+        error: data.error || data.message || 'Failed to run local automation',
+        status_code: err instanceof ApiError ? err.status : undefined,
+      })
+      if (err instanceof ApiError && !isWebhookTransportFailure(err)) {
+        await fetchWebhookAutomations()
+      }
     } finally {
       setRunningAutomationId(null)
     }
@@ -213,16 +256,16 @@ export function WebhookPanel() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-base font-semibold text-foreground">Webhooks</h2>
+          <h2 className="text-base font-semibold text-foreground">{t('title')}</h2>
           <p className="text-xs text-muted-foreground mt-0.5">
-            {webhooks.length} webhook{webhooks.length !== 1 ? 's' : ''} configured
+            {t('configured', { count: webhooks.length })}
           </p>
         </div>
         <Button
           onClick={() => setShowCreate(true)}
           size="sm"
         >
-          + Add Webhook
+          {t('addWebhook')}
         </Button>
       </div>
 
@@ -235,7 +278,7 @@ export function WebhookPanel() {
       {/* Secret reveal (after creation) */}
       {newSecret && (
         <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-4 space-y-2">
-          <p className="text-xs font-semibold text-amber-400">Webhook Secret (save now - shown only once)</p>
+          <p className="text-xs font-semibold text-amber-400">{t('secretLabel')}</p>
           <code className="block text-xs font-mono bg-secondary rounded px-2 py-1.5 text-foreground break-all select-all">
             {newSecret}
           </code>
@@ -244,7 +287,7 @@ export function WebhookPanel() {
             size="xs"
             onClick={() => setNewSecret(null)}
           >
-            Dismiss
+            {t('dismiss')}
           </Button>
         </div>
       )}
@@ -257,19 +300,19 @@ export function WebhookPanel() {
           <div className="flex items-center justify-between">
             <p className="text-xs font-semibold">
               {testResult.success ? (
-                <span className="text-green-400">Test successful</span>
+                <span className="text-green-400">{t('testSuccessful')}</span>
               ) : (
-                <span className="text-red-400">Test failed</span>
+                <span className="text-red-400">{t('testFailed')}</span>
               )}
             </p>
             <Button variant="link" size="xs" onClick={() => setTestResult(null)}>
-              Dismiss
+              {t('dismiss')}
             </Button>
           </div>
           <div className="text-xs text-muted-foreground space-y-0.5">
-            {testResult.status_code && <p>Status: <span className="font-mono">{testResult.status_code}</span></p>}
-            {testResult.duration_ms && <p>Duration: <span className="font-mono">{testResult.duration_ms}ms</span></p>}
-            {testResult.error && <p className="text-red-400">Error: {testResult.error}</p>}
+            {testResult.status_code && <p>{t('testStatus')} <span className="font-mono">{testResult.status_code}</span></p>}
+            {testResult.duration_ms && <p>{t('testDuration')} <span className="font-mono">{testResult.duration_ms}ms</span></p>}
+            {testResult.error && <p className="text-red-400">{t('testError')} {testResult.error}</p>}
           </div>
         </div>
       )}
@@ -286,9 +329,9 @@ export function WebhookPanel() {
       <div className="space-y-2">
         {isLocalMode && webhookAutomations.length > 0 && (
           <div className="rounded-lg border border-cyan-500/30 bg-cyan-500/5 p-3">
-            <h3 className="text-sm font-semibold text-cyan-200">Local Webhook Automations</h3>
+            <h3 className="text-sm font-semibold text-cyan-200">{t('localAutomations')}</h3>
             <p className="text-2xs text-cyan-300/80 mt-0.5 mb-2">
-              Local scheduler tasks that support webhook delivery and retries
+              {t('localAutomationsDesc')}
             </p>
             <div className="space-y-2">
               {webhookAutomations.map((task) => (
@@ -301,7 +344,7 @@ export function WebhookPanel() {
                         <span className="px-1.5 py-0.5 text-[10px] rounded bg-cyan-500/15 text-cyan-300 font-mono">{task.id}</span>
                       </div>
                       <div className="text-2xs text-muted-foreground mt-1">
-                        {task.nextRun ? `Next run ${formatTime(task.nextRun / 1000)}` : 'No next run scheduled'}
+                        {task.nextRun ? t('nextRun', { time: formatTime(task.nextRun / 1000) }) : t('noNextRun')}
                         {task.lastResult?.message ? ` · ${task.lastResult.message}` : ''}
                       </div>
                     </div>
@@ -312,7 +355,7 @@ export function WebhookPanel() {
                       disabled={runningAutomationId === task.id}
                       className="text-cyan-300 hover:text-cyan-200 hover:bg-cyan-500/10 text-2xs"
                     >
-                      {runningAutomationId === task.id ? 'Running...' : 'Run'}
+                      {runningAutomationId === task.id ? t('running') : t('run')}
                     </Button>
                   </div>
                 </div>
@@ -327,9 +370,9 @@ export function WebhookPanel() {
           </div>
         ) : webhooks.length === 0 ? (
           <div className="py-12 text-center">
-            <p className="text-xs text-muted-foreground">No webhooks configured</p>
+            <p className="text-xs text-muted-foreground">{t('noWebhooks')}</p>
             <p className="text-2xs text-muted-foreground/60 mt-1">
-              Add a webhook to receive HTTP notifications for events
+              {t('noWebhooksDesc')}
             </p>
           </div>
         ) : (
@@ -360,13 +403,13 @@ export function WebhookPanel() {
                   </div>
                   <p className="text-xs text-muted-foreground font-mono truncate mt-0.5">{wh.url}</p>
                   <div className="flex items-center gap-3 mt-1.5 text-2xs text-muted-foreground">
-                    <span>{wh.events.includes('*') ? 'All events' : `${wh.events.length} event${wh.events.length !== 1 ? 's' : ''}`}</span>
-                    <span>{wh.total_deliveries} deliveries</span>
+                    <span>{wh.events.includes('*') ? t('allEvents') : t('eventCount', { count: wh.events.length })}</span>
+                    <span>{t('deliveries', { count: wh.total_deliveries })}</span>
                     {wh.failed_deliveries > 0 && (
-                      <span className="text-red-400">{wh.failed_deliveries} failed</span>
+                      <span className="text-red-400">{t('failed', { count: wh.failed_deliveries })}</span>
                     )}
                     {wh.last_fired_at && (
-                      <span>Last fired {formatTime(wh.last_fired_at)}</span>
+                      <span>{t('lastFired', { time: formatTime(wh.last_fired_at) })}</span>
                     )}
                   </div>
                 </div>
@@ -377,10 +420,10 @@ export function WebhookPanel() {
                     size="xs"
                     onClick={() => handleTest(wh.id)}
                     disabled={testingId === wh.id}
-                    title="Send test event"
+                    title={t('sendTestEvent')}
                     className="text-2xs"
                   >
-                    {testingId === wh.id ? 'Testing...' : 'Test'}
+                    {testingId === wh.id ? t('testing') : t('test')}
                   </Button>
                   <Button
                     variant="ghost"
@@ -392,7 +435,7 @@ export function WebhookPanel() {
                         : 'text-green-400 hover:bg-green-500/10'
                     }`}
                   >
-                    {wh.enabled ? 'Disable' : 'Enable'}
+                    {wh.enabled ? t('disable') : t('enable')}
                   </Button>
                   <Button
                     variant="ghost"
@@ -400,7 +443,7 @@ export function WebhookPanel() {
                     onClick={() => handleDelete(wh.id)}
                     className="text-red-400 hover:bg-red-500/10 text-2xs"
                   >
-                    Delete
+                    {t('delete')}
                   </Button>
                 </div>
               </div>
@@ -408,9 +451,9 @@ export function WebhookPanel() {
               {/* Delivery log (expanded) */}
               {selectedWebhook === wh.id && (
                 <div className="mt-3 pt-3 border-t border-border space-y-2">
-                  <h4 className="text-xs font-semibold text-foreground">Recent Deliveries</h4>
+                  <h4 className="text-xs font-semibold text-foreground">{t('recentDeliveries')}</h4>
                   {deliveries.length === 0 ? (
-                    <p className="text-2xs text-muted-foreground">No deliveries recorded yet</p>
+                    <p className="text-2xs text-muted-foreground">{t('noDeliveries')}</p>
                   ) : (
                     <div className="space-y-1 max-h-60 overflow-y-auto">
                       {deliveries.map((d) => (
@@ -460,6 +503,7 @@ function CreateWebhookForm({
   onSubmit: (form: { name: string; url: string; events: string[] }) => void
   onCancel: () => void
 }) {
+  const t = useTranslations('webhooks')
   const [name, setName] = useState('')
   const [url, setUrl] = useState('')
   const [selectedEvents, setSelectedEvents] = useState<string[]>(['*'])
@@ -478,30 +522,30 @@ function CreateWebhookForm({
 
   return (
     <div className="rounded-lg border border-border p-4 space-y-3">
-      <h3 className="text-sm font-semibold text-foreground">New Webhook</h3>
+      <h3 className="text-sm font-semibold text-foreground">{t('newWebhook')}</h3>
 
       <div>
-        <label className="block text-xs text-muted-foreground mb-1">Name</label>
+        <label className="block text-xs text-muted-foreground mb-1">{t('formName')}</label>
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
           placeholder="e.g. Slack alerts"
-          className="w-full h-8 px-2.5 rounded-md bg-secondary border border-border text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+          className="w-full h-8 px-2.5 rounded-md bg-secondary border border-border text-sm text-foreground focus:outline-hidden focus:ring-1 focus:ring-primary"
         />
       </div>
 
       <div>
-        <label className="block text-xs text-muted-foreground mb-1">URL</label>
+        <label className="block text-xs text-muted-foreground mb-1">{t('formUrl')}</label>
         <input
           value={url}
           onChange={(e) => setUrl(e.target.value)}
           placeholder="https://hooks.slack.com/services/..."
-          className="w-full h-8 px-2.5 rounded-md bg-secondary border border-border text-sm text-foreground font-mono focus:outline-none focus:ring-1 focus:ring-primary"
+          className="w-full h-8 px-2.5 rounded-md bg-secondary border border-border text-sm text-foreground font-mono focus:outline-hidden focus:ring-1 focus:ring-primary"
         />
       </div>
 
       <div>
-        <label className="block text-xs text-muted-foreground mb-1.5">Events</label>
+        <label className="block text-xs text-muted-foreground mb-1.5">{t('formEvents')}</label>
         <div className="flex flex-wrap gap-1.5">
           {AVAILABLE_EVENTS.map((ev) => (
             <Button
@@ -526,7 +570,7 @@ function CreateWebhookForm({
           onClick={onCancel}
           className="flex-1"
         >
-          Cancel
+          {t('cancel')}
         </Button>
         <Button
           size="sm"
@@ -534,7 +578,7 @@ function CreateWebhookForm({
           disabled={!name || !url}
           className="flex-1"
         >
-          Create Webhook
+          {t('createWebhook')}
         </Button>
       </div>
     </div>

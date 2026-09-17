@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildGatewayWebSocketUrl } from '@/lib/gateway-url'
+import { buildGatewayPathFallbackUrls, buildGatewayWebSocketUrl } from '@/lib/gateway-url'
 
 describe('buildGatewayWebSocketUrl', () => {
   it('builds ws URL with host and port for local dev', () => {
@@ -40,6 +40,22 @@ describe('buildGatewayWebSocketUrl', () => {
       port: 18789,
       browserProtocol: 'https:',
     })).toBe('ws://127.0.0.1:18789')
+  })
+
+  it('downgrades http://localhost to ws://', () => {
+    expect(buildGatewayWebSocketUrl({
+      host: 'http://localhost:18789',
+      port: 18789,
+      browserProtocol: 'http:',
+    })).toBe('ws://localhost:18789')
+  })
+
+  it('preserves explicit wss:// on localhost (reverse-proxy TLS opt-in)', () => {
+    expect(buildGatewayWebSocketUrl({
+      host: 'wss://127.0.0.1:18789',
+      port: 18789,
+      browserProtocol: 'https:',
+    })).toBe('wss://127.0.0.1:18789')
   })
 
   it('omits 18789 for remote hosts on https browser context', () => {
@@ -96,5 +112,25 @@ describe('buildGatewayWebSocketUrl', () => {
       port: 9090,
       browserProtocol: 'http:',
     })).toBe('ws://gateway.example.com:9090')
+  })
+})
+
+describe('buildGatewayPathFallbackUrls', () => {
+  it('suggests common proxy websocket paths for root URLs', () => {
+    expect(buildGatewayPathFallbackUrls('wss://gateway.example.com')).toEqual([
+      'wss://gateway.example.com/gateway-ws',
+      'wss://gateway.example.com/gw',
+    ])
+  })
+
+  it('keeps token query params when generating fallbacks', () => {
+    expect(buildGatewayPathFallbackUrls('wss://gateway.example.com?token=abc')).toEqual([
+      'wss://gateway.example.com/gateway-ws?token=abc',
+      'wss://gateway.example.com/gw?token=abc',
+    ])
+  })
+
+  it('returns no fallbacks when URL already has a non-root path', () => {
+    expect(buildGatewayPathFallbackUrls('wss://gateway.example.com/gateway-ws')).toEqual([])
   })
 })

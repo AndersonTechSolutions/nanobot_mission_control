@@ -2,23 +2,15 @@ import crypto from 'node:crypto'
 import os from 'node:os'
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
+import { buildMissionControlCsp, buildNonceRequestHeaders } from '@/lib/csp'
+import { MC_SESSION_COOKIE_NAME, LEGACY_MC_SESSION_COOKIE_NAME } from '@/lib/session-cookie'
 
-/**
- * Constant-time string comparison using Node.js crypto.
- * Canonical implementation lives in src/lib/safe-compare.ts;
- * this is a local copy because proxy.ts runs in Next.js middleware
- * runtime which cannot import modules that pull in better-sqlite3.
- */
+/** Constant-time string comparison using Node.js crypto. */
 function safeCompare(a: string, b: string): boolean {
   if (typeof a !== 'string' || typeof b !== 'string') return false
   const bufA = Buffer.from(a)
   const bufB = Buffer.from(b)
-  if (bufA.length !== bufB.length) {
-    // Compare against dummy buffer to avoid timing leak on length mismatch
-    const dummy = Buffer.alloc(bufA.length)
-    crypto.timingSafeEqual(bufA, dummy)
-    return false
-  }
+  if (bufA.length !== bufB.length) return false
   return crypto.timingSafeEqual(bufA, bufB)
 }
 
@@ -92,7 +84,55 @@ function hostMatches(pattern: string, hostname: string): boolean {
   return h === p
 }
 
-function addSecurityHeaders(response: NextResponse, request: NextRequest): NextResponse {
+/** Normalize a host:port string by stripping default ports (80 for http, 443 for https). */
+function stripDefaultPort(host: string): string {
+  const h = host.toLowerCase()
+  if (h.endsWith(':443')) return h.slice(0, -4)
+  if (h.endsWith(':80')) return h.slice(0, -3)
+  return h
+}
+
+/**
+ * Compare a request host candidate with the Origin host for CSRF validation.
+ * Handles port mismatches caused by reverse proxies (e.g. Origin includes :8443
+ * but the Host header may have been rewritten or stripped by the proxy).
+ */
+function hostsMatchForCsrf(requestHost: string, originHost: string): boolean {
+  const a = normalizeHostname(requestHost)
+  const b = normalizeHostname(originHost)
+  if (!a || !b) return false
+  // Exact match first
+  if (a === b) return true
+  // Match after stripping default ports
+  return stripDefaultPort(a) === stripDefaultPort(b)
+}
+
+function nextResponseWithNonce(request: NextRequest, extraRequestHeaders?: Record<string, string>): { response: NextResponse; nonce: string } {
+  const nonce = crypto.randomBytes(16).toString('base64')
+  const googleEnabled = !!(process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || process.env.GOOGLE_CLIENT_ID)
+  const requestHeaders = buildNonceRequestHeaders({
+    headers: request.headers,
+    nonce,
+    googleEnabled,
+  })
+  // Never trust a client-supplied kiosk header; only this proxy may set it.
+  requestHeaders.delete('x-mc-kiosk-auth')
+  if (extraRequestHeaders) {
+    for (const [key, value] of Object.entries(extraRequestHeaders)) {
+      requestHeaders.set(key, value)
+    }
+  }
+  const response = NextResponse.next({
+    request: {
+      headers: requestHeaders,
+    },
+  })
+  // Debug log retained (commented) for future CSP/nonce flow troubleshooting.
+  // console.log(`[DEBUG csp] proxy generated nonce for ${request.nextUrl.pathname}: ${nonce.slice(0, 8)}...`)
+  return { response, nonce }
+}
+
+function addSecurityHeaders(response: NextResponse, _request: NextRequest, nonce?: string): NextResponse {
   const requestId = crypto.randomUUID()
   response.headers.set('X-Request-Id', requestId)
   response.headers.set('X-Content-Type-Options', 'nosniff')
@@ -100,17 +140,8 @@ function addSecurityHeaders(response: NextResponse, request: NextRequest): NextR
   response.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin')
 
   const googleEnabled = !!(process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || process.env.GOOGLE_CLIENT_ID)
-  const csp = [
-    `default-src 'self'`,
-    `script-src 'self' 'unsafe-inline' blob:${googleEnabled ? ' https://accounts.google.com' : ''}`,
-    `style-src 'self' 'unsafe-inline'`,
-    `connect-src 'self' ws: wss: http://127.0.0.1:* http://localhost:* https://cdn.jsdelivr.net`,
-    `img-src 'self' data: blob:${googleEnabled ? ' https://*.googleusercontent.com https://lh3.googleusercontent.com' : ''}`,
-    `font-src 'self' data:`,
-    `frame-src 'self'${googleEnabled ? ' https://accounts.google.com' : ''}`,
-    `worker-src 'self' blob:`,
-  ].join('; ')
-  response.headers.set('Content-Security-Policy', csp)
+  const effectiveNonce = nonce || crypto.randomBytes(16).toString('base64')
+  response.headers.set('Content-Security-Policy', buildMissionControlCsp({ nonce: effectiveNonce, googleEnabled }))
 
   return response
 }
@@ -136,14 +167,18 @@ export function proxy(request: NextRequest) {
   // In production: default-deny unless explicitly allowed.
   // In dev/test: allow all hosts unless overridden.
   const requestHosts = getRequestHostCandidates(request)
-  const allowAnyHost = envFlag('MC_ALLOW_ANY_HOST') || process.env.NODE_ENV !== 'production'
+  const allowAnyHost = envFlag('MC_ALLOW_ANY_HOST')
   const allowedPatterns = String(process.env.MC_ALLOWED_HOSTS || '')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean)
   const implicitAllowedHosts = getImplicitAllowedHosts()
 
-  const enforceAllowlist = !allowAnyHost && allowedPatterns.length > 0
+  // Production must fail closed: when MC_ALLOW_ANY_HOST is not set,
+  // only implicit local hosts plus any explicit MC_ALLOWED_HOSTS patterns are allowed.
+  // Non-production keeps current looser behavior (allow all unless MC_ALLOWED_HOSTS is set).
+  const isProduction = process.env.NODE_ENV === 'production'
+  const enforceAllowlist = isProduction ? !allowAnyHost : allowedPatterns.length > 0
   const isAllowedHost = !enforceAllowlist
     || requestHosts.some((hostName) =>
       implicitAllowedHosts.some((candidate) => hostMatches(candidate, hostName))
@@ -163,21 +198,14 @@ export function proxy(request: NextRequest) {
     if (origin) {
       let originHost: string
       try { originHost = new URL(origin).host } catch { originHost = '' }
-      const requestHost = request.headers.get('host')?.split(',')[0]?.trim()
-        || request.nextUrl.host
-        || ''
-      if (originHost && requestHost && originHost !== requestHost) {
+      if (originHost && !requestHosts.some((h) => hostsMatchForCsrf(h, originHost))) {
         return addSecurityHeaders(NextResponse.json({ error: 'CSRF origin mismatch' }, { status: 403 }), request)
       }
     }
   }
 
-  // Strip any client-supplied kiosk auth header — only proxy.ts is allowed to set it.
-  const incomingHeaders = new Headers(request.headers)
-  incomingHeaders.delete('x-mc-kiosk-auth')
-
-  // Kiosk: allow allowlisted office paths with valid ?token= to bypass session auth.
-  // Token is read from MC_OFFICE_TV_TOKEN. Compared with constant-time equality.
+  // Kiosk: allowlisted office paths with valid ?token= bypass session auth.
+  // Token is read from MC_OFFICE_TV_TOKEN and compared with constant-time equality.
   const KIOSK_TOKEN = process.env.MC_OFFICE_TV_TOKEN
   if (KIOSK_TOKEN && KIOSK_TOKEN.length > 0) {
     const isKioskPath =
@@ -189,21 +217,25 @@ export function proxy(request: NextRequest) {
     if (isKioskPath) {
       const provided = request.nextUrl.searchParams.get('token') || ''
       if (provided.length === KIOSK_TOKEN.length && safeCompare(provided, KIOSK_TOKEN)) {
-        incomingHeaders.set('x-mc-kiosk-auth', '1')
-        return NextResponse.next({ request: { headers: incomingHeaders } })
+        const { response, nonce } = nextResponseWithNonce(request, { 'x-mc-kiosk-auth': '1' })
+        return addSecurityHeaders(response, request, nonce)
       }
     }
   } else if (pathname === '/office/tv') {
-    return new NextResponse('Not Found', { status: 404 })
+    return addSecurityHeaders(new NextResponse('Not Found', { status: 404 }), request)
   }
 
-  // Allow login page, auth API, and docs without session
-  if (pathname === '/login' || pathname.startsWith('/api/auth/') || pathname === '/api/docs' || pathname === '/docs') {
-    return addSecurityHeaders(NextResponse.next({ request: { headers: incomingHeaders } }), request)
+  // Allow login, setup, auth API, docs, and container health probes without session
+  const isPublicHealthProbe = pathname === '/api/status' && request.nextUrl.searchParams.get('action') === 'health'
+  // Exact-match only (no prefix/wildcard) so this exempts just the two health routes.
+  const isPublicHealthRoute = pathname === '/api/health' || pathname === '/health'
+  if (pathname === '/login' || pathname === '/setup' || pathname.startsWith('/api/auth/') || pathname === '/api/setup' || pathname === '/api/docs' || pathname === '/docs' || isPublicHealthProbe || isPublicHealthRoute) {
+    const { response, nonce } = nextResponseWithNonce(request)
+    return addSecurityHeaders(response, request, nonce)
   }
 
   // Check for session cookie
-  const sessionToken = request.cookies.get('mc-session')?.value
+  const sessionToken = request.cookies.get(MC_SESSION_COOKIE_NAME)?.value || request.cookies.get(LEGACY_MC_SESSION_COOKIE_NAME)?.value
 
   // API routes: accept session cookie OR API key
   if (pathname.startsWith('/api/')) {
@@ -211,12 +243,15 @@ export function proxy(request: NextRequest) {
     const apiKey = extractApiKeyFromRequest(request)
     const hasValidApiKey = Boolean(configuredApiKey && apiKey && safeCompare(apiKey, configuredApiKey))
 
-    // Agent-scoped keys are validated in route auth (DB-backed) and should be
-    // allowed to pass through proxy auth gate.
-    const looksLikeAgentApiKey = /^mca_[a-f0-9]{48}$/i.test(apiKey)
+    // DB-backed keys (dashboard-rotated `mc_` global keys and `mca_` agent
+    // keys) are validated in route auth — the edge runtime cannot query
+    // SQLite, so the proxy only shape-checks them and lets route auth decide.
+    // Both formats are exactly 48 hex chars after the prefix.
+    const looksLikeDbBackedApiKey = /^mca?_[a-f0-9]{48}$/i.test(apiKey)
 
-    if (sessionToken || hasValidApiKey || looksLikeAgentApiKey) {
-      return addSecurityHeaders(NextResponse.next({ request: { headers: incomingHeaders } }), request)
+    if (sessionToken || hasValidApiKey || looksLikeDbBackedApiKey) {
+      const { response, nonce } = nextResponseWithNonce(request)
+      return addSecurityHeaders(response, request, nonce)
     }
 
     return addSecurityHeaders(NextResponse.json({ error: 'Unauthorized' }, { status: 401 }), request)
@@ -224,7 +259,8 @@ export function proxy(request: NextRequest) {
 
   // Page routes: redirect to login if no session
   if (sessionToken) {
-    return addSecurityHeaders(NextResponse.next({ request: { headers: incomingHeaders } }), request)
+    const { response, nonce } = nextResponseWithNonce(request)
+    return addSecurityHeaders(response, request, nonce)
   }
 
   // Redirect to login

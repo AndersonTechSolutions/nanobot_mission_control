@@ -1,11 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { config } from '@/lib/config'
 import { requireRole } from '@/lib/auth'
 import { mutationLimiter } from '@/lib/rate-limit'
-import { reflectPass, reweavePass, generateMOCs } from '@/lib/memory-utils'
+import { reflectPass, reweavePass, generateMOCs, gapDetectPass, consolidatePass } from '@/lib/memory-utils'
 import { logger } from '@/lib/logger'
-
-const MEMORY_PATH = config.memoryDir
+import { resolveWorkspaceMemoryAccess } from '@/lib/workspace-isolation'
 
 /**
  * Processing pipeline endpoint — runs knowledge maintenance operations.
@@ -23,7 +21,8 @@ export async function POST(request: NextRequest) {
   const rateCheck = mutationLimiter(request)
   if (rateCheck) return rateCheck
 
-  if (!MEMORY_PATH) {
+  const memoryAccess = resolveWorkspaceMemoryAccess(auth.user)
+  if (!memoryAccess) {
     return NextResponse.json({ error: 'Memory directory not configured' }, { status: 500 })
   }
 
@@ -32,17 +31,17 @@ export async function POST(request: NextRequest) {
     const { action } = body
 
     if (action === 'reflect') {
-      const result = await reflectPass(MEMORY_PATH)
+      const result = await reflectPass(memoryAccess.root)
       return NextResponse.json(result)
     }
 
     if (action === 'reweave') {
-      const result = await reweavePass(MEMORY_PATH)
+      const result = await reweavePass(memoryAccess.root)
       return NextResponse.json(result)
     }
 
     if (action === 'generate-moc') {
-      const mocs = await generateMOCs(MEMORY_PATH)
+      const mocs = await generateMOCs(memoryAccess.root)
       return NextResponse.json({
         action: 'generate-moc',
         groups: mocs,
@@ -51,7 +50,17 @@ export async function POST(request: NextRequest) {
       })
     }
 
-    return NextResponse.json({ error: 'Invalid action. Use: reflect, reweave, generate-moc' }, { status: 400 })
+    if (action === 'gap-detect') {
+      const result = await gapDetectPass(memoryAccess.root)
+      return NextResponse.json(result)
+    }
+
+    if (action === 'consolidate') {
+      const result = await consolidatePass(memoryAccess.root)
+      return NextResponse.json(result)
+    }
+
+    return NextResponse.json({ error: 'Invalid action. Use: reflect, reweave, generate-moc, gap-detect, consolidate' }, { status: 400 })
   } catch (err) {
     logger.error({ err }, 'Memory process API error')
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })

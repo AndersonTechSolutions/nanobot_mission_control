@@ -6,6 +6,7 @@ import { config } from '@/lib/config'
 import { requireRole } from '@/lib/auth'
 import { readLimiter } from '@/lib/rate-limit'
 import { logger } from '@/lib/logger'
+import { denyUnscopedResourceForStrictWorkspace } from '@/lib/workspace-isolation'
 
 interface AgentFileInfo {
   path: string
@@ -80,6 +81,9 @@ export async function GET(request: NextRequest) {
 
   const limited = readLimiter(request)
   if (limited) return limited
+
+  const isolationDenied = denyUnscopedResourceForStrictWorkspace(auth.user, 'runtime_memory', new URL(request.url).pathname)
+  if (isolationDenied) return isolationDenied
 
   if (!memoryDbDir || !existsSync(memoryDbDir)) {
     return NextResponse.json(

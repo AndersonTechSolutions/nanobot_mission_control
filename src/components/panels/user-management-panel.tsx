@@ -2,7 +2,9 @@
 
 import Image from 'next/image'
 import { useState, useEffect, useCallback } from 'react'
+import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
+import { apiFetch, ApiError } from '@/lib/api-client'
 import { useMissionControl } from '@/store'
 
 interface UserRecord {
@@ -35,6 +37,23 @@ interface AccessRequest {
   approved_user_id?: number | null
 }
 
+interface UserMutationResult {
+  error?: string
+}
+
+function userAdminError(error: unknown): string | null {
+  if (
+    error instanceof ApiError &&
+    error.payload !== null &&
+    typeof error.payload === 'object' &&
+    'error' in error.payload &&
+    typeof (error.payload as { error?: unknown }).error === 'string'
+  ) {
+    return (error.payload as { error: string }).error
+  }
+  return null
+}
+
 const roleColors: Record<string, string> = {
   admin: 'bg-red-500/20 text-red-400',
   operator: 'bg-blue-500/20 text-blue-400',
@@ -42,6 +61,7 @@ const roleColors: Record<string, string> = {
 }
 
 export function UserManagementPanel() {
+  const t = useTranslations('userManagement')
   const { currentUser } = useMissionControl()
   const [users, setUsers] = useState<UserRecord[]>([])
   const [requests, setRequests] = useState<AccessRequest[]>([])
@@ -68,35 +88,33 @@ export function UserManagementPanel() {
 
   const fetchAll = useCallback(async () => {
     try {
-      const [uRes, rRes] = await Promise.all([
-        fetch('/api/auth/users', { cache: 'no-store' }),
-        fetch('/api/auth/access-requests?status=all', { cache: 'no-store' }),
+      const [uJson, rJson] = await Promise.all([
+        apiFetch<{ users?: UserRecord[] }>('/api/auth/users', { cache: 'no-store' }),
+        apiFetch<{ requests?: AccessRequest[] }>('/api/auth/access-requests?status=all', {
+          cache: 'no-store',
+        }),
       ])
-
-      if (uRes.status === 403 || rRes.status === 403) {
-        setError('Admin access required')
-        return
-      }
-
-      const uJson = await uRes.json().catch(() => ({}))
-      const rJson = await rRes.json().catch(() => ({}))
 
       setUsers(Array.isArray(uJson?.users) ? uJson.users : [])
       setRequests(Array.isArray(rJson?.requests) ? rJson.requests : [])
       setError(null)
-    } catch {
-      setError('Failed to load users')
+    } catch (err) {
+      setError(
+        err instanceof ApiError && err.status === 403
+          ? t('adminAccessRequired')
+          : t('failedToLoadUsers'),
+      )
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [t])
 
   useEffect(() => { fetchAll() }, [fetchAll])
 
   const pendingRequests = requests.filter((r) => r.status === 'pending')
 
   const formatDate = (ts: number | null | undefined) => {
-    if (!ts) return 'Never'
+    if (!ts) return t('never')
     return new Date(ts * 1000).toLocaleString()
   }
 
@@ -104,22 +122,23 @@ export function UserManagementPanel() {
     if (!createForm.username || !createForm.password) return
     setCreating(true)
     try {
-      const res = await fetch('/api/auth/users', {
+      await apiFetch<UserMutationResult>('/api/auth/users', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(createForm),
       })
-      const data = await res.json().catch(() => ({}))
-      if (res.ok) {
-        showFeedback(true, `Created user "${createForm.username}"`)
-        setShowCreate(false)
-        setCreateForm({ username: '', password: '', display_name: '', role: 'operator' })
-        fetchAll()
-      } else {
-        showFeedback(false, data.error || 'Failed to create user')
-      }
-    } catch {
-      showFeedback(false, 'Network error')
+      showFeedback(true, t('createdUser', { username: createForm.username }))
+      setShowCreate(false)
+      setCreateForm({ username: '', password: '', display_name: '', role: 'operator' })
+      fetchAll()
+    } catch (err) {
+      showFeedback(
+        false,
+        userAdminError(err) ||
+          (err instanceof ApiError &&
+          (err.code === 'NETWORK_ERROR' || err.code === 'PARSE_ERROR')
+            ? t('networkError')
+            : t('failedToCreate')),
+      )
     } finally {
       setCreating(false)
     }
@@ -134,26 +153,32 @@ export function UserManagementPanel() {
     if (!editingId) return
     setSaving(true)
     try {
-      const body: any = { id: editingId }
+      const body: {
+        id: number
+        display_name?: string
+        role?: 'admin' | 'operator' | 'viewer'
+        password?: string
+      } = { id: editingId }
       if (editForm.display_name) body.display_name = editForm.display_name
       if (editForm.role) body.role = editForm.role
       if (editForm.password) body.password = editForm.password
 
-      const res = await fetch('/api/auth/users', {
+      await apiFetch<UserMutationResult>('/api/auth/users', {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       })
-      const data = await res.json().catch(() => ({}))
-      if (res.ok) {
-        showFeedback(true, 'User updated')
-        setEditingId(null)
-        fetchAll()
-      } else {
-        showFeedback(false, data.error || 'Failed to update')
-      }
-    } catch {
-      showFeedback(false, 'Network error')
+      showFeedback(true, t('userUpdated'))
+      setEditingId(null)
+      fetchAll()
+    } catch (err) {
+      showFeedback(
+        false,
+        userAdminError(err) ||
+          (err instanceof ApiError &&
+          (err.code === 'NETWORK_ERROR' || err.code === 'PARSE_ERROR')
+            ? t('networkError')
+            : t('failedToUpdate')),
+      )
     } finally {
       setSaving(false)
     }
@@ -162,25 +187,29 @@ export function UserManagementPanel() {
   const handleDelete = async (u: UserRecord) => {
     if (u.id === currentUser?.id) return
     try {
-      const res = await fetch(`/api/auth/users?id=${u.id}`, { method: 'DELETE' })
-      const data = await res.json().catch(() => ({}))
-      if (res.ok) {
-        showFeedback(true, `Deleted user "${u.username}"`)
-        fetchAll()
-      } else {
-        showFeedback(false, data.error || 'Failed to delete')
-      }
-    } catch {
-      showFeedback(false, 'Network error')
+      await apiFetch<UserMutationResult>('/api/auth/users', {
+        method: 'DELETE',
+        body: JSON.stringify({ id: u.id }),
+      })
+      showFeedback(true, t('deletedUser', { username: u.username }))
+      fetchAll()
+    } catch (err) {
+      showFeedback(
+        false,
+        userAdminError(err) ||
+          (err instanceof ApiError &&
+          (err.code === 'NETWORK_ERROR' || err.code === 'PARSE_ERROR')
+            ? t('networkError')
+            : t('failedToDelete')),
+      )
     }
   }
 
   const submitReview = async (requestId: number, action: 'approve' | 'reject') => {
     setProcessingRequestId(requestId)
     try {
-      const res = await fetch('/api/auth/access-requests', {
+      await apiFetch<UserMutationResult>('/api/auth/access-requests', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           request_id: requestId,
           action,
@@ -188,15 +217,17 @@ export function UserManagementPanel() {
           note: reviewForm.note || undefined,
         }),
       })
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(data.error || `Failed to ${action} request`)
       const req = requests.find(r => r.id === requestId)
-      showFeedback(true, `Request ${action}d for ${req?.email || 'user'}`)
+      showFeedback(true, t('requestActioned', { action, email: req?.email || t('user') }))
       setReviewingRequestId(null)
       setReviewForm({ role: 'viewer', note: '' })
       await fetchAll()
-    } catch (e: any) {
-      showFeedback(false, e?.message || `Failed to ${action} request`)
+    } catch (err) {
+      showFeedback(
+        false,
+        userAdminError(err) ||
+          (err instanceof Error ? err.message : t('failedToAction', { action })),
+      )
     } finally {
       setProcessingRequestId(null)
     }
@@ -205,8 +236,8 @@ export function UserManagementPanel() {
   if (currentUser?.role !== 'admin') {
     return (
       <div className="p-8 text-center">
-        <div className="text-lg font-semibold text-foreground mb-2">Access Denied</div>
-        <p className="text-sm text-muted-foreground">User management requires admin privileges.</p>
+        <div className="text-lg font-semibold text-foreground mb-2">{t('accessDenied')}</div>
+        <p className="text-sm text-muted-foreground">{t('adminRequired')}</p>
       </div>
     )
   }
@@ -215,7 +246,7 @@ export function UserManagementPanel() {
     return (
       <div className="p-8 text-center">
         <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse mx-auto mb-2" />
-        <span className="text-sm text-muted-foreground">Loading users...</span>
+        <span className="text-sm text-muted-foreground">{t('loadingUsers')}</span>
       </div>
     )
   }
@@ -228,14 +259,14 @@ export function UserManagementPanel() {
     <div className="p-6 max-w-5xl mx-auto space-y-5">
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-lg font-semibold text-foreground">Users</h2>
-          <p className="text-sm text-muted-foreground">{users.length} registered users · {pendingRequests.length} pending approvals</p>
+          <h2 className="text-lg font-semibold text-foreground">{t('usersTitle')}</h2>
+          <p className="text-sm text-muted-foreground">{t('usersSummary', { count: users.length, pending: pendingRequests.length })}</p>
         </div>
         <Button
           onClick={() => setShowCreate(!showCreate)}
           size="sm"
         >
-          {showCreate ? 'Cancel' : '+ Add Local User'}
+          {showCreate ? t('cancel') : t('addLocalUser')}
         </Button>
       </div>
 
@@ -250,17 +281,17 @@ export function UserManagementPanel() {
           <div className="px-4 py-3 bg-amber-500/10 border-b border-amber-500/20 flex items-center gap-2">
             <div className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
             <span className="text-sm font-medium text-amber-200">
-              {pendingRequests.length} Pending Access Request{pendingRequests.length !== 1 ? 's' : ''}
+              {t('pendingRequests', { count: pendingRequests.length })}
             </span>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
                 <tr className="bg-secondary/40 border-b border-border">
-                  <th className="text-left px-3 py-2 text-xs text-muted-foreground">Identity</th>
-                  <th className="text-left px-3 py-2 text-xs text-muted-foreground">Attempts</th>
-                  <th className="text-left px-3 py-2 text-xs text-muted-foreground">Last Attempt</th>
-                  <th className="text-right px-3 py-2 text-xs text-muted-foreground">Action</th>
+                  <th className="text-left px-3 py-2 text-xs text-muted-foreground">{t('identity')}</th>
+                  <th className="text-left px-3 py-2 text-xs text-muted-foreground">{t('attempts')}</th>
+                  <th className="text-left px-3 py-2 text-xs text-muted-foreground">{t('lastAttempt')}</th>
+                  <th className="text-right px-3 py-2 text-xs text-muted-foreground">{t('action')}</th>
                 </tr>
               </thead>
               <tbody>
@@ -299,14 +330,14 @@ export function UserManagementPanel() {
                             onChange={(e) => setReviewForm(f => ({ ...f, role: e.target.value as any }))}
                             className="h-7 px-2 rounded bg-secondary border border-border text-xs text-foreground"
                           >
-                            <option value="viewer">Viewer</option>
-                            <option value="operator">Operator</option>
-                            <option value="admin">Admin</option>
+                            <option value="viewer">{t('roleViewer')}</option>
+                            <option value="operator">{t('roleOperator')}</option>
+                            <option value="admin">{t('roleAdmin')}</option>
                           </select>
                           <input
                             value={reviewForm.note}
                             onChange={(e) => setReviewForm(f => ({ ...f, note: e.target.value }))}
-                            placeholder="Note (optional)"
+                            placeholder={t('noteOptional')}
                             className="h-7 px-2 rounded bg-secondary border border-border text-xs text-foreground w-32"
                           />
                           <Button
@@ -315,7 +346,7 @@ export function UserManagementPanel() {
                             variant="success"
                             size="xs"
                           >
-                            {processingRequestId === req.id ? '...' : 'Confirm'}
+                            {processingRequestId === req.id ? '...' : t('confirm')}
                           </Button>
                           <Button
                             onClick={() => submitReview(req.id, 'reject')}
@@ -323,14 +354,14 @@ export function UserManagementPanel() {
                             variant="destructive"
                             size="xs"
                           >
-                            Reject
+                            {t('reject')}
                           </Button>
                           <Button
                             onClick={() => { setReviewingRequestId(null); setReviewForm({ role: 'viewer', note: '' }) }}
                             variant="ghost"
                             size="xs"
                           >
-                            Cancel
+                            {t('cancel')}
                           </Button>
                         </div>
                       ) : (
@@ -341,7 +372,7 @@ export function UserManagementPanel() {
                             variant="success"
                             size="xs"
                           >
-                            Review
+                            {t('review')}
                           </Button>
                           <Button
                             onClick={() => submitReview(req.id, 'reject')}
@@ -349,7 +380,7 @@ export function UserManagementPanel() {
                             variant="destructive"
                             size="xs"
                           >
-                            Reject
+                            {t('reject')}
                           </Button>
                         </div>
                       )}
@@ -364,20 +395,20 @@ export function UserManagementPanel() {
 
       {showCreate && (
         <div className="p-4 rounded-lg bg-secondary/50 border border-border space-y-3">
-          <h3 className="text-sm font-medium text-foreground">New Local User</h3>
+          <h3 className="text-sm font-medium text-foreground">{t('newLocalUser')}</h3>
           <div className="grid grid-cols-2 gap-3">
-            <input value={createForm.username} onChange={(e) => setCreateForm((f) => ({ ...f, username: e.target.value }))} placeholder="Username" className="h-9 px-3 rounded-md bg-secondary border border-border text-sm text-foreground" />
-            <input type="password" value={createForm.password} onChange={(e) => setCreateForm((f) => ({ ...f, password: e.target.value }))} placeholder="Password" className="h-9 px-3 rounded-md bg-secondary border border-border text-sm text-foreground" />
-            <input value={createForm.display_name} onChange={(e) => setCreateForm((f) => ({ ...f, display_name: e.target.value }))} placeholder="Display name" className="h-9 px-3 rounded-md bg-secondary border border-border text-sm text-foreground" />
+            <input value={createForm.username} onChange={(e) => setCreateForm((f) => ({ ...f, username: e.target.value }))} placeholder={t('username')} className="h-9 px-3 rounded-md bg-secondary border border-border text-sm text-foreground" />
+            <input type="password" value={createForm.password} onChange={(e) => setCreateForm((f) => ({ ...f, password: e.target.value }))} placeholder={t('password')} className="h-9 px-3 rounded-md bg-secondary border border-border text-sm text-foreground" />
+            <input value={createForm.display_name} onChange={(e) => setCreateForm((f) => ({ ...f, display_name: e.target.value }))} placeholder={t('displayName')} className="h-9 px-3 rounded-md bg-secondary border border-border text-sm text-foreground" />
             <select value={createForm.role} onChange={(e) => setCreateForm((f) => ({ ...f, role: e.target.value as any }))} className="h-9 px-3 rounded-md bg-secondary border border-border text-sm text-foreground">
-              <option value="viewer">Viewer</option>
-              <option value="operator">Operator</option>
-              <option value="admin">Admin</option>
+              <option value="viewer">{t('roleViewer')}</option>
+              <option value="operator">{t('roleOperator')}</option>
+              <option value="admin">{t('roleAdmin')}</option>
             </select>
           </div>
           <div className="flex justify-end">
             <Button onClick={handleCreate} disabled={!createForm.username || !createForm.password || creating} size="sm">
-              {creating ? 'Creating...' : 'Create User'}
+              {creating ? t('creating') : t('createUser')}
             </Button>
           </div>
         </div>
@@ -387,11 +418,11 @@ export function UserManagementPanel() {
         <table className="w-full">
           <thead>
             <tr className="bg-secondary/50 border-b border-border">
-              <th className="text-left px-4 py-2.5 text-xs font-medium text-muted-foreground">User</th>
-              <th className="text-left px-4 py-2.5 text-xs font-medium text-muted-foreground">Provider</th>
-              <th className="text-left px-4 py-2.5 text-xs font-medium text-muted-foreground">Role</th>
-              <th className="text-left px-4 py-2.5 text-xs font-medium text-muted-foreground hidden md:table-cell">Last Login</th>
-              <th className="text-right px-4 py-2.5 text-xs font-medium text-muted-foreground">Actions</th>
+              <th className="text-left px-4 py-2.5 text-xs font-medium text-muted-foreground">{t('colUser')}</th>
+              <th className="text-left px-4 py-2.5 text-xs font-medium text-muted-foreground">{t('colProvider')}</th>
+              <th className="text-left px-4 py-2.5 text-xs font-medium text-muted-foreground">{t('colRole')}</th>
+              <th className="text-left px-4 py-2.5 text-xs font-medium text-muted-foreground hidden md:table-cell">{t('colLastLogin')}</th>
+              <th className="text-right px-4 py-2.5 text-xs font-medium text-muted-foreground">{t('colActions')}</th>
             </tr>
           </thead>
           <tbody>
@@ -405,17 +436,17 @@ export function UserManagementPanel() {
                     <td className="px-4 py-2.5 text-xs text-muted-foreground">{u.provider || 'local'}</td>
                     <td className="px-4 py-2.5">
                       <select value={editForm.role} onChange={(e) => setEditForm((f) => ({ ...f, role: e.target.value as any }))} className="h-8 px-2 rounded bg-secondary border border-border text-sm text-foreground" disabled={u.id === currentUser?.id}>
-                        <option value="viewer">Viewer</option>
-                        <option value="operator">Operator</option>
-                        <option value="admin">Admin</option>
+                        <option value="viewer">{t('roleViewer')}</option>
+                        <option value="operator">{t('roleOperator')}</option>
+                        <option value="admin">{t('roleAdmin')}</option>
                       </select>
                     </td>
                     <td className="px-4 py-2.5 hidden md:table-cell">
-                      <input type="password" value={editForm.password} onChange={(e) => setEditForm((f) => ({ ...f, password: e.target.value }))} placeholder="New password (optional)" className="h-8 px-2 rounded bg-secondary border border-border text-sm text-foreground w-full" disabled={(u.provider || 'local') !== 'local'} />
+                      <input type="password" value={editForm.password} onChange={(e) => setEditForm((f) => ({ ...f, password: e.target.value }))} placeholder={t('newPasswordOptional')} className="h-8 px-2 rounded bg-secondary border border-border text-sm text-foreground w-full" disabled={(u.provider || 'local') !== 'local'} />
                     </td>
                     <td className="px-4 py-2.5 text-right space-x-2">
-                      <Button onClick={handleEdit} disabled={saving} size="xs">Save</Button>
-                      <Button onClick={() => setEditingId(null)} variant="outline" size="xs">Cancel</Button>
+                      <Button onClick={handleEdit} disabled={saving} size="xs">{t('save')}</Button>
+                      <Button onClick={() => setEditingId(null)} variant="outline" size="xs">{t('cancel')}</Button>
                     </td>
                   </>
                 ) : (
@@ -448,9 +479,9 @@ export function UserManagementPanel() {
                     </td>
                     <td className="px-4 py-2.5 text-xs text-muted-foreground hidden md:table-cell">{formatDate(u.last_login_at)}</td>
                     <td className="px-4 py-2.5 text-right space-x-2">
-                      <Button onClick={() => startEdit(u)} variant="outline" size="xs">Edit</Button>
+                      <Button onClick={() => startEdit(u)} variant="outline" size="xs">{t('edit')}</Button>
                       {u.id !== currentUser?.id && (
-                        <Button onClick={() => handleDelete(u)} variant="destructive" size="xs">Delete</Button>
+                        <Button onClick={() => handleDelete(u)} variant="destructive" size="xs">{t('delete')}</Button>
                       )}
                     </td>
                   </>

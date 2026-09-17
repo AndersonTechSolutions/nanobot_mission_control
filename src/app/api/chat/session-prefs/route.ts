@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getDatabase } from '@/lib/db'
 import { requireRole } from '@/lib/auth'
 import { logger } from '@/lib/logger'
+import { denyUnscopedResourceForStrictWorkspace } from '@/lib/workspace-isolation'
 
 const PREFS_KEY = 'chat.session_prefs.v1'
 const ALLOWED_COLORS = new Set(['slate', 'blue', 'green', 'amber', 'red', 'purple', 'pink', 'teal'])
@@ -48,6 +49,8 @@ function savePrefs(prefs: SessionPrefs, username: string) {
 export async function GET(request: NextRequest) {
   const auth = requireRole(request, 'viewer')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDenied = denyUnscopedResourceForStrictWorkspace(auth.user, 'session_preferences', new URL(request.url).pathname)
+  if (isolationDenied) return isolationDenied
 
   try {
     return NextResponse.json({ prefs: loadPrefs() })
@@ -64,6 +67,8 @@ export async function GET(request: NextRequest) {
 export async function PATCH(request: NextRequest) {
   const auth = requireRole(request, 'operator')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
+  const isolationDenied = denyUnscopedResourceForStrictWorkspace(auth.user, 'session_preferences', new URL(request.url).pathname)
+  if (isolationDenied) return isolationDenied
 
   try {
     const body = await request.json().catch(() => ({}))

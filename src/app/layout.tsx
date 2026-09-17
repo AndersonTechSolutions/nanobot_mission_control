@@ -1,19 +1,24 @@
 import type { Metadata, Viewport } from 'next'
 import { Inter, JetBrains_Mono } from 'next/font/google'
+import { headers } from 'next/headers'
 import { ThemeProvider } from 'next-themes'
+import { NextIntlClientProvider } from 'next-intl'
+import { getLocale, getMessages } from 'next-intl/server'
 import { THEME_IDS } from '@/lib/themes'
 import { ThemeBackground } from '@/components/ui/theme-background'
+import { AuthExpiredListener } from '@/components/auth-expired-listener'
+import { ToastProvider } from '@/components/ui/toast-provider'
 import './globals.css'
 
 const inter = Inter({
   subsets: ['latin'],
-  variable: '--font-sans',
+  variable: '--font-inter',
   display: 'swap',
 })
 
 const jetbrainsMono = JetBrains_Mono({
   subsets: ['latin'],
-  variable: '--font-mono',
+  variable: '--font-jetbrains-mono',
   display: 'swap',
 })
 
@@ -49,8 +54,8 @@ export const viewport: Viewport = {
 }
 
 export const metadata: Metadata = {
-  title: 'Mission Control',
-  description: 'Nanobot Mission Control Dashboard',
+  title: 'Nanobot Mission Control',
+  description: 'Nanobot Mission Control Dashboard — agent orchestration, office layout, and fleet monitoring.',
   metadataBase,
   icons: {
     icon: [
@@ -61,14 +66,16 @@ export const metadata: Metadata = {
     shortcut: ['/icon.png'],
   },
   openGraph: {
-    title: 'Mission Control',
-    description: 'Nanobot Mission Control Dashboard',
-    images: [{ url: '/brand/mc-logo-512.png', width: 512, height: 512, alt: 'Mission Control logo' }],
+    title: 'Mission Control — AI Agent Orchestration Dashboard',
+    description: 'Open-source dashboard for AI agent orchestration. Manage agent fleets, dispatch tasks, track costs, and coordinate multi-agent workflows.',
+    images: [{ url: '/brand/mc-logo-512.png', width: 512, height: 512, alt: 'Mission Control — open-source AI agent orchestration dashboard' }],
+    type: 'website',
+    siteName: 'Mission Control',
   },
   twitter: {
-    card: 'summary',
-    title: 'Mission Control',
-    description: 'Nanobot Mission Control Dashboard',
+    card: 'summary_large_image',
+    title: 'Mission Control — AI Agent Orchestration Dashboard',
+    description: 'Open-source dashboard for AI agent orchestration. Manage agent fleets, dispatch tasks, track costs, and coordinate multi-agent workflows.',
     images: ['/brand/mc-logo-512.png'],
   },
   appleWebApp: {
@@ -78,35 +85,49 @@ export const metadata: Metadata = {
   },
 }
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: {
   children: React.ReactNode
 }) {
+  const nonce = (await headers()).get('x-nonce') || undefined
+  const locale = await getLocale()
+  const messages = await getMessages()
+
+  // Debug log retained (commented) for future CSP/nonce flow troubleshooting.
+  // console.log('[DEBUG csp] layout nonce from x-nonce header:', nonce ? `${nonce.slice(0, 8)}...` : '(MISSING)')
+
   return (
-    <html lang="en" className="dark" suppressHydrationWarning>
+    <html lang={locale} dir={locale === 'ar' ? 'rtl' : 'ltr'} className="dark" suppressHydrationWarning>
       <head>
         {/* Blocking script to set 'dark' class before first paint, preventing FOUC.
             Content is a static string literal — no user input, no XSS vector. */}
         <script
+          nonce={nonce}
           dangerouslySetInnerHTML={{
             __html: `(function(){try{var t=localStorage.getItem('theme')||'void';var light=['light','paper'];if(light.indexOf(t)===-1)document.documentElement.classList.add('dark')}catch(e){}})()`,
           }}
         />
       </head>
       <body className={`${inter.variable} ${jetbrainsMono.variable} font-sans antialiased`} suppressHydrationWarning>
-        <ThemeProvider
-          attribute="class"
-          defaultTheme="void"
-          themes={THEME_IDS}
-          enableSystem={false}
-          disableTransitionOnChange
-        >
-          <ThemeBackground />
-          <div className="h-screen overflow-hidden bg-background text-foreground">
-            {children}
-          </div>
-        </ThemeProvider>
+        <NextIntlClientProvider messages={messages}>
+          <ThemeProvider
+            attribute="class"
+            defaultTheme="void"
+            themes={THEME_IDS}
+            enableSystem={false}
+            disableTransitionOnChange
+            nonce={nonce}
+          >
+            <ThemeBackground />
+            <AuthExpiredListener />
+            <ToastProvider>
+            <div className="h-screen overflow-hidden bg-background text-foreground">
+              {children}
+            </div>
+            </ToastProvider>
+          </ThemeProvider>
+        </NextIntlClientProvider>
       </body>
     </html>
   )

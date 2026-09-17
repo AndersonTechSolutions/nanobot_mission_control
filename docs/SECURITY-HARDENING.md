@@ -105,7 +105,7 @@ Mission Control sets these headers automatically:
 
 | Header | Value |
 |--------|-------|
-| `Content-Security-Policy` | `default-src 'self'; script-src 'self' 'unsafe-inline' 'nonce-...'` |
+| `Content-Security-Policy` | `default-src 'self'; script-src 'self' 'nonce-<per-request>' 'strict-dynamic'; style-src 'self' 'nonce-<per-request>'` |
 | `X-Frame-Options` | `DENY` |
 | `X-Content-Type-Options` | `nosniff` |
 | `Referrer-Policy` | `strict-origin-when-cross-origin` |
@@ -174,6 +174,31 @@ MC_RETAIN_PIPELINE_RUNS_DAYS=90    # Pipeline logs
 MC_RETAIN_TOKEN_USAGE_DAYS=90      # Token/cost records
 MC_RETAIN_GATEWAY_SESSIONS_DAYS=90 # Gateway session history
 ```
+
+### 11. Runtime Installer Integrity
+
+Dashboard-triggered OpenClaw and Hermes installations execute third-party
+shell installers. Local runtime installation is disabled by default. Enable it
+only after reviewing the source and rollback path. Mission Control also
+requires an operator-approved SHA-256 digest before either remote script can
+run:
+
+```env
+MC_ENABLE_RUNTIME_INSTALLS=1
+MC_OPENCLAW_INSTALLER_SHA256=<64 lowercase hex characters>
+MC_HERMES_INSTALLER_SHA256=<64 lowercase hex characters>
+# Required only for per-user installs from the super-admin organization flow:
+MC_OPENCLAW_GIT_COMMIT=<reviewed 40-character commit SHA>
+MC_CLAUDE_CODE_VERSION=<exact semver>
+MC_CODEX_VERSION=<exact semver>
+```
+
+Download the installer separately through a trusted channel, inspect it, and
+calculate its digest with `sha256sum install.sh` (Linux) or
+`shasum -a 256 install.sh` (macOS). If the publisher changes the installer,
+the dashboard install fails closed until you review the new bytes and update
+the configured digest. Regex and optional AI review remain defense-in-depth;
+they do not replace provenance verification.
 
 ---
 
@@ -275,3 +300,83 @@ Internet
 - Mission Control listens on localhost or a private network
 - OpenClaw Gateway is bound to loopback only
 - Agent workspaces are isolated per-agent directories
+
+---
+
+## Agent Auth: Least-Privilege Key Guidance
+
+### The Problem
+
+The global API key (`API_KEY` env var) grants full `admin` access. When agents use it, they can:
+- Create/delete other agents
+- Modify any task or project
+- Rotate the API key itself
+- Access all workspaces
+
+This violates least-privilege. A compromised agent session leaks admin access.
+
+### Recommended: Agent-Scoped Keys
+
+Create per-agent keys with limited scopes:
+
+```bash
+# Create a scoped key for agent "Aegis" (via CLI)
+pnpm mc raw --method POST --path /api/agents/5/keys --body '{
+  "name": "aegis-worker",
+  "scopes": ["viewer", "agent:self", "agent:diagnostics", "tasks:write"],
+  "expires_in_days": 30
+}' --json
+```
+
+Scoped keys:
+- Can only act as the agent they belong to (no cross-agent access)
+- Have explicit scope lists (viewer, agent:self, tasks:write, etc.)
+- Auto-expire after a set period
+- Can be revoked without affecting other agents
+- Are logged separately in the audit trail
+
+### Auth Hierarchy
+
+| Method | Role | Use Case |
+|--------|------|----------|
+| Agent-scoped key (`mca_...`) | Per-scope | Autonomous agents (recommended) |
+| Global API key | admin | Admin scripts, CI/CD, initial setup |
+| Session cookie | Per-user role | Human operators via web UI |
+| Proxy header | Per-user role | SSO/gateway-authenticated users |
+
+### Monitoring Global Key Usage
+
+Mission Control logs a security event (`global_api_key_used`) every time the global API key is used. Monitor these in the audit log:
+
+```bash
+pnpm mc raw --method GET --path '/api/security-audit?event_type=global_api_key_used&timeframe=day' --json
+```
+
+Goal: drive global key usage to zero in production by replacing with scoped agent keys.
+
+### Rate Limiting by Agent Identity
+
+Agent-facing endpoints use per-agent rate limiters (keyed by `x-agent-name` header):
+- Heartbeat: 30/min per agent
+- Task polling: 20/min per agent
+- Self-registration: 5/min per IP
+
+This prevents a runaway agent from consuming the entire rate limit budget.
+
+---
+
+## Rate Limit Backend Strategy
+
+Current: in-memory `Map` per process (suitable for single-instance deployments).
+
+For multi-instance deployments, the rate limiter supports a pluggable backend via the `createRateLimiter` factory. Future options:
+- **Redis**: shared state across instances (use Upstash or self-hosted)
+- **SQLite WAL**: leverage the existing DB for cross-process coordination
+- **Edge KV**: for edge-deployed instances
+
+The current implementation includes:
+- Periodic cleanup (60s interval)
+- Capacity-bounded maps (default 10K entries, LRU eviction)
+- Trusted proxy IP parsing (`MC_TRUSTED_PROXIES`)
+
+No action needed for single-instance deployments. For multi-instance, implement a custom `RateLimitStore` interface when scaling beyond 1 node.

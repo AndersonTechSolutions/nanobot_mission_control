@@ -1,13 +1,17 @@
 'use client'
 
 import { useState } from 'react'
+import { useTranslations } from 'next-intl'
 import { useMissionControl } from '@/store'
 import { Button } from '@/components/ui/button'
+import { apiFetch, ApiError } from '@/lib/api-client'
 
 type UpdateState = 'idle' | 'updating' | 'restarting' | 'error'
 
 export function UpdateBanner() {
   const { updateAvailable, updateDismissedVersion, dismissUpdate } = useMissionControl()
+  const t = useTranslations('updateBanner')
+  const tc = useTranslations('common')
   const [state, setState] = useState<UpdateState>('idle')
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
 
@@ -19,16 +23,19 @@ export function UpdateBanner() {
     setErrorMsg(null)
 
     try {
-      const res = await fetch('/api/releases/update', {
+      const res = await apiFetch<Response>('/api/releases/update', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ targetVersion: updateAvailable!.latestVersion }),
+        body: JSON.stringify({
+          targetVersion: updateAvailable!.latestVersion,
+          confirmation: 'update_mission_control',
+        }),
+        raw: true,
       })
       const data = await res.json()
 
       if (!res.ok) {
         setState('error')
-        setErrorMsg(data.error || 'Update failed')
+        setErrorMsg(data.error || t('updateFailed'))
         return
       }
 
@@ -37,7 +44,10 @@ export function UpdateBanner() {
         // Poll until the server comes back up, then reload
         const poll = setInterval(async () => {
           try {
-            const check = await fetch('/api/releases/check', { cache: 'no-store' })
+            const check = await apiFetch<Response>('/api/releases/check', {
+              cache: 'no-store',
+              raw: true,
+            })
             if (check.ok) {
               clearInterval(poll)
               window.location.reload()
@@ -55,9 +65,11 @@ export function UpdateBanner() {
       } else {
         window.location.reload()
       }
-    } catch {
+    } catch (error) {
       setState('error')
-      setErrorMsg('Network error — could not reach the server.')
+      setErrorMsg(error instanceof ApiError && error.code !== 'NETWORK_ERROR'
+        ? error.message || t('updateFailed')
+        : t('networkError'))
     }
   }
 
@@ -68,10 +80,10 @@ export function UpdateBanner() {
       <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" />
       <p className="flex-1 text-xs text-emerald-300">
         {state === 'updating' && (
-          <span className="font-medium text-amber-300">Updating...</span>
+          <span className="font-medium text-amber-300">{t('updating')}</span>
         )}
         {state === 'restarting' && (
-          <span className="font-medium text-amber-300">Restarting server...</span>
+          <span className="font-medium text-amber-300">{t('restartingServer')}</span>
         )}
         {state === 'error' && (
           <span className="font-medium text-red-300">{errorMsg}</span>
@@ -79,9 +91,9 @@ export function UpdateBanner() {
         {state === 'idle' && (
           <>
             <span className="font-medium text-emerald-200">
-              Update available: v{updateAvailable.latestVersion}
+              {t('updateAvailable', { version: updateAvailable.latestVersion })}
             </span>
-            {' — a newer version of Mission Control is available.'}
+            {t('newerVersionAvailable')}
           </>
         )}
       </p>
@@ -92,7 +104,7 @@ export function UpdateBanner() {
             disabled={isbusy}
             className="shrink-0 text-2xs font-medium text-emerald-900 bg-emerald-500 hover:bg-emerald-400 px-2.5 py-1 rounded transition-colors"
           >
-            Update Now
+            {tc('updateNow')}
           </button>
           <a
             href={updateAvailable.releaseUrl}
@@ -100,14 +112,14 @@ export function UpdateBanner() {
             rel="noopener noreferrer"
             className="shrink-0 text-2xs font-medium text-emerald-400 hover:text-emerald-300 px-2 py-1 rounded border border-emerald-500/20 hover:border-emerald-500/40 transition-colors"
           >
-            View Release
+            {tc('viewRelease')}
           </a>
           <Button
             variant="ghost"
             size="icon-xs"
             onClick={() => dismissUpdate(updateAvailable.latestVersion)}
             className="shrink-0 text-emerald-400/60 hover:text-emerald-300 hover:bg-transparent"
-            title="Dismiss"
+            title={tc('dismiss')}
           >
             <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
               <path d="M4 4l8 8M12 4l-8 8" />

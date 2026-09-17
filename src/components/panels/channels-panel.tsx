@@ -1,7 +1,9 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
+import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
+import { apiFetch, ApiError } from '@/lib/api-client'
 import { useMissionControl } from '@/store'
 
 // ---------------------------------------------------------------------------
@@ -202,7 +204,7 @@ function StatusRow({ label, value }: { label: string; value: string }) {
 function ErrorCallout({ message }: { message: string | null | undefined }) {
   if (!message) return null
   return (
-    <div className="text-xs text-red-400 bg-red-500/10 rounded px-2 py-1.5 mt-2 break-words">
+    <div className="text-xs text-red-400 bg-red-500/10 rounded px-2 py-1.5 mt-2 wrap-break-word">
       {message}
     </div>
   )
@@ -228,6 +230,7 @@ function CardShell({ platform, label, children, status, accounts, onProbe, probi
   onProbe: () => void
   probing: boolean
 }) {
+  const t = useTranslations('channels')
   const icon = PLATFORM_ICONS[platform] ?? '\u{1F4E1}'
   const name = label || (PLATFORM_NAMES[platform] ?? platform)
   const isActive = channelIsActive(status, accounts ?? [])
@@ -242,7 +245,7 @@ function CardShell({ platform, label, children, status, accounts, onProbe, probi
         <div className="flex items-center gap-1.5">
           <span className={`w-2 h-2 rounded-full ${isActive ? (status?.connected ? 'bg-green-500' : status?.running ? 'bg-amber-500' : 'bg-muted-foreground/50') : 'bg-red-500'}`} />
           <span className="text-xs text-muted-foreground">
-            {isActive ? (status?.connected ? 'Connected' : status?.running ? 'Running' : 'Configured') : 'Inactive'}
+            {isActive ? (status?.connected ? t('statusConnected') : status?.running ? t('statusRunning') : t('statusConfigured')) : t('statusInactive')}
           </span>
         </div>
       </div>
@@ -257,9 +260,9 @@ function CardShell({ platform, label, children, status, accounts, onProbe, probi
         {probing ? (
           <>
             <span className="w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin" />
-            Probing...
+            {t('probing')}
           </>
-        ) : 'Probe'}
+        ) : t('probe')}
       </Button>
     </div>
   )
@@ -270,6 +273,7 @@ function CardShell({ platform, label, children, status, accounts, onProbe, probi
 // ---------------------------------------------------------------------------
 
 function WhatsAppCard({ status, accounts, onProbe, probing, onAction, actionBusy }: PlatformCardProps) {
+  const t = useTranslations('channels')
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null)
   const [message, setMessage] = useState<string | null>(null)
 
@@ -296,7 +300,7 @@ function WhatsAppCard({ status, accounts, onProbe, probing, onAction, actionBusy
     setMessage(null)
     setQrDataUrl(null)
     await onAction('whatsapp-logout', {})
-    setMessage('Logged out.')
+    setMessage(t('loggedOut'))
   }
 
   return (
@@ -328,16 +332,16 @@ function WhatsAppCard({ status, accounts, onProbe, probing, onAction, actionBusy
 
       <div className="flex flex-wrap gap-1.5 mt-3">
         <Button onClick={() => handleLink(false)} disabled={actionBusy} variant="outline" size="xs">
-          Show QR
+          {t('showQr')}
         </Button>
         <Button onClick={() => handleLink(true)} disabled={actionBusy} variant="outline" size="xs">
-          Relink
+          {t('relink')}
         </Button>
         <Button onClick={handleWait} disabled={actionBusy} variant="outline" size="xs">
-          Wait for scan
+          {t('waitForScan')}
         </Button>
         <Button onClick={handleLogout} disabled={actionBusy} variant="destructive" size="xs">
-          Logout
+          {t('logout')}
         </Button>
       </div>
 
@@ -420,6 +424,7 @@ function SignalCard({ status, accounts, onProbe, probing }: PlatformCardProps) {
 }
 
 function NostrCard({ status, accounts, onProbe, probing, onAction, actionBusy }: PlatformCardProps) {
+  const t = useTranslations('channels')
   const primaryAccount = accounts[0]
   const profile: NostrProfile | null = primaryAccount?.profile ?? status?.profile ?? null
   const [editingProfile, setEditingProfile] = useState(false)
@@ -451,10 +456,10 @@ function NostrCard({ status, accounts, onProbe, probing, onAction, actionBusy }:
     const res = readActionResult(await onAction('nostr-profile-save', { accountId, profile: profileForm }))
     setProfileSaving(false)
     if (res?.ok !== false && res?.persisted) {
-      setProfileMessage('Profile published to relays.')
+      setProfileMessage(t('profilePublished'))
       setEditingProfile(false)
     } else {
-      setProfileMessage(res?.error ?? 'Save failed.')
+      setProfileMessage(res?.error ?? t('saveFailed'))
     }
   }
 
@@ -467,9 +472,9 @@ function NostrCard({ status, accounts, onProbe, probing, onAction, actionBusy }:
     if (res?.merged || res?.imported) {
       const merged = res.merged ?? res.imported
       setProfileForm(prev => ({ ...prev, ...merged }))
-      setProfileMessage('Profile imported from relays.')
+      setProfileMessage(t('profileImported'))
     } else {
-      setProfileMessage(res?.error ?? 'Import failed.')
+      setProfileMessage(res?.error ?? t('importFailed'))
     }
   }
 
@@ -487,54 +492,54 @@ function NostrCard({ status, accounts, onProbe, probing, onAction, actionBusy }:
       {!editingProfile ? (
         <div className="mt-3 p-2.5 bg-muted/30 rounded text-xs">
           <div className="flex justify-between items-center mb-1.5">
-            <span className="font-medium text-foreground">Profile</span>
+            <span className="font-medium text-foreground">{t('profile')}</span>
             {status?.configured && (
               <Button onClick={openProfileForm} variant="ghost" size="xs" className="h-5 text-[10px] px-1.5">
-                Edit
+                {t('edit')}
               </Button>
             )}
           </div>
           {profile?.displayName || profile?.name ? (
             <div className="space-y-0.5">
-              {profile.displayName && <StatusRow label="Display Name" value={profile.displayName} />}
-              {profile.name && <StatusRow label="Username" value={profile.name} />}
-              {profile.about && <StatusRow label="About" value={profile.about.slice(0, 80)} />}
+              {profile.displayName && <StatusRow label={t('displayName')} value={profile.displayName} />}
+              {profile.name && <StatusRow label={t('username')} value={profile.name} />}
+              {profile.about && <StatusRow label={t('about')} value={profile.about.slice(0, 80)} />}
               {profile.nip05 && <StatusRow label="NIP-05" value={profile.nip05} />}
             </div>
           ) : (
-            <span className="text-muted-foreground">No profile set</span>
+            <span className="text-muted-foreground">{t('noProfileSet')}</span>
           )}
         </div>
       ) : (
         <div className="mt-3 p-2.5 bg-muted/30 rounded text-xs space-y-2">
-          <div className="font-medium text-foreground">Edit Profile</div>
+          <div className="font-medium text-foreground">{t('editProfile')}</div>
           {profileMessage && (
             <div className="text-xs text-muted-foreground bg-muted/50 rounded px-2 py-1">{profileMessage}</div>
           )}
-          <ProfileField label="Username" value={profileForm.name ?? ''} onChange={v => setProfileForm(p => ({ ...p, name: v }))} disabled={profileSaving} />
-          <ProfileField label="Display Name" value={profileForm.displayName ?? ''} onChange={v => setProfileForm(p => ({ ...p, displayName: v }))} disabled={profileSaving} />
-          <ProfileField label="Bio" value={profileForm.about ?? ''} onChange={v => setProfileForm(p => ({ ...p, about: v }))} disabled={profileSaving} multiline />
-          <ProfileField label="Avatar URL" value={profileForm.picture ?? ''} onChange={v => setProfileForm(p => ({ ...p, picture: v }))} disabled={profileSaving} />
+          <ProfileField label={t('username')} value={profileForm.name ?? ''} onChange={v => setProfileForm(p => ({ ...p, name: v }))} disabled={profileSaving} />
+          <ProfileField label={t('displayName')} value={profileForm.displayName ?? ''} onChange={v => setProfileForm(p => ({ ...p, displayName: v }))} disabled={profileSaving} />
+          <ProfileField label={t('bio')} value={profileForm.about ?? ''} onChange={v => setProfileForm(p => ({ ...p, about: v }))} disabled={profileSaving} multiline />
+          <ProfileField label={t('avatarUrl')} value={profileForm.picture ?? ''} onChange={v => setProfileForm(p => ({ ...p, picture: v }))} disabled={profileSaving} />
           {showAdvanced && (
             <>
-              <ProfileField label="Banner URL" value={profileForm.banner ?? ''} onChange={v => setProfileForm(p => ({ ...p, banner: v }))} disabled={profileSaving} />
-              <ProfileField label="Website" value={profileForm.website ?? ''} onChange={v => setProfileForm(p => ({ ...p, website: v }))} disabled={profileSaving} />
+              <ProfileField label={t('bannerUrl')} value={profileForm.banner ?? ''} onChange={v => setProfileForm(p => ({ ...p, banner: v }))} disabled={profileSaving} />
+              <ProfileField label={t('website')} value={profileForm.website ?? ''} onChange={v => setProfileForm(p => ({ ...p, website: v }))} disabled={profileSaving} />
               <ProfileField label="NIP-05" value={profileForm.nip05 ?? ''} onChange={v => setProfileForm(p => ({ ...p, nip05: v }))} disabled={profileSaving} />
-              <ProfileField label="Lightning" value={profileForm.lud16 ?? ''} onChange={v => setProfileForm(p => ({ ...p, lud16: v }))} disabled={profileSaving} />
+              <ProfileField label={t('lightning')} value={profileForm.lud16 ?? ''} onChange={v => setProfileForm(p => ({ ...p, lud16: v }))} disabled={profileSaving} />
             </>
           )}
           <div className="flex flex-wrap gap-1.5">
             <Button onClick={handleProfileSave} disabled={profileSaving || actionBusy} variant="default" size="xs">
-              {profileSaving ? 'Saving...' : 'Save & Publish'}
+              {profileSaving ? t('saving') : t('saveAndPublish')}
             </Button>
             <Button onClick={handleProfileImport} disabled={profileSaving || actionBusy} variant="outline" size="xs">
-              Import from Relays
+              {t('importFromRelays')}
             </Button>
             <Button onClick={() => setShowAdvanced(!showAdvanced)} variant="outline" size="xs">
-              {showAdvanced ? 'Hide Advanced' : 'Show Advanced'}
+              {showAdvanced ? t('hideAdvanced') : t('showAdvanced')}
             </Button>
             <Button onClick={() => setEditingProfile(false)} disabled={profileSaving} variant="ghost" size="xs">
-              Cancel
+              {t('cancel')}
             </Button>
           </div>
         </div>
@@ -593,10 +598,11 @@ function ProfileField({ label, value, onChange, disabled, multiline }: {
 }
 
 function AccountList({ accounts }: { accounts: ChannelAccount[] }) {
+  const t = useTranslations('channels')
   return (
     <div className="mt-3 space-y-2">
       <div className="text-[10px] text-muted-foreground font-medium">
-        Accounts ({accounts.length})
+        {t('accounts', { count: accounts.length })}
       </div>
       {accounts.map(acct => (
         <div key={acct.accountId} className="p-2 bg-muted/20 rounded text-xs space-y-0.5">
@@ -609,7 +615,7 @@ function AccountList({ accounts }: { accounts: ChannelAccount[] }) {
           <StatusRow label="Connected" value={yesNo(acct.connected)} />
           {acct.lastInboundAt && <StatusRow label="Last inbound" value={relativeTime(acct.lastInboundAt)} />}
           {acct.lastError && (
-            <div className="text-red-400 break-words mt-1">{acct.lastError}</div>
+            <div className="text-red-400 wrap-break-word mt-1">{acct.lastError}</div>
           )}
         </div>
       ))}
@@ -636,6 +642,7 @@ interface PlatformCardProps {
 // ---------------------------------------------------------------------------
 
 export function ChannelsPanel() {
+  const t = useTranslations('channels')
   const { connection } = useMissionControl()
   const [snapshot, setSnapshot] = useState<ChannelsSnapshot | null>(null)
   const [loading, setLoading] = useState(true)
@@ -645,20 +652,15 @@ export function ChannelsPanel() {
 
   const fetchChannels = useCallback(async () => {
     try {
-      const res = await fetch('/api/channels')
-      if (res.status === 401 || res.status === 403) {
-        setError('Authentication required')
-        return
-      }
-      if (!res.ok) {
-        setError('Failed to load channels')
-        return
-      }
-      const data: ChannelsSnapshot = await res.json()
+      const data = await apiFetch<ChannelsSnapshot>('/api/channels')
       setSnapshot(data)
       setError(null)
-    } catch {
-      setError('Failed to load channels')
+    } catch (err) {
+      setError(
+        err instanceof ApiError && (err.status === 401 || err.status === 403)
+          ? 'Authentication required'
+          : 'Failed to load channels',
+      )
     } finally {
       setLoading(false)
     }
@@ -673,7 +675,7 @@ export function ChannelsPanel() {
   const handleProbe = async (channelId: string) => {
     setProbing(channelId)
     try {
-      await fetch(`/api/channels?action=probe&channel=${encodeURIComponent(channelId)}`)
+      await apiFetch(`/api/channels?action=probe&channel=${encodeURIComponent(channelId)}`)
       await fetchChannels()
     } catch {
       // next poll will refresh
@@ -685,16 +687,18 @@ export function ChannelsPanel() {
   const handleAction = async (action: string, params: Record<string, unknown>): Promise<unknown> => {
     setActionBusy(true)
     try {
-      const res = await fetch('/api/channels', {
+      const data = await apiFetch<ActionResult>('/api/channels', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action, ...params }),
       })
-      const data = await res.json()
       // Refresh channel data after action
       await fetchChannels()
       return data
-    } catch {
+    } catch (err) {
+      if (err instanceof ApiError && err.payload !== undefined) {
+        await fetchChannels()
+        return err.payload
+      }
       return null
     } finally {
       setActionBusy(false)
@@ -707,7 +711,7 @@ export function ChannelsPanel() {
       <div className="m-4">
         <div className="flex items-center gap-2 mb-6">
           <div className="w-4 h-4 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-          <span className="text-sm text-muted-foreground">Loading channels...</span>
+          <span className="text-sm text-muted-foreground">{t('loadingChannels')}</span>
         </div>
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
           {[1, 2, 3].map(i => (
@@ -784,11 +788,11 @@ export function ChannelsPanel() {
       {/* Header */}
       <div className="flex items-center justify-between mb-4">
         <div>
-          <h2 className="text-lg font-semibold text-foreground">Channels</h2>
+          <h2 className="text-lg font-semibold text-foreground">{t('title')}</h2>
           <div className="flex items-center gap-1.5 mt-1">
             <span className={`w-2 h-2 rounded-full ${gatewayConnected ? 'bg-green-500' : 'bg-red-500'}`} />
             <span className="text-xs text-muted-foreground">
-              {gatewayConnected ? 'Gateway Connected' : 'Gateway Disconnected'}
+              {gatewayConnected ? t('gatewayConnected') : t('gatewayDisconnected')}
             </span>
           </div>
         </div>
@@ -797,7 +801,7 @@ export function ChannelsPanel() {
           variant="outline"
           size="sm"
         >
-          Refresh
+          {t('refresh')}
         </Button>
       </div>
 
@@ -806,8 +810,8 @@ export function ChannelsPanel() {
         <div className="text-center py-16">
           <p className="text-sm text-muted-foreground">
             {gatewayConnected
-              ? 'No channels configured yet. Configure messaging platforms (WhatsApp, Telegram, Discord, Slack, etc.) in your OpenClaw gateway settings.'
-              : 'Cannot reach the OpenClaw gateway. Check that it is running and accessible.'}
+              ? t('noChannelsConfigured')
+              : t('gatewayUnreachable')}
           </p>
         </div>
       ) : (

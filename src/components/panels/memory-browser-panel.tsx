@@ -1,9 +1,11 @@
 'use client'
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { useTranslations } from 'next-intl'
 import { Button } from '@/components/ui/button'
 import { Loader } from '@/components/ui/loader'
 import { useMissionControl } from '@/store'
+import { apiFetch } from '@/lib/api-client'
 import { createClientLogger } from '@/lib/client-logger'
 import { MemoryGraph } from './memory-graph'
 
@@ -97,6 +99,7 @@ function statusBg(status: 'healthy' | 'warning' | 'critical'): string {
 }
 
 export function MemoryBrowserPanel() {
+  const t = useTranslations('memoryBrowser')
   const {
     memoryFiles,
     selectedMemoryFile,
@@ -122,7 +125,10 @@ export function MemoryBrowserPanel() {
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
-  const [activeView, setActiveView] = useState<'files' | 'graph' | 'health' | 'pipeline'>(!isLocal ? 'graph' : 'files')
+  const [activeView, setActiveView] = useState<'files' | 'graph' | 'health' | 'pipeline' | 'hermes'>(!isLocal ? 'graph' : 'files')
+  const [hermesMemory, setHermesMemory] = useState<{ agentMemory: string | null; userMemory: string | null; agentMemorySize: number; userMemorySize: number; agentMemoryEntries: number; userMemoryEntries: number } | null>(null)
+  const [hermesInstalled, setHermesInstalled] = useState<boolean | null>(null)
+  const [isLoadingHermes, setIsLoadingHermes] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [fileFilter, setFileFilter] = useState<'all' | 'daily' | 'knowledge'>('all')
   const [schemaWarnings, setSchemaWarnings] = useState<string[]>([])
@@ -143,8 +149,7 @@ export function MemoryBrowserPanel() {
     const params = new URLSearchParams({ action: 'tree' })
     if (typeof options?.depth === 'number') params.set('depth', String(options.depth))
     if (options?.path) params.set('path', options.path)
-    const response = await fetch(`/api/memory?${params.toString()}`)
-    return response.json()
+    return apiFetch<{ tree?: MemoryFile[] }>(`/api/memory?${params.toString()}`)
   }, [])
 
   const loadFileTree = useCallback(async () => {
@@ -189,8 +194,7 @@ export function MemoryBrowserPanel() {
   const loadFileContent = async (filePath: string) => {
     setIsLoading(true)
     try {
-      const response = await fetch(`/api/memory?action=content&path=${encodeURIComponent(filePath)}`)
-      const data = await response.json()
+      const data = await apiFetch<{ content?: string; wikiLinks?: unknown[] }>(`/api/memory?action=content&path=${encodeURIComponent(filePath)}`)
       if (data.content !== undefined) {
         setSelectedMemoryFile(filePath)
         setMemoryContent(data.content)
@@ -203,11 +207,10 @@ export function MemoryBrowserPanel() {
             incoming: [],
             outgoing: [],
           })
-          fetch(`/api/memory/links?file=${encodeURIComponent(filePath)}`)
-            .then((r) => r.json())
+          apiFetch<{ wikiLinks?: unknown[]; incoming?: string[]; outgoing?: string[] }>(`/api/memory/links?file=${encodeURIComponent(filePath)}`)
             .then((linkData) => {
               setMemoryFileLinks({
-                wikiLinks: linkData.wikiLinks || data.wikiLinks,
+                wikiLinks: linkData.wikiLinks || data.wikiLinks || [],
                 incoming: linkData.incoming || [],
                 outgoing: linkData.outgoing || [],
               })
@@ -229,8 +232,7 @@ export function MemoryBrowserPanel() {
     if (!searchQuery.trim()) return
     setIsSearching(true)
     try {
-      const response = await fetch(`/api/memory?action=search&query=${encodeURIComponent(searchQuery)}`)
-      const data = await response.json()
+      const data = await apiFetch<{ results?: { path: string; name: string; matches: number }[] }>(`/api/memory?action=search&query=${encodeURIComponent(searchQuery)}`)
       setSearchResults(data.results || [])
     } catch (error) {
       log.error('Search failed:', error)
@@ -259,12 +261,10 @@ export function MemoryBrowserPanel() {
     if (!selectedMemoryFile) return
     setIsSaving(true)
     try {
-      const response = await fetch('/api/memory', {
+      const data = await apiFetch<{ success?: boolean; schemaWarnings?: string[] }>('/api/memory', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'save', path: selectedMemoryFile, content: editedContent })
       })
-      const data = await response.json()
       if (data.success) {
         setMemoryContent(editedContent)
         setIsEditing(false)
@@ -281,12 +281,10 @@ export function MemoryBrowserPanel() {
 
   const createNewFile = async (filePath: string, content: string = '') => {
     try {
-      const response = await fetch('/api/memory', {
+      const data = await apiFetch<{ success?: boolean }>('/api/memory', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'create', path: filePath, content })
       })
-      const data = await response.json()
       if (data.success) {
         loadFileTree()
         loadFileContent(filePath)
@@ -299,12 +297,10 @@ export function MemoryBrowserPanel() {
   const deleteFile = async () => {
     if (!selectedMemoryFile) return
     try {
-      const response = await fetch('/api/memory', {
+      const data = await apiFetch<{ success?: boolean }>('/api/memory', {
         method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'delete', path: selectedMemoryFile })
       })
-      const data = await response.json()
       if (data.success) {
         setSelectedMemoryFile('')
         setMemoryContent('')
@@ -320,8 +316,7 @@ export function MemoryBrowserPanel() {
   const loadHealth = useCallback(async () => {
     setIsLoadingHealth(true)
     try {
-      const response = await fetch('/api/memory/health')
-      const data = await response.json()
+      const data = await apiFetch<HealthReport>('/api/memory/health')
       if (data.categories) {
         setHealthReport(data)
         setMemoryHealth(data)
@@ -339,17 +334,31 @@ export function MemoryBrowserPanel() {
     }
   }, [activeView, healthReport, loadHealth])
 
+  useEffect(() => {
+    if (hermesInstalled === null) {
+      apiFetch<{ installed?: boolean }>('/api/hermes').then(d => setHermesInstalled(d.installed === true)).catch(() => setHermesInstalled(false))
+    }
+  }, [hermesInstalled])
+
+  useEffect(() => {
+    if (activeView === 'hermes' && !hermesMemory && !isLoadingHermes) {
+      setIsLoadingHermes(true)
+      apiFetch<{ agentMemory: string | null; userMemory: string | null; agentMemorySize: number; userMemorySize: number; agentMemoryEntries: number; userMemoryEntries: number }>('/api/hermes/memory')
+        .then(d => setHermesMemory(d))
+        .catch(() => {})
+        .finally(() => setIsLoadingHermes(false))
+    }
+  }, [activeView, hermesMemory, isLoadingHermes])
+
   const runPipelineAction = async (action: string) => {
     setIsRunningPipeline(true)
     setPipelineResult(null)
     setMocGroups([])
     try {
-      const response = await fetch('/api/memory/process', {
+      const data = await apiFetch<ProcessingResult & { groups?: MOCGroup[] }>('/api/memory/process', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action })
       })
-      const data = await response.json()
       if (action === 'generate-moc') {
         setMocGroups(data.groups || [])
       } else {
@@ -508,7 +517,7 @@ export function MemoryBrowserPanel() {
     return elements
   }
 
-  const viewTabs = ['files', ...(!isLocal ? ['graph'] : []), 'health', 'pipeline'] as const
+  const viewTabs = ['files', ...(!isLocal ? ['graph'] : []), 'health', 'pipeline', ...(hermesInstalled ? ['hermes'] : [])] as const
 
   return (
     <div className="h-[calc(100vh-3.5rem)] flex flex-col overflow-hidden">
@@ -517,7 +526,7 @@ export function MemoryBrowserPanel() {
         <button
           onClick={() => setSidebarOpen(!sidebarOpen)}
           className="p-1.5 rounded hover:bg-[hsl(var(--surface-2))] text-muted-foreground text-xs font-mono"
-          title={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
+          title={sidebarOpen ? t('hideSidebar') : t('showSidebar')}
         >|||</button>
         <div className="w-px h-4 bg-border mx-1" />
         {viewTabs.map((view) => (
@@ -531,10 +540,10 @@ export function MemoryBrowserPanel() {
         {healthReport && (
           <span className={`text-[10px] font-mono ${statusColor(healthReport.overall)} tabular-nums mr-1`}>{healthReport.overallScore}%</span>
         )}
-        <span className="text-[10px] text-muted-foreground/50 font-mono tabular-nums">{fileCount} files / {formatFileSize(sizeTotal)}</span>
-        {isHydratingTree && <span className="ml-2 text-[10px] text-muted-foreground/35 font-mono">indexing…</span>}
+        <span className="text-[10px] text-muted-foreground/50 font-mono tabular-nums">{t('fileCountSize', { count: fileCount, size: formatFileSize(sizeTotal) })}</span>
+        {isHydratingTree && <span className="ml-2 text-[10px] text-muted-foreground/35 font-mono">{t('indexing')}</span>}
         <div className="w-px h-4 bg-border mx-1" />
-        <button onClick={() => setShowCreateModal(true)} className="px-2 py-1 rounded text-xs font-mono text-muted-foreground hover:text-foreground hover:bg-[hsl(var(--surface-2))] transition-colors">+ new</button>
+        <button onClick={() => setShowCreateModal(true)} className="px-2 py-1 rounded text-xs font-mono text-muted-foreground hover:text-foreground hover:bg-[hsl(var(--surface-2))] transition-colors">{t('newFile')}</button>
       </div>
 
       <div className="flex flex-1 min-h-0">
@@ -542,7 +551,7 @@ export function MemoryBrowserPanel() {
         {sidebarOpen && (
           <div className="w-60 shrink-0 border-r border-border bg-[hsl(var(--surface-0))] flex flex-col min-h-0">
             <div className="p-2">
-              <input type="text" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && searchFiles()} placeholder="Search files..." className="w-full px-2 py-1.5 text-xs font-mono bg-[hsl(var(--surface-1))] border border-border/50 rounded text-foreground placeholder-muted-foreground/40 focus:outline-none focus:border-primary/30" />
+              <input type="text" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && searchFiles()} placeholder={t('searchPlaceholder')} className="w-full px-2 py-1.5 text-xs font-mono bg-[hsl(var(--surface-1))] border border-border/50 rounded text-foreground placeholder-muted-foreground/40 focus:outline-hidden focus:border-primary/30" />
             </div>
             <div className="flex gap-0.5 px-2 pb-2">
               {(['all', 'daily', 'knowledge'] as const).map((f) => (
@@ -551,7 +560,7 @@ export function MemoryBrowserPanel() {
             </div>
             {searchResults.length > 0 && (
               <div className="px-2 pb-2 border-b border-border/50">
-                <div className="text-[10px] text-muted-foreground/50 font-mono mb-1">{searchResults.length} results</div>
+                <div className="text-[10px] text-muted-foreground/50 font-mono mb-1">{t('searchResults', { count: searchResults.length })}</div>
                 <div className="max-h-28 overflow-y-auto space-y-px">
                   {searchResults.map((r, i) => (
                     <div key={i} className="flex items-center gap-1.5 py-1 px-1.5 rounded text-xs font-mono cursor-pointer hover:bg-[hsl(var(--surface-2))] text-muted-foreground" onClick={() => { loadFileContent(r.path); setSearchResults([]) }}>
@@ -566,11 +575,11 @@ export function MemoryBrowserPanel() {
               {isLoading ? (
                 <div className="flex items-center justify-center h-20"><Loader variant="inline" /></div>
               ) : filteredFiles.length === 0 ? (
-                <div className="text-center text-muted-foreground/40 text-xs font-mono py-8">no files</div>
+                <div className="text-center text-muted-foreground/40 text-xs font-mono py-8">{t('noFiles')}</div>
               ) : renderTree(filteredFiles)}
             </div>
             <div className="p-2 border-t border-border/50">
-              <button onClick={loadFileTree} disabled={isLoading} className="w-full py-1 text-[11px] font-mono text-muted-foreground/50 hover:text-muted-foreground rounded hover:bg-[hsl(var(--surface-1))] transition-colors">refresh</button>
+              <button onClick={loadFileTree} disabled={isLoading} className="w-full py-1 text-[11px] font-mono text-muted-foreground/50 hover:text-muted-foreground rounded hover:bg-[hsl(var(--surface-1))] transition-colors">{t('refresh')}</button>
             </div>
           </div>
         )}
@@ -583,6 +592,10 @@ export function MemoryBrowserPanel() {
             <div className="flex-1 overflow-auto p-6"><HealthView report={healthReport} isLoading={isLoadingHealth} onRefresh={loadHealth} /></div>
           ) : activeView === 'pipeline' ? (
             <div className="flex-1 overflow-auto p-6"><PipelineView result={pipelineResult} mocGroups={mocGroups} isRunning={isRunningPipeline} onRunAction={runPipelineAction} onNavigate={loadFileContent} /></div>
+          ) : activeView === 'hermes' ? (
+            <div className="flex-1 overflow-auto p-6">
+              <HermesMemoryView data={hermesMemory} isLoading={isLoadingHermes} onRefresh={() => { setHermesMemory(null); setIsLoadingHermes(false) }} />
+            </div>
           ) : (
             <div className="flex-1 flex min-h-0">
               <div className="flex-1 flex flex-col min-h-0">
@@ -593,16 +606,16 @@ export function MemoryBrowserPanel() {
                       <span className="text-[10px] font-mono text-muted-foreground/30 tabular-nums shrink-0">{memoryContent.length} chars</span>
                     )}
                     <div className="flex items-center gap-1 shrink-0">
-                      <button onClick={() => setLinksOpen(!linksOpen)} className={`px-2 py-0.5 text-[11px] font-mono rounded transition-colors ${linksOpen ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:text-foreground hover:bg-[hsl(var(--surface-2))]'}`} title="Toggle backlinks panel">links</button>
+                      <button onClick={() => setLinksOpen(!linksOpen)} className={`px-2 py-0.5 text-[11px] font-mono rounded transition-colors ${linksOpen ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:text-foreground hover:bg-[hsl(var(--surface-2))]'}`} title={t('toggleBacklinks')}>{t('links')}</button>
                       {!isEditing ? (
                         <>
-                          <button onClick={() => { setIsEditing(true); setEditedContent(memoryContent ?? '') }} className="px-2 py-0.5 text-[11px] font-mono text-muted-foreground hover:text-foreground rounded hover:bg-[hsl(var(--surface-2))] transition-colors">edit</button>
-                          <button onClick={() => setShowDeleteConfirm(true)} className="px-2 py-0.5 text-[11px] font-mono text-red-400/60 hover:text-red-400 rounded hover:bg-red-500/10 transition-colors">delete</button>
+                          <button onClick={() => { setIsEditing(true); setEditedContent(memoryContent ?? '') }} className="px-2 py-0.5 text-[11px] font-mono text-muted-foreground hover:text-foreground rounded hover:bg-[hsl(var(--surface-2))] transition-colors">{t('edit')}</button>
+                          <button onClick={() => setShowDeleteConfirm(true)} className="px-2 py-0.5 text-[11px] font-mono text-red-400/60 hover:text-red-400 rounded hover:bg-red-500/10 transition-colors">{t('delete')}</button>
                         </>
                       ) : (
                         <>
-                          <button onClick={saveFile} disabled={isSaving} className="px-2 py-0.5 text-[11px] font-mono text-green-400/80 hover:text-green-400 rounded hover:bg-green-500/10 transition-colors">{isSaving ? 'saving...' : 'save'}</button>
-                          <button onClick={() => { setIsEditing(false); setEditedContent('') }} className="px-2 py-0.5 text-[11px] font-mono text-muted-foreground hover:text-foreground rounded hover:bg-[hsl(var(--surface-2))] transition-colors">cancel</button>
+                          <button onClick={saveFile} disabled={isSaving} className="px-2 py-0.5 text-[11px] font-mono text-green-400/80 hover:text-green-400 rounded hover:bg-green-500/10 transition-colors">{isSaving ? t('saving') : t('save')}</button>
+                          <button onClick={() => { setIsEditing(false); setEditedContent('') }} className="px-2 py-0.5 text-[11px] font-mono text-muted-foreground hover:text-foreground rounded hover:bg-[hsl(var(--surface-2))] transition-colors">{t('cancel')}</button>
                         </>
                       )}
                       <button onClick={() => { setSelectedMemoryFile(''); setMemoryContent(''); setMemoryFileLinks(null); setIsEditing(false); setEditedContent(''); setSchemaWarnings([]); setLinksOpen(false) }} className="px-1.5 py-0.5 text-[11px] font-mono text-muted-foreground/40 hover:text-muted-foreground rounded hover:bg-[hsl(var(--surface-2))] transition-colors">x</button>
@@ -611,7 +624,7 @@ export function MemoryBrowserPanel() {
                 )}
                 {schemaWarnings.length > 0 && (
                   <div className="px-4 py-2 bg-amber-500/5 border-b border-amber-500/15">
-                    <div className="text-[11px] font-mono text-amber-400">Schema warnings:</div>
+                    <div className="text-[11px] font-mono text-amber-400">{t('schemaWarnings')}</div>
                     {schemaWarnings.map((w, i) => (
                       <div key={i} className="text-[11px] font-mono text-amber-400/70 ml-2">- {w}</div>
                     ))}
@@ -623,22 +636,22 @@ export function MemoryBrowserPanel() {
                   ) : memoryContent != null && selectedMemoryFile ? (
                     <div className="p-6 max-w-3xl">
                       {isEditing ? (
-                        <textarea value={editedContent} onChange={(e) => setEditedContent(e.target.value)} className="w-full min-h-[500px] p-3 bg-[hsl(var(--surface-1))] text-foreground font-mono text-sm border border-border/50 rounded-md resize-none focus:outline-none focus:border-primary/30 leading-relaxed" placeholder="Edit file content..." />
+                        <textarea value={editedContent} onChange={(e) => setEditedContent(e.target.value)} className="w-full min-h-[500px] p-3 bg-[hsl(var(--surface-1))] text-foreground font-mono text-sm border border-border/50 rounded-md resize-none focus:outline-hidden focus:border-primary/30 leading-relaxed" placeholder={t('editPlaceholder')} />
                       ) : selectedMemoryFile.endsWith('.md') ? (
                         <div>{renderMarkdown(memoryContent)}</div>
                       ) : selectedMemoryFile.endsWith('.json') ? (
-                        <pre className="text-sm font-mono overflow-auto whitespace-pre-wrap break-words text-foreground/80 leading-relaxed">
+                        <pre className="text-sm font-mono overflow-auto whitespace-pre-wrap wrap-break-word text-foreground/80 leading-relaxed">
                           <code>{(() => { try { return JSON.stringify(JSON.parse(memoryContent), null, 2) } catch { return memoryContent } })()}</code>
                         </pre>
                       ) : (
-                        <pre className="text-sm font-mono whitespace-pre-wrap break-words text-foreground/80 leading-relaxed">{memoryContent}</pre>
+                        <pre className="text-sm font-mono whitespace-pre-wrap wrap-break-word text-foreground/80 leading-relaxed">{memoryContent}</pre>
                       )}
                     </div>
                   ) : (
                     <div className="flex flex-col items-center justify-center h-full text-muted-foreground/30">
                       <span className="text-4xl font-mono mb-3">/</span>
-                      <span className="text-sm font-mono">select a file to view</span>
-                      <span className="text-xs font-mono mt-1 text-muted-foreground/20">or switch to health / pipeline view</span>
+                      <span className="text-sm font-mono">{t('selectFilePrompt')}</span>
+                      <span className="text-xs font-mono mt-1 text-muted-foreground/20">{t('orSwitchView')}</span>
                     </div>
                   )}
                 </div>
@@ -657,12 +670,97 @@ export function MemoryBrowserPanel() {
   )
 }
 
+function HermesMemoryView({ data, isLoading, onRefresh }: { data: { agentMemory: string | null; userMemory: string | null; agentMemorySize: number; userMemorySize: number; agentMemoryEntries: number; userMemoryEntries: number } | null; isLoading: boolean; onRefresh: () => void }) {
+  const t = useTranslations('memoryBrowser')
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <Loader variant="inline" label={t('loadingHermes')} />
+      </div>
+    )
+  }
+  if (!data) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full text-muted-foreground/30">
+        <span className="text-sm font-mono mb-3">{t('noHermesData')}</span>
+        <Button onClick={onRefresh} size="sm" variant="secondary">{t('refresh')}</Button>
+      </div>
+    )
+  }
+
+  const AGENT_CAP = 2200
+  const USER_CAP = 1375
+  const agentPct = Math.min(100, Math.round((data.agentMemorySize / AGENT_CAP) * 100))
+  const userPct = Math.min(100, Math.round((data.userMemorySize / USER_CAP) * 100))
+
+  return (
+    <div className="max-w-3xl space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-lg font-semibold font-mono text-foreground mb-1">{t('hermesMemoryTitle')}</h2>
+          <p className="text-xs text-muted-foreground font-mono">{t('hermesMemoryDesc')}</p>
+        </div>
+        <Button onClick={onRefresh} size="sm" variant="secondary">{t('refresh')}</Button>
+      </div>
+
+      {/* MEMORY.md */}
+      <div className="bg-[hsl(var(--surface-1))] border border-border/50 rounded-lg p-4">
+        <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-semibold font-mono text-foreground">MEMORY.md</span>
+            <span className="text-[10px] font-mono text-purple-400">{data.agentMemoryEntries} entries</span>
+          </div>
+          <span className="text-[10px] font-mono text-muted-foreground tabular-nums">
+            {data.agentMemorySize}/{AGENT_CAP} chars ({agentPct}%)
+          </span>
+        </div>
+        <div className="h-1.5 bg-[hsl(var(--surface-0))] rounded-full overflow-hidden mb-3">
+          <div
+            className={`h-full rounded-full transition-all ${agentPct > 90 ? 'bg-red-500' : agentPct > 70 ? 'bg-amber-500' : 'bg-purple-500'}`}
+            style={{ width: `${agentPct}%`, opacity: 0.7 }}
+          />
+        </div>
+        {data.agentMemory ? (
+          <pre className="text-xs font-mono whitespace-pre-wrap wrap-break-word text-foreground/80 leading-relaxed max-h-80 overflow-y-auto bg-[hsl(var(--surface-0))] rounded-md p-3 border border-border/30">{data.agentMemory}</pre>
+        ) : (
+          <div className="text-xs font-mono text-muted-foreground/40 py-4 text-center">{t('noAgentMemory')}</div>
+        )}
+      </div>
+
+      {/* USER.md */}
+      <div className="bg-[hsl(var(--surface-1))] border border-border/50 rounded-lg p-4">
+        <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-semibold font-mono text-foreground">USER.md</span>
+            <span className="text-[10px] font-mono text-purple-400">{data.userMemoryEntries} entries</span>
+          </div>
+          <span className="text-[10px] font-mono text-muted-foreground tabular-nums">
+            {data.userMemorySize}/{USER_CAP} chars ({userPct}%)
+          </span>
+        </div>
+        <div className="h-1.5 bg-[hsl(var(--surface-0))] rounded-full overflow-hidden mb-3">
+          <div
+            className={`h-full rounded-full transition-all ${userPct > 90 ? 'bg-red-500' : userPct > 70 ? 'bg-amber-500' : 'bg-purple-500'}`}
+            style={{ width: `${userPct}%`, opacity: 0.7 }}
+          />
+        </div>
+        {data.userMemory ? (
+          <pre className="text-xs font-mono whitespace-pre-wrap wrap-break-word text-foreground/80 leading-relaxed max-h-80 overflow-y-auto bg-[hsl(var(--surface-0))] rounded-md p-3 border border-border/30">{data.userMemory}</pre>
+        ) : (
+          <div className="text-xs font-mono text-muted-foreground/40 py-4 text-center">{t('noUserMemory')}</div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function LinksSidebar({ fileLinks, onNavigate }: { fileLinks: { wikiLinks: unknown[]; incoming: string[]; outgoing: string[] }; onNavigate: (path: string) => void }) {
+  const t = useTranslations('memoryBrowser')
   const links = fileLinks.wikiLinks as { target: string; display: string; line: number }[]
   return (
     <div className="w-56 shrink-0 border-l border-border bg-[hsl(var(--surface-0))] flex flex-col min-h-0 overflow-y-auto">
       <div className="p-3 border-b border-border/50">
-        <div className="text-[10px] font-mono text-muted-foreground/50 uppercase tracking-wider mb-2">Outgoing ({fileLinks.outgoing.length})</div>
+        <div className="text-[10px] font-mono text-muted-foreground/50 uppercase tracking-wider mb-2">{t('outgoing', { count: fileLinks.outgoing.length })}</div>
         {fileLinks.outgoing.length === 0 ? (
           <div className="text-[11px] font-mono text-muted-foreground/30">none</div>
         ) : (
@@ -676,7 +774,7 @@ function LinksSidebar({ fileLinks, onNavigate }: { fileLinks: { wikiLinks: unkno
         )}
       </div>
       <div className="p-3 border-b border-border/50">
-        <div className="text-[10px] font-mono text-muted-foreground/50 uppercase tracking-wider mb-2">Backlinks ({fileLinks.incoming.length})</div>
+        <div className="text-[10px] font-mono text-muted-foreground/50 uppercase tracking-wider mb-2">{t('backlinks', { count: fileLinks.incoming.length })}</div>
         {fileLinks.incoming.length === 0 ? (
           <div className="text-[11px] font-mono text-muted-foreground/30">none</div>
         ) : (
@@ -690,7 +788,7 @@ function LinksSidebar({ fileLinks, onNavigate }: { fileLinks: { wikiLinks: unkno
         )}
       </div>
       <div className="p-3">
-        <div className="text-[10px] font-mono text-muted-foreground/50 uppercase tracking-wider mb-2">Wiki-links ({links.length})</div>
+        <div className="text-[10px] font-mono text-muted-foreground/50 uppercase tracking-wider mb-2">{t('wikiLinks', { count: links.length })}</div>
         {links.length === 0 ? (
           <div className="text-[11px] font-mono text-muted-foreground/30">none</div>
         ) : (
@@ -709,18 +807,19 @@ function LinksSidebar({ fileLinks, onNavigate }: { fileLinks: { wikiLinks: unkno
 }
 
 function HealthView({ report, isLoading, onRefresh }: { report: HealthReport | null; isLoading: boolean; onRefresh: () => void }) {
+  const t = useTranslations('memoryBrowser')
   if (isLoading) {
     return (
       <div className="flex items-center justify-center h-full">
-        <Loader variant="inline" label="Running diagnostics" />
+        <Loader variant="inline" label={t('runningDiagnostics')} />
       </div>
     )
   }
   if (!report) {
     return (
       <div className="flex flex-col items-center justify-center h-full text-muted-foreground/30">
-        <span className="text-sm font-mono mb-3">No health data</span>
-        <Button onClick={onRefresh} size="sm" variant="secondary">Run Diagnostics</Button>
+        <span className="text-sm font-mono mb-3">{t('noHealthData')}</span>
+        <Button onClick={onRefresh} size="sm" variant="secondary">{t('runDiagnostics')}</Button>
       </div>
     )
   }
@@ -730,10 +829,10 @@ function HealthView({ report, isLoading, onRefresh }: { report: HealthReport | n
         <div className={`text-4xl font-bold font-mono tabular-nums ${statusColor(report.overall)}`}>{report.overallScore}</div>
         <div>
           <div className={`text-sm font-semibold font-mono uppercase ${statusColor(report.overall)}`}>{report.overall}</div>
-          <div className="text-[11px] text-muted-foreground/50 font-mono">8 categories / {new Date(report.generatedAt).toLocaleTimeString()}</div>
+          <div className="text-[11px] text-muted-foreground/50 font-mono">{t('healthCategories', { time: new Date(report.generatedAt).toLocaleTimeString() })}</div>
         </div>
         <div className="flex-1" />
-        <Button onClick={onRefresh} size="sm" variant="secondary">Refresh</Button>
+        <Button onClick={onRefresh} size="sm" variant="secondary">{t('refresh')}</Button>
       </div>
       <div className="grid gap-3">
         {report.categories.map((cat) => (
@@ -764,37 +863,38 @@ function HealthView({ report, isLoading, onRefresh }: { report: HealthReport | n
 }
 
 function PipelineView({ result, mocGroups, isRunning, onRunAction, onNavigate }: { result: ProcessingResult | null; mocGroups: MOCGroup[]; isRunning: boolean; onRunAction: (action: string) => void; onNavigate: (path: string) => void }) {
+  const t = useTranslations('memoryBrowser')
   return (
     <div className="max-w-2xl space-y-6">
       <div>
-        <h2 className="text-lg font-semibold font-mono text-foreground mb-1">Processing Pipeline</h2>
-        <p className="text-xs text-muted-foreground font-mono">Knowledge maintenance operations inspired by Ars Contexta&apos;s 6 Rs</p>
+        <h2 className="text-lg font-semibold font-mono text-foreground mb-1">{t('pipelineTitle')}</h2>
+        <p className="text-xs text-muted-foreground font-mono">{t('pipelineDesc')}</p>
       </div>
       <div className="grid grid-cols-3 gap-3">
         <button onClick={() => onRunAction('reflect')} disabled={isRunning} className="bg-[hsl(var(--surface-1))] border border-border/50 rounded-lg p-4 text-left hover:border-primary/30 transition-colors disabled:opacity-50">
-          <div className="text-sm font-semibold font-mono text-foreground mb-1">Reflect</div>
-          <div className="text-[11px] text-muted-foreground font-mono">Find connection opportunities between files</div>
+          <div className="text-sm font-semibold font-mono text-foreground mb-1">{t('pipelineReflect')}</div>
+          <div className="text-[11px] text-muted-foreground font-mono">{t('pipelineReflectDesc')}</div>
         </button>
         <button onClick={() => onRunAction('reweave')} disabled={isRunning} className="bg-[hsl(var(--surface-1))] border border-border/50 rounded-lg p-4 text-left hover:border-primary/30 transition-colors disabled:opacity-50">
-          <div className="text-sm font-semibold font-mono text-foreground mb-1">Reweave</div>
-          <div className="text-[11px] text-muted-foreground font-mono">Find stale files needing updates from newer linked files</div>
+          <div className="text-sm font-semibold font-mono text-foreground mb-1">{t('pipelineReweave')}</div>
+          <div className="text-[11px] text-muted-foreground font-mono">{t('pipelineReweaveDesc')}</div>
         </button>
         <button onClick={() => onRunAction('generate-moc')} disabled={isRunning} className="bg-[hsl(var(--surface-1))] border border-border/50 rounded-lg p-4 text-left hover:border-primary/30 transition-colors disabled:opacity-50">
-          <div className="text-sm font-semibold font-mono text-foreground mb-1">Generate MOC</div>
-          <div className="text-[11px] text-muted-foreground font-mono">Auto-generate Maps of Content from file clusters</div>
+          <div className="text-sm font-semibold font-mono text-foreground mb-1">{t('pipelineGenerateMoc')}</div>
+          <div className="text-[11px] text-muted-foreground font-mono">{t('pipelineGenerateMocDesc')}</div>
         </button>
       </div>
       {isRunning && (
-        <Loader variant="inline" label="Processing" />
+        <Loader variant="inline" label={t('processing')} />
       )}
       {result && (
         <div className="bg-[hsl(var(--surface-1))] border border-border/50 rounded-lg p-4">
           <div className="flex items-center gap-2 mb-3">
             <span className="text-sm font-semibold font-mono text-foreground capitalize">{result.action}</span>
-            <span className="text-[10px] font-mono text-muted-foreground/50">{result.filesProcessed} files processed</span>
+            <span className="text-[10px] font-mono text-muted-foreground/50">{t('filesProcessed', { count: result.filesProcessed })}</span>
           </div>
           {result.suggestions.length === 0 ? (
-            <div className="text-[11px] font-mono text-green-400/70">No suggestions — knowledge base looks well-connected</div>
+            <div className="text-[11px] font-mono text-green-400/70">{t('noSuggestions')}</div>
           ) : (
             <div className="space-y-1.5">
               {result.suggestions.map((sug, i) => <div key={i} className="text-[11px] font-mono text-muted-foreground/80 leading-relaxed">{sug}</div>)}
@@ -804,7 +904,7 @@ function PipelineView({ result, mocGroups, isRunning, onRunAction, onNavigate }:
       )}
       {mocGroups.length > 0 && (
         <div className="space-y-3">
-          <div className="text-sm font-semibold font-mono text-foreground">Maps of Content ({mocGroups.length} groups)</div>
+          <div className="text-sm font-semibold font-mono text-foreground">{t('mapsOfContent', { count: mocGroups.length })}</div>
           {mocGroups.map((group) => (
             <div key={group.directory} className="bg-[hsl(var(--surface-1))] border border-border/50 rounded-lg p-4">
               <div className="text-xs font-semibold font-mono text-foreground/80 mb-2">{group.directory}</div>
@@ -825,6 +925,7 @@ function PipelineView({ result, mocGroups, isRunning, onRunAction, onNavigate }:
 }
 
 function CreateFileModal({ onClose, onCreate }: { onClose: () => void; onCreate: (path: string, content: string) => void }) {
+  const t = useTranslations('memoryBrowser')
   const [fileName, setFileName] = useState('')
   const [filePath, setFilePath] = useState('knowledge/')
   const [initialContent, setInitialContent] = useState('')
@@ -836,16 +937,16 @@ function CreateFileModal({ onClose, onCreate }: { onClose: () => void; onCreate:
     onClose()
   }
   return (
-    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center z-50 p-4">
       <div className="bg-[hsl(var(--surface-1))] border border-border rounded-lg max-w-md w-full p-5 shadow-xl">
         <div className="flex justify-between items-center mb-4">
-          <h3 className="text-sm font-semibold text-foreground font-mono">new file</h3>
+          <h3 className="text-sm font-semibold text-foreground font-mono">{t('newFileTitle')}</h3>
           <button onClick={onClose} className="text-muted-foreground hover:text-foreground text-lg leading-none">x</button>
         </div>
         <div className="space-y-3">
           <div>
-            <label className="block text-[11px] font-mono text-muted-foreground mb-1">directory</label>
-            <select value={filePath} onChange={(e) => setFilePath(e.target.value)} className="w-full px-2.5 py-1.5 text-xs font-mono bg-[hsl(var(--surface-0))] border border-border/50 rounded text-foreground focus:outline-none focus:border-primary/30">
+            <label className="block text-[11px] font-mono text-muted-foreground mb-1">{t('directory')}</label>
+            <select value={filePath} onChange={(e) => setFilePath(e.target.value)} className="w-full px-2.5 py-1.5 text-xs font-mono bg-[hsl(var(--surface-0))] border border-border/50 rounded text-foreground focus:outline-hidden focus:border-primary/30">
               <option value="knowledge-base/">knowledge-base/</option>
               <option value="memory/">memory/</option>
               <option value="knowledge/">knowledge/</option>
@@ -855,12 +956,12 @@ function CreateFileModal({ onClose, onCreate }: { onClose: () => void; onCreate:
             </select>
           </div>
           <div>
-            <label className="block text-[11px] font-mono text-muted-foreground mb-1">name</label>
-            <input type="text" value={fileName} onChange={(e) => setFileName(e.target.value)} placeholder="my-file" className="w-full px-2.5 py-1.5 text-xs font-mono bg-[hsl(var(--surface-0))] border border-border/50 rounded text-foreground focus:outline-none focus:border-primary/30" autoFocus />
+            <label className="block text-[11px] font-mono text-muted-foreground mb-1">{t('fileName')}</label>
+            <input type="text" value={fileName} onChange={(e) => setFileName(e.target.value)} placeholder="my-file" className="w-full px-2.5 py-1.5 text-xs font-mono bg-[hsl(var(--surface-0))] border border-border/50 rounded text-foreground focus:outline-hidden focus:border-primary/30" autoFocus />
           </div>
           <div>
-            <label className="block text-[11px] font-mono text-muted-foreground mb-1">type</label>
-            <select value={fileType} onChange={(e) => { setFileType(e.target.value); setInitialContent(templates[e.target.value] || '') }} className="w-full px-2.5 py-1.5 text-xs font-mono bg-[hsl(var(--surface-0))] border border-border/50 rounded text-foreground focus:outline-none focus:border-primary/30">
+            <label className="block text-[11px] font-mono text-muted-foreground mb-1">{t('fileType')}</label>
+            <select value={fileType} onChange={(e) => { setFileType(e.target.value); setInitialContent(templates[e.target.value] || '') }} className="w-full px-2.5 py-1.5 text-xs font-mono bg-[hsl(var(--surface-0))] border border-border/50 rounded text-foreground focus:outline-hidden focus:border-primary/30">
               <option value="md">.md</option>
               <option value="json">.json</option>
               <option value="txt">.txt</option>
@@ -868,13 +969,13 @@ function CreateFileModal({ onClose, onCreate }: { onClose: () => void; onCreate:
             </select>
           </div>
           <div>
-            <label className="block text-[11px] font-mono text-muted-foreground mb-1">content</label>
-            <textarea value={initialContent} onChange={(e) => setInitialContent(e.target.value)} className="w-full h-20 px-2.5 py-1.5 text-xs font-mono bg-[hsl(var(--surface-0))] border border-border/50 rounded text-foreground focus:outline-none focus:border-primary/30 resize-none" placeholder="optional..." />
+            <label className="block text-[11px] font-mono text-muted-foreground mb-1">{t('content')}</label>
+            <textarea value={initialContent} onChange={(e) => setInitialContent(e.target.value)} className="w-full h-20 px-2.5 py-1.5 text-xs font-mono bg-[hsl(var(--surface-0))] border border-border/50 rounded text-foreground focus:outline-hidden focus:border-primary/30 resize-none" placeholder={t('contentOptional')} />
           </div>
           <div className="text-[10px] font-mono text-muted-foreground/40 bg-[hsl(var(--surface-0))] px-2 py-1 rounded">{filePath}{fileName || '...'}.{fileType}</div>
           <div className="flex gap-2 pt-2">
-            <Button onClick={handleCreate} disabled={!fileName.trim()} size="sm" className="flex-1">Create</Button>
-            <Button onClick={onClose} variant="secondary" size="sm">Cancel</Button>
+            <Button onClick={handleCreate} disabled={!fileName.trim()} size="sm" className="flex-1">{t('create')}</Button>
+            <Button onClick={onClose} variant="secondary" size="sm">{t('cancel')}</Button>
           </div>
         </div>
       </div>
@@ -883,17 +984,18 @@ function CreateFileModal({ onClose, onCreate }: { onClose: () => void; onCreate:
 }
 
 function DeleteConfirmModal({ fileName, onClose, onConfirm }: { fileName: string; onClose: () => void; onConfirm: () => void }) {
+  const t = useTranslations('memoryBrowser')
   return (
-    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center z-50 p-4">
       <div className="bg-[hsl(var(--surface-1))] border border-border rounded-lg max-w-sm w-full p-5 shadow-xl">
-        <h3 className="text-sm font-semibold text-red-400 font-mono mb-3">delete file</h3>
+        <h3 className="text-sm font-semibold text-red-400 font-mono mb-3">{t('deleteFileTitle')}</h3>
         <div className="bg-red-500/5 border border-red-500/15 rounded-md p-3 mb-4">
-          <p className="text-xs text-muted-foreground font-mono">permanently delete:</p>
+          <p className="text-xs text-muted-foreground font-mono">{t('permanentlyDelete')}</p>
           <p className="text-xs font-mono text-foreground mt-1 bg-[hsl(var(--surface-0))] px-2 py-1 rounded">{fileName}</p>
         </div>
         <div className="flex gap-2">
-          <Button onClick={onConfirm} variant="destructive" size="sm" className="flex-1">Delete</Button>
-          <Button onClick={onClose} variant="secondary" size="sm">Cancel</Button>
+          <Button onClick={onConfirm} variant="destructive" size="sm" className="flex-1">{t('delete')}</Button>
+          <Button onClick={onClose} variant="secondary" size="sm">{t('cancel')}</Button>
         </div>
       </div>
     </div>

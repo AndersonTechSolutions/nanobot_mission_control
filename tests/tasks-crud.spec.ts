@@ -44,6 +44,20 @@ test.describe('Tasks CRUD', () => {
     expect(body.task.metadata).toEqual({ source: 'e2e' })
   })
 
+  test('POST persists implementation target metadata for deterministic repo routing', async ({ request }) => {
+    const { id, res, body } = await createTestTask(request, {
+      metadata: {
+        implementation_repo: 'builderz-labs/mission-control',
+        code_location: '/apps/api',
+      },
+    })
+    cleanup.push(id)
+
+    expect(res.status()).toBe(201)
+    expect(body.task.metadata.implementation_repo).toBe('builderz-labs/mission-control')
+    expect(body.task.metadata.code_location).toBe('/apps/api')
+  })
+
   test('POST ignores client-supplied created_by and uses authenticated actor', async ({ request }) => {
     const title = `e2e-task-actor-${Date.now()}`
     const res = await request.post('/api/tasks', {
@@ -69,7 +83,7 @@ test.describe('Tasks CRUD', () => {
     expect(res.status()).toBe(400)
   })
 
-  test('POST rejects duplicate title', async ({ request }) => {
+  test('POST allows duplicate title', async ({ request }) => {
     const { id, body: first } = await createTestTask(request)
     cleanup.push(id)
 
@@ -77,7 +91,11 @@ test.describe('Tasks CRUD', () => {
       headers: API_KEY_HEADER,
       data: { title: first.task.title },
     })
-    expect(res.status()).toBe(409)
+    expect(res.status()).toBe(201)
+    const body = await res.json()
+    cleanup.push(body.task.id)
+    expect(body.task.title).toBe(first.task.title)
+    expect(body.task.id).not.toBe(first.task.id)
   })
 
   // ── GET /api/tasks ───────────────────────────
@@ -162,6 +180,30 @@ test.describe('Tasks CRUD', () => {
     const body = await res.json()
     expect(body.task.title).toBe('Updated title')
     expect(body.task.priority).toBe('high')
+  })
+
+  test('PUT updates implementation target metadata and GET returns persisted values', async ({ request }) => {
+    const { id } = await createTestTask(request, {
+      metadata: { implementation_repo: 'builderz-labs/mission-control', code_location: '/apps/api' },
+    })
+    cleanup.push(id)
+
+    const updateRes = await request.put(`/api/tasks/${id}`, {
+      headers: API_KEY_HEADER,
+      data: {
+        metadata: {
+          implementation_repo: 'torreypjones/mission-control',
+          code_location: '/src/app/api/tasks',
+        },
+      },
+    })
+    expect(updateRes.status()).toBe(200)
+
+    const readRes = await request.get(`/api/tasks/${id}`, { headers: API_KEY_HEADER })
+    expect(readRes.status()).toBe(200)
+    const readBody = await readRes.json()
+    expect(readBody.task.metadata.implementation_repo).toBe('torreypjones/mission-control')
+    expect(readBody.task.metadata.code_location).toBe('/src/app/api/tasks')
   })
 
   test('PUT returns 404 for missing task', async ({ request }) => {

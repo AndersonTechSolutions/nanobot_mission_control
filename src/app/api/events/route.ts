@@ -1,5 +1,5 @@
 import { NextRequest , NextResponse } from 'next/server'
-import { eventBus, ServerEvent } from '@/lib/event-bus'
+import { eventBelongsToWorkspace, eventBus, ServerEvent } from '@/lib/event-bus'
 import { requireRole } from '@/lib/auth'
 
 export const dynamic = 'force-dynamic'
@@ -28,8 +28,9 @@ export async function GET(request: NextRequest) {
       // Forward workspace-scoped server events to this SSE client
       const userWorkspaceId = auth.user.workspace_id ?? 1
       const handler = (event: ServerEvent) => {
-        // Skip events from other workspaces (if event carries workspace_id)
-        if (event.data?.workspace_id && event.data.workspace_id !== userWorkspaceId) return
+        // Fail closed: unattributed events are not safe to deliver to a
+        // workspace-scoped client.
+        if (!eventBelongsToWorkspace(event, userWorkspaceId)) return
         try {
           controller.enqueue(
             encoder.encode(`data: ${JSON.stringify(event)}\n\n`)
@@ -57,10 +58,21 @@ export async function GET(request: NextRequest) {
     },
 
     cancel() {
-      // Client disconnected
-      if (cleanup) cleanup()
+      if (cleanup) {
+        cleanup()
+        cleanup = null
+      }
     },
   })
+
+  // Defense-in-depth: if the request is aborted (proxy timeout, network drop)
+  // ensure we clean up the event listener even if cancel() doesn't fire.
+  request.signal.addEventListener('abort', () => {
+    if (cleanup) {
+      cleanup()
+      cleanup = null
+    }
+  }, { once: true })
 
   return new Response(stream, {
     headers: {

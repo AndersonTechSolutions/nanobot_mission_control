@@ -1,13 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { config } from '@/lib/config'
 import { requireRole } from '@/lib/auth'
 import { readLimiter } from '@/lib/rate-limit'
 import { buildLinkGraph, extractWikiLinks } from '@/lib/memory-utils'
 import { readFile } from 'fs/promises'
-import { join, basename, extname } from 'path'
 import { logger } from '@/lib/logger'
-
-const MEMORY_PATH = config.memoryDir
+import { isPathAllowed, resolveSafeMemoryPath } from '@/lib/memory-path'
+import { resolveWorkspaceMemoryAccess } from '@/lib/workspace-isolation'
 
 export async function GET(request: NextRequest) {
   const auth = requireRole(request, 'viewer')
@@ -16,7 +14,8 @@ export async function GET(request: NextRequest) {
   const limited = readLimiter(request)
   if (limited) return limited
 
-  if (!MEMORY_PATH) {
+  const memoryAccess = resolveWorkspaceMemoryAccess(auth.user)
+  if (!memoryAccess) {
     return NextResponse.json({ error: 'Memory directory not configured' }, { status: 500 })
   }
 
@@ -25,17 +24,15 @@ export async function GET(request: NextRequest) {
 
   try {
     if (filePath) {
-      // Return links for a specific file
-      const fullPath = join(MEMORY_PATH, filePath)
-      // Basic path traversal check
-      if (!fullPath.startsWith(MEMORY_PATH)) {
-        return NextResponse.json({ error: 'Invalid path' }, { status: 400 })
+      if (!isPathAllowed(filePath)) {
+        return NextResponse.json({ error: 'Path not allowed' }, { status: 403 })
       }
+      const fullPath = await resolveSafeMemoryPath(memoryAccess.root, filePath)
       const content = await readFile(fullPath, 'utf-8')
       const links = extractWikiLinks(content)
 
       // Also find backlinks from the full graph
-      const graph = await buildLinkGraph(MEMORY_PATH)
+      const graph = await buildLinkGraph(memoryAccess.root)
       const node = graph.nodes[filePath]
       const incoming = node?.incoming ?? []
       const outgoing = node?.outgoing ?? []
@@ -49,7 +46,7 @@ export async function GET(request: NextRequest) {
     }
 
     // Return full link graph
-    const graph = await buildLinkGraph(MEMORY_PATH)
+    const graph = await buildLinkGraph(memoryAccess.root)
 
     // Serialize for the frontend (strip wikiLinks detail for the full graph)
     const nodes = Object.values(graph.nodes).map((n) => ({

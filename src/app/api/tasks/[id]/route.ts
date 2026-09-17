@@ -7,7 +7,11 @@ import { logger } from '@/lib/logger';
 import { validateBody, updateTaskSchema } from '@/lib/validation';
 import { resolveMentionRecipients } from '@/lib/mentions';
 import { normalizeTaskUpdateStatus } from '@/lib/task-status';
-import { pushTaskToGitHub } from '@/lib/github-sync-engine';
+import { reconcileDeferredTaskCompletions } from '@/lib/task-dispatch';
+import { syncTaskOutbound } from '@/lib/github-sync-engine';
+import { removeTaskFromGnap } from '@/lib/gnap-sync';
+import { config } from '@/lib/config';
+import { requireAgentTaskAccess, requireWorkspaceId } from '@/lib/enforcement/workspace-scope';
 
 function formatTicketRef(prefix?: string | null, num?: number | null): string | undefined {
   if (!prefix || typeof num !== 'number' || !Number.isFinite(num) || num <= 0) return undefined
@@ -51,10 +55,18 @@ export async function GET(
     const db = getDatabase();
     const resolvedParams = await params;
     const taskId = parseInt(resolvedParams.id);
-    const workspaceId = auth.user.workspace_id ?? 1;
+    const wsResult = requireWorkspaceId(auth.user);
+    if (!('workspaceId' in wsResult)) return wsResult.response;
+    const { workspaceId } = wsResult;
 
     if (isNaN(taskId)) {
       return NextResponse.json({ error: 'Invalid task ID' }, { status: 400 });
+    }
+
+    try {
+      await reconcileDeferredTaskCompletions({ workspaceId, taskId, limit: 1 })
+    } catch (err) {
+      logger.warn({ err, taskId }, 'Deferred task reconciliation failed during task read')
     }
     
     const stmt = db.prepare(`
@@ -68,10 +80,13 @@ export async function GET(
     if (!task) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 });
     }
-    
+
+    const taskDeny = requireAgentTaskAccess(auth.user, (task as Task).assigned_to ?? null);
+    if (taskDeny) return taskDeny;
+
     // Parse JSON fields
     const taskWithParsedData = mapTaskRow(task);
-    
+
     return NextResponse.json({ task: taskWithParsedData });
   } catch (error) {
     logger.error({ err: error }, 'GET /api/tasks/[id] error');
@@ -96,7 +111,9 @@ export async function PUT(
     const db = getDatabase();
     const resolvedParams = await params;
     const taskId = parseInt(resolvedParams.id);
-    const workspaceId = auth.user.workspace_id ?? 1;
+    const wsResult = requireWorkspaceId(auth.user);
+    if (!('workspaceId' in wsResult)) return wsResult.response;
+    const { workspaceId } = wsResult;
     const validated = await validateBody(request, updateTaskSchema);
     if ('error' in validated) return validated.error;
     const body = validated.data;
@@ -113,7 +130,10 @@ export async function PUT(
     if (!currentTask) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 });
     }
-    
+
+    const taskDeny = requireAgentTaskAccess(auth.user, currentTask.assigned_to ?? null);
+    if (taskDeny) return taskDeny;
+
     const {
       title,
       description,
@@ -272,7 +292,10 @@ export async function PUT(
     updateParams.push(taskId, workspaceId);
     
     if (fieldsToUpdate.length === 1) { // Only updated_at
-      return NextResponse.json({ error: 'No fields to update' }, { status: 400 });
+      return NextResponse.json({
+        task: mapTaskRow(currentTask),
+        unchanged: true,
+      });
     }
     
     const stmt = db.prepare(`
@@ -386,24 +409,13 @@ export async function PUT(
     `).get(taskId, workspaceId) as Task;
     const parsedTask = mapTaskRow(updatedTask);
 
-    // Fire-and-forget outbound GitHub sync for relevant changes
-    const syncRelevantChanges = changes.some(c =>
-      c.startsWith('status:') || c.startsWith('priority:') || c.includes('title') || c.includes('assigned')
-    )
-    if (syncRelevantChanges && (updatedTask as any).github_repo) {
-      const project = db.prepare(`
-        SELECT id, github_repo, github_sync_enabled FROM projects
-        WHERE id = ? AND workspace_id = ?
-      `).get((updatedTask as any).project_id, workspaceId) as any
-      if (project?.github_sync_enabled) {
-        pushTaskToGitHub(updatedTask as any, project).catch(err =>
-          logger.error({ err, taskId }, 'Outbound GitHub sync failed')
-        )
-      }
+    // Fire-and-forget outbound sync (GitHub + GNAP)
+    if (changes.length > 0) {
+      syncTaskOutbound(updatedTask as any, workspaceId);
     }
 
     // Broadcast to SSE clients
-    eventBus.broadcast('task.updated', parsedTask);
+    eventBus.broadcast('task.updated', { ...parsedTask, workspace_id: workspaceId });
 
     return NextResponse.json({ task: parsedTask });
   } catch (error) {
@@ -429,7 +441,9 @@ export async function DELETE(
     const db = getDatabase();
     const resolvedParams = await params;
     const taskId = parseInt(resolvedParams.id);
-    const workspaceId = auth.user.workspace_id ?? 1;
+    const wsResult = requireWorkspaceId(auth.user);
+    if (!('workspaceId' in wsResult)) return wsResult.response;
+    const { workspaceId } = wsResult;
     
     if (isNaN(taskId)) {
       return NextResponse.json({ error: 'Invalid task ID' }, { status: 400 });
@@ -443,7 +457,10 @@ export async function DELETE(
     if (!task) {
       return NextResponse.json({ error: 'Task not found' }, { status: 404 });
     }
-    
+
+    const taskDeny = requireAgentTaskAccess(auth.user, (task as Task).assigned_to ?? null);
+    if (taskDeny) return taskDeny;
+
     // Delete task (cascades will handle comments)
     const stmt = db.prepare('DELETE FROM tasks WHERE id = ? AND workspace_id = ?');
     stmt.run(taskId, workspaceId);
@@ -463,8 +480,14 @@ export async function DELETE(
       workspaceId
     );
 
+    // Remove from GNAP repo
+    if (config.gnap.enabled && config.gnap.autoSync) {
+      try { removeTaskFromGnap(taskId, config.gnap.repoPath) }
+      catch (err) { logger.warn({ err, taskId }, 'GNAP sync failed for task deletion') }
+    }
+
     // Broadcast to SSE clients
-    eventBus.broadcast('task.deleted', { id: taskId, title: task.title });
+    eventBus.broadcast('task.deleted', { id: taskId, title: task.title, workspace_id: workspaceId });
 
     return NextResponse.json({ success: true });
   } catch (error) {
