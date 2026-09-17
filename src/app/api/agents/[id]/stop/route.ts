@@ -41,6 +41,7 @@ export async function POST(
 
   // Broadcast operation started
   eventBus.broadcast('agent.lifecycle', {
+    workspace_id: 1,
     id,
     action: 'stop',
     status: 'pending',
@@ -54,6 +55,7 @@ export async function POST(
 
   if (!result.killed) {
     eventBus.broadcast('agent.lifecycle', {
+      workspace_id: 1,
       id,
       action: 'stop',
       status: 'error',
@@ -89,6 +91,7 @@ export async function POST(
       } catch {
         // Process exited -- stop successful
         eventBus.broadcast('agent.lifecycle', {
+          workspace_id: 1,
           id: agentId,
           action: 'stop',
           status: 'success',
@@ -103,6 +106,7 @@ export async function POST(
 
     // Still alive after 10s -- suggest force kill
     eventBus.broadcast('agent.lifecycle', {
+      workspace_id: 1,
       id: agentId,
       action: 'stop',
       status: 'pending',

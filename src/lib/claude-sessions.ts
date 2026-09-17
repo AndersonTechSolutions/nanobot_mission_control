@@ -12,7 +12,7 @@
  * - Activity status (active if last message < 5 minutes ago)
  */
 
-import { createReadStream, readdirSync, statSync } from 'fs'
+import { createReadStream, readFileSync, readdirSync, statSync } from 'fs'
 import { createInterface } from 'readline'
 import { join } from 'path'
 import { config } from './config'
@@ -383,3 +383,72 @@ export async function syncClaudeSessions(force = false): Promise<{ ok: boolean; 
     return lastSyncResult
   }
 }
+
+export interface LatestToolUse {
+  agentName: string
+  toolName: string
+  subject?: string
+  createdAt: number
+}
+
+const TOOL_RECENT_WINDOW_SEC = 60
+
+/**
+ * Scans active session JSONL files and returns the latest tool_use per agent
+ * (within the last 60s). Used as a fallback signal for local Claude Code
+ * sessions that don't log to `mcp_call_log`.
+ */
+export function getRecentToolUsesByAgent(claudeHome?: string): LatestToolUse[] {
+  const home = claudeHome || config.claudeHome
+  const projectsDir = `${home}/projects`
+  const out = new Map<string, LatestToolUse>()
+  const sinceSec = Math.floor(Date.now() / 1000) - TOOL_RECENT_WINDOW_SEC
+
+  let projectDirs: string[] = []
+  try { projectDirs = readdirSync(projectsDir) } catch { return [] }
+
+  for (const proj of projectDirs) {
+    let files: string[] = []
+    try { files = readdirSync(`${projectsDir}/${proj}`).filter(f => f.endsWith('.jsonl')) } catch { continue }
+    for (const file of files) {
+      const path = `${projectsDir}/${proj}/${file}`
+      let stat
+      try { stat = statSync(path) } catch { continue }
+      if (stat.mtimeMs / 1000 < sinceSec) continue
+
+      let content: string
+      try { content = readFileSync(path, 'utf8') } catch { continue }
+      const lines = content.trim().split('\n').slice(-50)
+
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i]
+        if (!line) continue
+        try {
+          const entry = JSON.parse(line)
+          const ts = entry?.timestamp ? Math.floor(new Date(entry.timestamp).getTime() / 1000) : 0
+          if (!ts || ts < sinceSec) continue
+          const entryContent = entry?.message?.content
+          if (!Array.isArray(entryContent)) continue
+          for (const part of entryContent) {
+            if (part?.type === 'tool_use' && typeof part?.name === 'string') {
+              const subject =
+                typeof part?.input?.file_path === 'string' ? part.input.file_path
+                : typeof part?.input?.command === 'string' ? part.input.command
+                : typeof part?.input?.url === 'string' ? part.input.url
+                : typeof part?.input?.query === 'string' ? part.input.query
+                : undefined
+              const agentName = proj
+              const existing = out.get(agentName)
+              if (!existing || existing.createdAt < ts) {
+                out.set(agentName, { agentName, toolName: part.name, subject, createdAt: ts })
+              }
+              break
+            }
+          }
+        } catch { /* skip bad lines */ }
+      }
+    }
+  }
+  return Array.from(out.values())
+}
+

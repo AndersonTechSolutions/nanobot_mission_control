@@ -64,6 +64,7 @@ export async function POST(
 
   // Broadcast operation started
   eventBus.broadcast('agent.lifecycle', {
+    workspace_id: 1,
     id,
     action: 'start',
     status: 'pending',
@@ -76,6 +77,7 @@ export async function POST(
 
   if (result.error) {
     eventBus.broadcast('agent.lifecycle', {
+      workspace_id: 1,
       id,
       action: 'start',
       status: 'error',
@@ -105,6 +107,7 @@ export async function POST(
         process.kill(startedPid, 0) // Check process exists (signal 0 = no-op)
         // Process is alive -- success
         eventBus.broadcast('agent.lifecycle', {
+          workspace_id: 1,
           id: agentId,
           action: 'start',
           status: 'success',
@@ -121,6 +124,7 @@ export async function POST(
 
     // Timeout -- process did not start
     eventBus.broadcast('agent.lifecycle', {
+      workspace_id: 1,
       id: agentId,
       action: 'start',
       status: 'error',

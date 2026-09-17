@@ -212,6 +212,21 @@ export const integrationActionSchema = z.object({
   category: z.string().optional(),
 })
 
+export const sessionListQuerySchema = z.object({
+  agent: z.string().optional(),
+  channel: z.string().optional(),
+  search: z.string().optional(),
+  dateRange: z.enum(['today', '7d', '30d', 'all']).default('all'),
+  limit: z.coerce.number().int().min(1).max(200).default(50),
+  offset: z.coerce.number().int().min(0).default(0),
+})
+
+export const sessionContentQuerySchema = z.object({
+  offset: z.coerce.number().int().min(0).default(0),
+  limit: z.coerce.number().int().min(1).max(500).default(100),
+  tail: z.coerce.number().int().min(0).max(1).default(0),
+})
+
 export const createPipelineSchema = z.object({
   name: z.string().min(1, 'Name is required').max(200),
   description: z.string().max(5000).optional(),

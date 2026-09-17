@@ -57,6 +57,7 @@ export async function POST(
 
   // Broadcast operation
   eventBus.broadcast('agent.lifecycle', {
+    workspace_id: 1,
     id,
     action: 'force_stop',
     status: 'pending',
@@ -71,6 +72,7 @@ export async function POST(
   const status = result.killed ? 'success' : 'error'
 
   eventBus.broadcast('agent.lifecycle', {
+    workspace_id: 1,
     id,
     action: 'force_stop',
     status,

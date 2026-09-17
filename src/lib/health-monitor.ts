@@ -78,6 +78,7 @@ class HealthMonitor {
         if (!previousIds.has(snapshot.id)) {
           // New agent discovered
           eventBus.broadcast('agent.created', {
+            workspace_id: 1,
             id: snapshot.id,
             name: snapshot.name,
             status: snapshot.health.overall,
@@ -88,6 +89,7 @@ class HealthMonitor {
           const prev = this.lastSnapshot.get(snapshot.id)
           if (prev && prev.health.overall !== snapshot.health.overall) {
             eventBus.broadcast('agent.status_changed', {
+              workspace_id: 1,
               id: snapshot.id,
               name: snapshot.name,
               status: snapshot.health.overall,
@@ -101,7 +103,7 @@ class HealthMonitor {
       // Detect removed agents
       for (const id of previousIds) {
         if (!currentIds.has(id)) {
-          eventBus.broadcast('agent.deleted', { id })
+          eventBus.broadcast('agent.deleted', { workspace_id: 1, id })
         }
       }
 
@@ -189,6 +191,7 @@ class HealthMonitor {
     }
 
     eventBus.broadcast('agent.status_changed', {
+      workspace_id: 1,
       id: snapshot.id,
       name: snapshot.name,
       status: snapshot.health.overall,
