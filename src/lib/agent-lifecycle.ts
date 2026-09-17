@@ -10,6 +10,7 @@
  */
 
 import { spawn, execSync } from 'node:child_process'
+import os from 'node:os'
 import type { DiscoveredAgent } from '@/types/agent-health'
 
 // ---------------------------------------------------------------------------
@@ -215,7 +216,7 @@ export function stopAgent(
   const label = findLaunchdService(pid)
   if (label) {
     // Find the plist file path
-    const home = process.env.HOME || '/Users/designmac'
+    const home = process.env.HOME || os.homedir()
     const plistPath = `${home}/Library/LaunchAgents/${label}.plist`
     try {
       // unload stops the service AND prevents KeepAlive respawn

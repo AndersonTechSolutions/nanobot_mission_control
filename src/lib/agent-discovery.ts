@@ -10,6 +10,7 @@
  */
 
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { config } from '@/lib/config'
 import type { DiscoveredAgent } from '@/types/agent-health'
@@ -72,7 +73,7 @@ function discoverRootAgent(): DiscoveredAgent | null {
     // Ignore — use defaults
   }
 
-  const homePath = process.env.HOME || '/Users/designmac'
+  const homePath = process.env.HOME || os.homedir()
 
   return {
     id: name.toLowerCase(),
